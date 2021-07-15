@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2017-2021 Intel Corporation
+Copyright (C) 2018-2021 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -32,7 +32,7 @@ SPDX-License-Identifier: MIT
 // to include this file only.
 
 // Definition of integer Registry-key Values
-// (may merge this into igc_flags.def's macro)
+// (may merge this into igc_flags.h's macro)
 enum {
     // ForcePixelShaderSIMDMode
     FLAG_PS_SIMD_MODE_DEFAULT = 0,                 // default is SIMD8 compilation + heuristics to determine if we want to compile SIMD32/SIMD16

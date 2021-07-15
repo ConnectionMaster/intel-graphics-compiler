@@ -1,28 +1,14 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (c) 2020-2021 Intel Corporation
+Copyright (C) 2020-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"),
-to deal in the Software without restriction, including without limitation
-the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom
-the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-IN THE SOFTWARE.
+SPDX-License-Identifier: MIT
 
 ============================= end_copyright_notice ===========================*/
 
 #include "MessageDecoder.hpp"
+
+#include <tuple>
 
 using namespace iga;
 
@@ -58,61 +44,73 @@ struct MessageDecoderOther : MessageDecoderLegacy
 
 
 void MessageDecoderOther::tryDecodeGTWY() {
-    auto choosePage = [&](const char *xe, const char *_ = nullptr) {
-        return xe;
+
+    //
+    using GatewayElement = std::tuple<uint32_t,SendOp,const char *,const char *,const char *>;
+    static constexpr GatewayElement GATEWAY_MESSAGES[] = {
+        {0x1, SendOp::SIGNAL, "33508", "47927", "57492"}, // MSD_SIGNAL_EVENT
+        {0x2, SendOp::MONITOR, "33512", "47925", "57490"}, // MSD_MONITOR_EVENT
+        {0x3, SendOp::UNMONITOR, "33513", "47926", "57491"}, // MSD_MONITOR_NO_EVENT
+        // no 0x5
+        {0x4, SendOp::BARRIER, "33524", "47924", "57489"}, // MSD_BARRIER
+        {0x6, SendOp::WAIT, "33514", "47928", "57493"}, // MSD_WAIT_FOR_EVENT
     };
-    std::stringstream sym, descs;
-    int opBits = getDescBits(0, 3); // [2:0]
-    int expectMlen = 0;
-    const char *doc = nullptr;
-    SendOp sendOp = SendOp::INVALID;
-    switch (opBits) {
-    case 1:
-        sym << "signal_event";
-        descs << "signal event";
-        expectMlen = 1; //
-        sendOp = SendOp::SIGNAL_EVENT;
-        doc = choosePage("54036", "57494");
-        break;
-    case 2:
-        sym << "monitor";
-        descs << "monitor event";
-        expectMlen = 1; // C.f. MDP_EVENT
-        sendOp = SendOp::MONITOR;
-        doc = choosePage("47925", "57490");
-        break;
-    case 3:
-        sym << "unmonitor";
-        descs << "unmonitor event";
-        expectMlen = 1; // C.f. MDP_NO_EVENT
-        sendOp = SendOp::UNMONITOR;
-        doc = choosePage("47926", "57491");
-        break;
-    case 4:
-        sym << "barrier";
-        descs << "barrier";
-        expectMlen = 1; // C.f. MDP_Barrier
-        sendOp = SendOp::BARRIER;
-        doc = choosePage("47924", "57489");
-        break;
-    case 6:
-        sym << "wait";
-        descs << "wait for event";
-        sendOp = SendOp::WAIT;
-        expectMlen = 1; // C.f. MDP_Timeout
-        doc = choosePage("47928", "57493");
-        break;
-    default:
-        error(0, 2, "unsupported GTWY op");
+
+    const GatewayElement *ge = nullptr;
+    uint32_t opBits = getDescBits(0, 3); // [2:0]
+    for (const auto &g: GATEWAY_MESSAGES) {
+        if (std::get<0>(g) == opBits) {
+            ge = &g;
+            break;
+        }
     }
-    addField("GatewayOpcode", 0, 3, opBits, descs.str());
+    if (ge == nullptr) {
+        error(0, 2, "unsupported GTWY op");
+        return;
+    }
+    std::stringstream sym, desc;
+    const SendOpDefinition &sod = lookupSendOp(std::get<1>(*ge));
+    if (!sod.isValid()) {
+        // should be in the table
+        error(0, 2, "INTERNAL ERROR: cannot find GTWY op");
+        return;
+    }
+
+    sym << sod.mnemonic;
+    desc << sod.description;
+    int expectMlen = 0, expectRlen = 0;
+    switch (sod.op) {
+    case SendOp::SIGNAL:
+    case SendOp::MONITOR: // C.f. MDP_EVENT
+    case SendOp::UNMONITOR: // C.f. MDP_NO_EVENT
+    case SendOp::BARRIER: // C.f. MDP_Barrier
+    case SendOp::WAIT: // C.f. MDP_Timeout
+        expectMlen = 1;
+        break;
+    default: break;
+    }
+    switch (sod.op) {
+    case SendOp::BARRIER:
+        // XeHP+ no register is returned
+        expectRlen = platform() >= Platform::XE_HP ? 0 : 1;
+        if (platform() >= Platform::XE) {
+            decodeDescBitField("ActiveThreadsOnly", 11,
+                "only active threads participate");
+        }
+        break;
+    default: break;
+    }
+
+    addField("GatewayOpcode", 0, 3, opBits, desc.str());
     setSpecialOpX(
-        sym.str(), descs.str(), sendOp,
-        AddrType::FLAT, SendDesc(0),
-        1, // mlen
-        0, // rlen
-        0);
+        sym.str(), desc.str(), sod.op,
+        AddrType::INVALID, SendDesc(0),
+        expectMlen, // mlen
+        expectRlen, // rlen
+        MessageInfo::Attr::NONE);
     decodeMDC_HF(); // all gateway messages forbid a header
+    const char *doc =
+        chooseDoc(std::get<2>(*ge), std::get<3>(*ge), std::get<4>(*ge));
     setDoc(doc);
 }
 
@@ -271,7 +269,7 @@ void MessageDecoderOther::tryDecodeRC()
     mi.elemSizeBitsMemory = mi.elemSizeBitsRegFile = bitSize;
     mi.addrSizeBits = 0;
     mi.surfaceId = surfaceIndex;
-    mi.attributeSet = 0;
+    mi.attributeSet = MessageInfo::Attr::NONE;
 
     decodeMDC_H2(); // all render target messages permit a dual-header
 }
@@ -299,7 +297,6 @@ enum class SamplerSIMD {
 // 101 SIMD8H
 // 110 SIMD16H
 // 111 Reserved
-//
 
 static SamplerSIMD decodeSimdSize(
     Platform p,
@@ -359,9 +356,309 @@ static SamplerSIMD decodeSimdSize(
     return simdMode;
 }
 
+
+
+
+enum class SamplerParam {
+    NONE = 0,
+    AI, // array index
+    BIAS,
+    BIAS_AI,
+    DUDX, // u derivative with respect to x?
+    DUDY, // u derivative with respect to y?
+    DUMMY, // dummy parameter for messages with no arguments
+           // sampler send requires src0 to be something
+    DVDX, // v derivative with respect to x?
+    DVDY, // v derivative with respect to y?
+    LOD, // level of detail
+    LOD_AI, // legel of detail ... array index
+    MCS0, // multi compartment sampler buffer 0
+    MCS1, // multi compartment sampler buffer 1
+    MCS2, // multi compartment sampler buffer 3
+    MCS3, // multi compartment sampler buffer 3
+    MLOD, // ... level of detail
+    MLOD_R,
+    R, // r-coordinate
+    REF,
+    SI,
+    U, // u-coordinate
+    V, // v-coordinate
+};
+
+static std::string ToSymbol(SamplerParam sp) {
+    switch (sp) {
+    case SamplerParam::AI:       return "ai";
+    case SamplerParam::BIAS:     return "bias";
+    case SamplerParam::BIAS_AI:  return "bias_ai";
+    case SamplerParam::DUDX:     return "dudx";
+    case SamplerParam::DUDY:     return "dudy";
+    case SamplerParam::DUMMY:    return "dummy";
+    case SamplerParam::DVDX:     return "dvdx";
+    case SamplerParam::DVDY:     return "dvdy";
+    case SamplerParam::LOD:      return "lod";
+    case SamplerParam::LOD_AI:   return "lod_ai";
+    case SamplerParam::MCS0:     return "mcs0";
+    case SamplerParam::MCS1:     return "mcs1";
+    case SamplerParam::MCS2:     return "mcs2";
+    case SamplerParam::MCS3:     return "mcs3";
+    case SamplerParam::MLOD:     return "mlod";
+    case SamplerParam::MLOD_R:   return "mlod_r";
+    case SamplerParam::R:        return "r";
+    case SamplerParam::REF:      return "ref";
+    case SamplerParam::SI:       return "si";
+    case SamplerParam::U:        return "u";
+    case SamplerParam::V:        return "v";
+    default:                     return "?";
+    }
+}
+
+struct SamplerMessageDescription {
+    const char *mnemonic;
+    SamplerParam params[8];
+
+    constexpr SamplerMessageDescription(
+        const char *mne,
+        SamplerParam p0 = SamplerParam::NONE,
+        SamplerParam p1 = SamplerParam::NONE,
+        SamplerParam p2 = SamplerParam::NONE,
+        SamplerParam p3 = SamplerParam::NONE,
+        SamplerParam p4 = SamplerParam::NONE,
+        SamplerParam p5 = SamplerParam::NONE,
+        SamplerParam p6 = SamplerParam::NONE,
+        SamplerParam p7 = SamplerParam::NONE)
+        : mnemonic(mne)
+        , params{p0, p1, p2, p3, p4, p5, p6, p7}
+    {
+    }
+
+    int countParams() const {
+        int n = 0;
+        for (SamplerParam sp : params) {
+            if (sp == SamplerParam::NONE)
+                break;
+        }
+        return n;
+    }
+
+    std::string describe(int src0Len) const {
+        std::stringstream ss;
+        ss << mnemonic;
+        bool first = true;
+        int n = 0;
+        for (SamplerParam sp : params) {
+            if (sp == SamplerParam::NONE)
+                break;
+            if (first) {
+                first = false;
+                ss << ":";
+            } else {
+                ss << "+";
+            }
+            ss << ToSymbol(sp);
+            // for optional parameters
+            if (src0Len >= 0 && ++n >= src0Len)
+                break;
+        }
+        return ss.str();
+    }
+};
+
+
+static void decodeSendMessage(
+    uint32_t opBits, SamplerSIMD simdMode,
+    SendOp &sendOp, std::string &symbol, std::string &desc, int &params)
+{
+    if (simdMode != SamplerSIMD::SIMD32_64) {
+        switch (opBits) {
+        case 0x00:
+            symbol = "sample";
+            desc = "sample";
+            params = 4;
+            break;
+        case 0x01:
+            symbol = "sample_b";
+            desc = "sample+LOD bias";
+            params = 5;
+            break;
+        case 0x02:
+            symbol = "sample_l";
+            desc = "sample override LOD";
+            params = 5;
+            break;
+        case 0x03:
+            symbol = "sample_c";
+            desc = "sample compare";
+            params = 5;
+            break;
+        case 0x04:
+            symbol = "sample_d";
+            desc = "sample gradient";
+            params = 10;
+            break;
+        case 0x05:
+            symbol = "sample_b_c";
+            desc = "sample compare+LOD bias";
+            params = 6;
+            break;
+        case 0x06:
+            symbol = "sample_l_c";
+            desc = "sample compare+override LOD";
+            params = 6;
+            break;
+        case 0x07:
+            symbol = "sample_ld";
+            desc = "sample load";
+            params = 4;
+            break;
+        case 0x08:
+            symbol = "sample_gather4";
+            desc = "sample gather4";
+            params = 4;
+            break;
+        case 0x09:
+            symbol = "sample_lod";
+            desc = "sample override lod";
+            params = 4;
+            break;
+        case 0x0A:
+            symbol = "sample_resinfo";
+            desc = "sample res info";
+            params = 1;
+            break;
+        case 0x0B:
+            symbol = "sample_info";
+            desc = "sample info";
+            params = 0;
+            break;
+        case 0x0C:
+            symbol = "sample_killpix";
+            desc = "sample+killpix";
+            params = 3;
+            break;
+        case 0x10:
+            symbol = "sample_gather4_c";
+            desc = "sample gather4+compare";
+            params = 5;
+            break;
+        case 0x11:
+            symbol = "sample_gather4_po";
+            desc = "sample gather4+pixel offset";
+            params = 5;
+            break;
+        case 0x12:
+            symbol = "sample_gather4_po_c";
+            desc = "sample gather4 pixel offset+compare";
+            params = 6;
+            break;
+            // case 0x13: //skipped
+        case 0x14:
+            symbol = "sample_d_c";
+            desc = "sample derivatives+compare";
+            params = 11;
+            break;
+        case 0x16:
+            symbol = "sample_min";
+            desc = "sample min";
+            params = 2;
+            break;
+        case 0x17:
+            symbol = "sample_max";
+            desc = "sample max";
+            params = 2;
+            break;
+        case 0x18:
+            symbol = "sample_lz";
+            desc = "sample with lod forced to 0";
+            params = 4;
+            break;
+        case 0x19:
+            symbol = "sample_c_lz";
+            desc = "sample compare+with lod forced to 0";
+            params = 5;
+            break;
+        case 0x1A:
+            symbol = "sample_ld_lz";
+            desc = "sample load with lod forced to 0";
+            params = 3;
+            break;
+            // case 0x1B:
+        case 0x1C:
+            symbol = "sample_ld2dms_w";
+            desc = "sample ld2 multi-sample wide";
+            params = 7;
+            break;
+        case 0x1D:
+            symbol = "sample_ld_mcs";
+            desc = "sample load mcs auxilary data";
+            params = 4;
+            break;
+        case 0x1E:
+            symbol = "sample_ld2dms";
+            desc = "sample load multi-sample";
+            params = 6;
+            break;
+        case 0x1F:
+            symbol = "sample_ld2ds";
+            desc = "sample multi-sample without mcs";
+            params = 6;
+            break;
+        default:
+            symbol = std::to_string(opBits) + "?";
+            desc = "?";
+            break;
+        }
+    } else {
+        switch (opBits) {
+        case 0x00:
+            symbol = "sample_unorm";
+            desc = "sample unorm";
+            params = 4; // relatively sure
+            break;
+        case 0x02:
+            symbol = "sample_unorm_killpix";
+            desc = "sample unorm+killpix";
+            params = 4; // no idea???
+            break;
+        case 0x08:
+            symbol = "sample_deinterlace";
+            desc = "sample deinterlace";
+            params = 4; // no idea???
+            break;
+        case 0x0C:
+            // yes: this appears to be replicated
+            symbol = "sample_unorm_media";
+            desc = "sample unorm for media";
+            params = 4; // no idea???
+            break;
+        case 0x0A:
+            // yes: this appears to be replicated
+            symbol = "sample_unorm_killpix_media";
+            desc = "sample unorm+killpix for media";
+            params = 4; // no idea???
+            break;
+        case 0x0B:
+            symbol = "sample_8x8";
+            desc = "sample 8x8";
+            params = 4; // no idea???
+            break;
+        case 0x1F:
+            symbol = "sample_flush";
+            desc = "sampler cache flush";
+            sendOp = SendOp::SAMPLER_FLUSH;
+            params = 0; // certain
+            break;
+        default:
+            symbol = std::to_string(opBits) + "?";
+            desc = "?";
+            sendOp = SendOp::INVALID;
+            break;
+        }
+    }
+}
+
 void MessageDecoderOther::tryDecodeSMPL()
 {
-    setDoc(platform() >= Platform::XE ? "43860" : "12484");
+    setDoc("12484", "43860", "57022");
     std::stringstream syms, descs;
 
     auto simd2 = decodeDescBitField("SIMD[2]", 29, "", "");
@@ -383,218 +680,33 @@ void MessageDecoderOther::tryDecodeSMPL()
     syms << "_";
     descs << " ";
 
-
     SendOp sendOp = SendOp::SAMPLER_LOAD;
     int params = 0;
-    const char *messageDesc = "";
-    auto opBits = getDescBits(12,5);
-    if (simdMode != SamplerSIMD::SIMD32_64) {
-        switch (opBits) {
-        case 0x00:
-            syms << "sample";
-            messageDesc = "sample";
-            params = 4;
-            break;
-        case 0x01:
-            syms << "sample_b";
-            messageDesc = "sample+LOD bias";
-            params = 5;
-            break;
-        case 0x02:
-            syms << "sample_l";
-            messageDesc = "sample override LOD";
-            params = 5;
-            break;
-        case 0x03:
-            syms << "sample_c";
-            messageDesc = "sample compare";
-            params = 5;
-            break;
-        case 0x04:
-            syms << "sample_d";
-            messageDesc = "sample gradient";
-            params = 10;
-            break;
-        case 0x05:
-            syms << "sample_b_c";
-            messageDesc = "sample compare+LOD bias";
-            params = 6;
-            break;
-        case 0x06:
-            syms << "sample_l_c";
-            messageDesc = "sample compare+override LOD";
-            params = 6;
-            break;
-        case 0x07:
-            syms << "sample_ld";
-            messageDesc = "sample load";
-            params = 4;
-            break;
-        case 0x08:
-            syms << "sample_gather4";
-            messageDesc = "sample gather4";
-            params = 4;
-            break;
-        case 0x09:
-            syms << "sample_lod";
-            messageDesc = "sample override lod";
-            params = 4;
-            break;
-        case 0x0A:
-            syms << "sample_resinfo";
-            messageDesc = "sample res info";
-            params = 1;
-            break;
-        case 0x0B:
-            syms << "sample_info";
-            messageDesc = "sample info";
-            params = 0;
-            break;
-        case 0x0C:
-            syms << "sample_killpix";
-            messageDesc = "sample+killpix";
-            params = 3;
-            break;
-        case 0x10:
-            syms << "sample_gather4_c";
-            messageDesc = "sample gather4+compare";
-            params = 5;
-            break;
-        case 0x11:
-            syms << "sample_gather4_po";
-            messageDesc = "sample gather4+pixel offset";
-            params = 5;
-            break;
-        case 0x12:
-            syms << "sample_gather4_po_c";
-            messageDesc = "sample gather4 pixel offset+compare";
-            params = 6;
-            break;
-            // case 0x13: //skipped
-        case 0x14:
-            syms << "sample_d_c";
-            messageDesc = "sample derivatives+compare";
-            params = 11;
-            break;
-        case 0x16:
-            syms << "sample_min";
-            messageDesc = "sample min";
-            params = 2;
-            break;
-        case 0x17:
-            syms << "sample_max";
-            messageDesc = "sample max";
-            params = 2;
-            break;
-        case 0x18:
-            syms << "sample_lz";
-            messageDesc = "sample with lod forced to 0";
-            params = 4;
-            break;
-        case 0x19:
-            syms << "sample_c_lz";
-            messageDesc = "sample compare+with lod forced to 0";
-            params = 5;
-            break;
-        case 0x1A:
-            syms << "sample_ld_lz";
-            messageDesc = "sample load with lod forced to 0";
-            params = 3;
-            break;
-            // case 0x1B:
-        case 0x1C:
-            syms << "sample_ld2dms_w";
-            messageDesc = "sample ld2 multi-sample wide";
-            params = 7;
-            break;
-        case 0x1D:
-            syms << "sample_ld_mcs";
-            messageDesc = "sample load mcs auxilary data";
-            params = 4;
-            break;
-        case 0x1E:
-            syms << "sample_ld2dms";
-            messageDesc = "sample load multi-sample";
-            params = 6;
-            break;
-        case 0x1F:
-            syms << "sample_ld2ds";
-            messageDesc = "sample multi-sample without mcs";
-            params = 6;
-            break;
-        default:
-            syms << "sample_" << std::hex << std::uppercase << opBits << "?";
-            messageDesc = "?";
-            break;
-        }
-    } else {
-        switch (opBits) {
-        case 0x00:
-            syms << "sample_unorm";
-            messageDesc = "sample unorm";
-            params = 4; // relatively sure
-            break;
-        case 0x02:
-            syms << "sample_unorm_killpix";
-            messageDesc = "sample unorm+killpix";
-            params = 4; // no idea???
-            break;
-        case 0x08:
-            syms << "sample_deinterlace";
-            messageDesc = "sample deinterlace";
-            params = 4; // no idea???
-            break;
-        case 0x0C:
-            // yes: this appears to be replicated
-            syms << "sample_unorm_media";
-            messageDesc = "sample unorm for media";
-            params = 4; // no idea???
-            break;
-        case 0x0A:
-            // yes: this appears to be replicated
-            syms << "sample_unorm_killpix_media";
-            messageDesc = "sample unorm+killpix for media";
-            params = 4; // no idea???
-            break;
-        case 0x0B:
-            syms << "sample_8x8";
-            messageDesc = "sample 8x8";
-            params = 4; // no idea???
-            break;
-        case 0x1F:
-            syms << "sample_flush";
-            messageDesc = "sampler cache flush";
-            sendOp = SendOp::SAMPLER_FLUSH;
-            params = 0; // certain
-            break;
-        default:
-            syms << "sample_" << std::hex << std::uppercase << opBits << "?";
-            messageDesc = "?";
-            sendOp = SendOp::INVALID;
-            break;
-        }
-    }
-    (void)addField("SamplerMessageType",12,5,opBits,messageDesc);
-    descs << messageDesc;
+    std::string symbol, desc;
+    auto opBits = getDescBits(12, 5);
+    decodeSendMessage(opBits, simdMode,
+        sendOp, symbol, desc, params);
+    syms << symbol;
+
+    (void)addField("SamplerMessageType", 12, 5, opBits, desc);
+    descs << desc;
 
     auto six = decodeDescField("SamplerIndex", 8, 4,
-        [&](std::stringstream &ss, uint32_t six){ss << "sampler " << six;});
+        [&](std::stringstream &ss, uint32_t six) {ss << "sampler " << six;});
     descs << " using sampler index " << six;
     syms << "[" << six << "," << decodeBTI(32) << "]";
 
-    AddrType addrType = AddrType::BTI;
     setScatterGatherOp(
         syms.str(),
         descs.str(),
         sendOp,
-        addrType,
+        AddrType::INVALID,
         getDescBits(0,8),
         32,
         is16bData ? 16 : 32,
         params,
         simdSize,
-        0
-    );
+        MessageInfo::Attr::NONE);
     decodeMDC_H(); // header is optional in the sampler
 }
 
@@ -606,7 +718,7 @@ void MessageDecoderOther::tryDecodeTS()
             AddrType::FLAT, 0,
             1, // mlen
             0, // rlen
-            0);
+            MessageInfo::Attr::NONE);
     } else {
         error(0, 32, "unsupported TS op");
     }
@@ -691,7 +803,7 @@ void MessageDecoderOther::tryDecodeURB()
         dataSize,
         elemsPerAddr,
         simd,
-        0);
+        MessageInfo::Attr::NONE);
     if (opBits == 7 || opBits == 8)
         result.info.immediateOffset = off;
 }

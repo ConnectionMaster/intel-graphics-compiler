@@ -1,28 +1,11 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2017-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
+============================= end_copyright_notice ===========================*/
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
 #include "HWConformity.h"
 #include "Optimizer.h"
 #include "G4_Verifier.hpp"
@@ -335,7 +318,13 @@ void HWConformity::fixInstExecSize(G4_BB* bb)
 bool HWConformity::reduceExecSize(INST_LIST_ITER iter, G4_BB* bb)
 {
     G4_INST *inst = *iter;
-    if (!inst || inst->isSend() || inst->getExecSize() == 1)
+    // Madw can't be split in any pass except for fixMadwInst as it will cause the dst(SOA layout) unexpected. For example:
+    //    madw (M1, 16) dst(0,0)<1> src0(0,0)<1;1,0> 0x38:ud 0x0:ud
+    // If split here, then low result is in dst(0,0) and dst(2,0), and high result is in dst(1,0) and dst(3,0)
+    //    madw (M1, 8) dst(0,0)<1> src0(0,0)<1;1,0> 0x38:ud 0x0:ud
+    //    madw (M8, 8) dst(2,0)<1> src0(1,0)<1;1,0> 0x38:ud 0x0:ud
+    // But expected dst is low result is in dst(0,0) and dst(1,0) and high result is in dst(2,0) and dst(3,0)
+    if (!inst || inst->isSend() || inst->getExecSize() == 1 || inst->opcode() == G4_madw)
     {
         return false;
     }
@@ -1530,8 +1519,8 @@ void HWConformity::moveSrcToGRF(INST_LIST_ITER it, uint32_t srcNum, uint16_t num
     {
 
         //inst->removeDefUse(Gen4_Operand_Number(srcNum + 1));
-        //def_inst->useInstList.push_back(std::pair<G4_INST*, Gen4_Operand_Number>(inst, Gen4_Operand_Number(srcNum + 1)));
-        //inst->defInstList.push_back(std::pair<G4_INST*, Gen4_Operand_Number>(def_inst, Gen4_Operand_Number(srcNum + 1)));
+        //def_inst->useInstList.emplace_back(inst, Gen4_Operand_Number(srcNum + 1));
+        //inst->defInstList.emplace_back(def_inst, Gen4_Operand_Number(srcNum + 1));
 
         G4_DstRegRegion* existing_def = def_inst->getDst();
         G4_SrcRegRegion* newSrc = builder.createSrc(
@@ -1592,7 +1581,7 @@ void HWConformity::saveDst(INST_LIST_ITER& it, uint8_t stride, G4_BB *bb)
     G4_SrcRegRegion *srcRegion = builder.createSrc(dst->getBase(), dst->getRegOff(),
         dst->getSubRegOff(), region, dstType);
 
-    G4_DstRegRegion *tmpDstOpnd = builder.Create_Dst_Opnd_From_Dcl(dcl, stride);
+    G4_DstRegRegion *tmpDstOpnd = builder.createDstRegRegion(dcl, stride);
 
     unsigned int new_option = inst->getOption();
 
@@ -1649,8 +1638,8 @@ void HWConformity::insertMovAfter(INST_LIST_ITER& it, uint16_t stride, G4_BB* bb
     G4_Declare* dcl = builder.createTempVar(execSize * stride, dstType, subAlign);
 
     const RegionDesc* region = builder.createRegionDesc(stride, 1, 0);
-    G4_SrcRegRegion *srcRegion = builder.Create_Src_Opnd_From_Dcl(dcl, region);
-    G4_DstRegRegion *tmpDstOpnd = builder.Create_Dst_Opnd_From_Dcl(dcl, stride);
+    G4_SrcRegRegion *srcRegion = builder.createSrcRegRegion(dcl, region);
+    G4_DstRegRegion *tmpDstOpnd = builder.createDstRegRegion(dcl, stride);
 
     G4_Predicate *pred = NULL;
     if (inst->opcode() != G4_sel) {

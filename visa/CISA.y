@@ -1,28 +1,10 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2017-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
+============================= end_copyright_notice ===========================*/
 
 %{
 #include <stdio.h>
@@ -184,6 +166,17 @@ std::vector<attr_gen_struct*> AttrOptVar;
 
     struct attr_gen_struct*  pattr_gen;
 
+    struct dpas_info_struct {
+        ISA_Opcode    opcode;
+        GenPrecision  src2Precision;
+        GenPrecision  src1Precision;
+        uint8_t       depth;
+        uint8_t       count;
+    } dpas_info;
+
+    struct bfn_op_struct {
+        uint8_t func_ctrl;
+    } bfn_info;
 
 
     // Align Support in Declaration
@@ -261,6 +254,9 @@ std::vector<attr_gen_struct*> AttrOptVar;
 %token SRCMOD_NEG           // (-)
 %token SRCMOD_NEGABS        // (-abs)
 %token SRCMOD_NOT           // (~)
+%token BFN_OP
+%token DPAS_OP
+%token BF_CVT_OP
 %token <type>   ITYPE
 %token <type>   DECL_DATA_TYPE
 %token <type>   DFTYPE         // :df
@@ -506,6 +502,9 @@ std::vector<attr_gen_struct*> AttrOptVar;
 %type <intval>              GenAttrOpt
 %type <flag>                Atomic16Opt
 %type <intval>              AtomicBitwidthOpt
+%type <dpas_info>           DPAS_OP
+%type <bfn_info>            BFN_OP
+%token <opcode>             QW_SCATTER_OP
 
 
 
@@ -828,6 +827,10 @@ Instruction:
         | LifetimeStartInst
         | LifetimeEndInst
         | NullaryInstruction
+        | DpasInstruction
+        | BfnInstruction
+        | QwScatterInstruction
+        | BF_CvtInstruction
 
 
 Label: LABEL {pBuilder->CISA_create_label($1, CISAlineno);}
@@ -918,6 +921,35 @@ ArithInstruction_4OPND:
      }
 
 
+DpasInstruction:
+    // 1       2          3           4           5            6
+    DPAS_OP ExecSize  RawOperand  RawOperand  RawOperand VecSrcOpndSimple
+    {
+        pBuilder->CISA_create_dpas_instruction(
+            $1.opcode, $2.emask, $2.exec_size,
+            $3, $4, $5, $6.cisa_gen_opnd,
+            $1.src2Precision, $1.src1Precision, $1.depth, $1.count, CISAlineno);
+    }
+
+BfnInstruction:
+    // 1      2         3         4           5                 6                      7                       8
+    Predicate BFN_OP SatModOpt ExecSize VecDstOperand_G_I VecSrcOperand_G_I_IMM VecSrcOperand_G_I_IMM  VecSrcOperand_G_I_IMM
+    {
+        pBuilder->CISA_create_bfn_instruction($1, $2.func_ctrl , $3, $4.emask, $4.exec_size,
+            $5.cisa_gen_opnd, $6.cisa_gen_opnd, $7.cisa_gen_opnd, $8.cisa_gen_opnd, CISAlineno);
+    }
+//                        1           2        3     4       5      6      7         8
+QwScatterInstruction: Predicate QW_SCATTER_OP DOT DEC_LIT ExecSize Var RawOperand RawOperand
+    {
+        ABORT_ON_FAIL(pBuilder->CISA_create_qword_scatter_instruction(
+            $2, $1, $5.emask, $5.exec_size, (uint32_t)$4, $6, $7, $8, CISAlineno));
+    }
+
+               //    1         2           3              4
+BF_CvtInstruction: BF_CVT_OP ExecSize VecDstOperand_G VecSrcOperand_G_IMM
+    {
+        pBuilder->CISA_create_bf_cvt_instruction($2.emask, $2.exec_size, $3.cisa_gen_opnd, $4.cisa_gen_opnd, CISAlineno);
+    }
 
 
                      //  1            2           3            4             5                6

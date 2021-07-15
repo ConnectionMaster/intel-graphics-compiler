@@ -96,6 +96,12 @@ bool AddImplicitArgs::runOnModule(Module &M)
             ImplicitArgs::addBufferOffsetArgs(func, m_pMdUtils, ctx->getModuleMetaData());
         }
 
+        if (ctx->getModuleMetaData()->compOpt.UseBindlessMode &&
+            !ctx->getModuleMetaData()->compOpt.UseLegacyBindlessMode)
+        {
+            ImplicitArgs::addBindlessOffsetArgs(func, m_pMdUtils, ctx->getModuleMetaData());
+        }
+
         ImplicitArgs implicitArgs(func, m_pMdUtils);
 
         // Create the new function body and insert it into the module
@@ -497,6 +503,7 @@ bool BuiltinCallGraphAnalysis::runOnModule(Module &M)
     {
         traverseCallGraphSCC(*I);
     }
+    m_pMdUtils->save(M.getContext());
 
     // Detect stack calls that use implicit args, and force inline them, since they are not supported
     if (IGC_IS_FLAG_ENABLED(ForceInlineStackCallWithImplArg))
@@ -770,6 +777,5 @@ void BuiltinCallGraphAnalysis::writeBackAllIntoMetaData(const ImplicitArgumentDe
         funcInfo->addImplicitArgInfoListItem(argMD);
     }
 
-    m_pMdUtils->save(f->getParent()->getContext());
 }
 

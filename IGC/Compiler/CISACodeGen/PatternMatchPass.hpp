@@ -154,6 +154,7 @@ namespace IGC
         void visitFPToUIInst(llvm::FPToUIInst& I);
         void visitDbgInfoIntrinsic(llvm::DbgInfoIntrinsic& I);
         void visitExtractValueInst(llvm::ExtractValueInst& I);
+        void visitInsertValueInst(llvm::InsertValueInst& I);
         void visitBranchInst(llvm::BranchInst& I);
 
     public:
@@ -172,6 +173,7 @@ namespace IGC
 
         bool MatchFMA(llvm::IntrinsicInst& I);
         bool MatchFrc(llvm::BinaryOperator& I);
+        bool MatchFloor(llvm::BinaryOperator& I);
         bool MatchPredAdd(llvm::BinaryOperator& I);
         bool MatchSimpleAdd(llvm::BinaryOperator& I);
         bool MatchMad(llvm::BinaryOperator& I);
@@ -195,6 +197,10 @@ namespace IGC
         bool MatchCondModifier(llvm::CmpInst& I);
         bool MatchBoolOp(llvm::BinaryOperator& I);
         bool MatchFunnelShiftRotate(llvm::IntrinsicInst& I);
+        bool MatchBfn(llvm::Instruction& I);
+        bool MatchCmpSelect(llvm::SelectInst& I);
+        bool MatchAdd3(llvm::Instruction& I);
+        bool MatchDpas(llvm::GenIntrinsicInst& I);
         bool MatchDp4a(llvm::GenIntrinsicInst& I);
         bool MatchLogicAlu(llvm::BinaryOperator& I);
         bool MatchRsqrt(llvm::BinaryOperator& I);
@@ -224,6 +230,9 @@ namespace IGC
         bool matchPtrToPair(llvm::ExtractValueInst*);
 
         bool MatchUnmaskedRegionBoundary(llvm::Instruction& I, bool start);
+
+        bool MatchInsertToStruct(llvm::InsertValueInst*);
+        bool MatchExtractFromStruct(llvm::ExtractValueInst*);
 
         void AddPattern(Pattern* P)
         {

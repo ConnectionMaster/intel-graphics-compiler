@@ -1,24 +1,8 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (c) 2000-2021 Intel Corporation
+Copyright (C) 2019-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"),
-to deal in the Software without restriction, including without limitation
-the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom
-the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-IN THE SOFTWARE.
+SPDX-License-Identifier: MIT
 
 ============================= end_copyright_notice ===========================*/
 
@@ -36,16 +20,23 @@ IN THE SOFTWARE.
 #include "GenXUtil.h"
 #include "GenXVisa.h"
 
-#include "vc/GenXOpts/Utils/InternalMetadata.h"
+#include "vc/GenXOpts/Utils/KernelInfo.h"
+#include "vc/Support/BackendConfig.h"
+#include "vc/Utils/General/BreakConst.h"
 
 #include "Probe/Assertion.h"
 #include "llvmWrapper/IR/DerivedTypes.h"
+#include "llvmWrapper/IR/Function.h"
 #include "llvmWrapper/IR/InstrTypes.h"
 #include "llvmWrapper/IR/Instructions.h"
 
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Analysis/CallGraph.h"
+#include "llvm/Analysis/CallGraphSCCPass.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
 #include "llvm/GenXIntrinsics/GenXMetadata.h"
+#include "llvm/IR/DiagnosticInfo.h"
+#include "llvm/IR/DiagnosticPrinter.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstVisitor.h"
 #include "llvm/IR/Intrinsics.h"
@@ -55,6 +46,7 @@ IN THE SOFTWARE.
 
 #include <forward_list>
 #include <queue>
+#include <unordered_set>
 #include <utility>
 
 using namespace llvm;
@@ -64,8 +56,199 @@ using namespace genx;
 
 static cl::opt<bool> ForceSVMTPM("force-svm-tpm", cl::init(true), cl::Hidden,
   cl::desc("Force putting thread-private memory to SVM"));
+static cl::opt<bool>
+    PerformStackAnalysis("stack-analysis", cl::init(true), cl::Hidden,
+                         cl::desc("Perform static stack analysis to generate "
+                                  "warning in case of stack overflow"));
 
 namespace {
+
+// Diagnostic information for errors/warnings in the TPM
+class DiagnosticInfoTPM : public DiagnosticInfo {
+private:
+  std::string Description;
+  static int KindID;
+
+  static int getKindID() {
+    if (KindID == 0)
+      KindID = llvm::getNextAvailablePluginDiagnosticKind();
+    return KindID;
+  }
+
+public:
+  // Initialize from description
+  DiagnosticInfoTPM(const Twine &Desc, DiagnosticSeverity Severity = DS_Error)
+      : DiagnosticInfo(llvm::getNextAvailablePluginDiagnosticKind(), Severity),
+        Description("GenXTPM: " + Desc.str()) {}
+
+  // Initialize with Value
+  DiagnosticInfoTPM(Value *Val, const Twine &Desc, DiagnosticSeverity Severity)
+      : DiagnosticInfo(getKindID(), Severity) {
+    std::string Str;
+    llvm::raw_string_ostream(Str) << *Val;
+    Description = (Twine("TPM failed for: <") + Str + ">: " + Desc).str();
+  }
+
+  void print(DiagnosticPrinter &DP) const override { DP << Description; }
+
+  static bool classof(const DiagnosticInfo *DI) {
+    return DI->getKind() == getKindID();
+  }
+};
+
+class StackAnalysis : public InstVisitor<StackAnalysis> {
+  DataLayout const &m_DL;
+  CallGraph const &m_CG;
+  uint64_t const m_MaxStackSize{};
+
+  // FunctionState contains information about function:
+  // m_UsedSz => how much stack memory it takes within with called from it the
+  //  most heavy function
+  // m_pHeavyFunction => pointer to function that occupies
+  //  the most stack memory
+  // m_ProcessingFlag => current state of function
+  struct FunctionState final {
+    // enumeration used to diagnose recursion
+    enum class ProcessingState {
+      Started,   // function started to be processed but did not finish
+      Finished,  // function has completely finished being processed
+      NotStarted // function has not started processing but will start
+    };
+    uint64_t m_UsedSz{0};
+    Function *m_pHeavyFunction{nullptr};
+    ProcessingState m_ProcessingFlag{ProcessingState::NotStarted};
+  };
+
+  // map between Function and its State
+  std::unordered_map<Function *, FunctionState> m_ProcessedFs{};
+
+  uint64_t checkFunction(Function &F);
+  std::string GenerateCallSequence(Function &F);
+  void checkKernel(Function &Kernel);
+
+public:
+  StackAnalysis() = delete;
+  StackAnalysis(DataLayout const &DL, CallGraph const &CG,
+                uint64_t MaxStackSize)
+      : m_DL{DL}, m_CG{CG}, m_MaxStackSize{MaxStackSize} {}
+
+  void visitAllocaInst(AllocaInst &AI);
+  void visitFunction(Function &F);
+
+  void doAnalysis(Module &M);
+};
+
+// It collects all allocas and updates stack usage of each function
+void StackAnalysis::visitAllocaInst(AllocaInst &AI) {
+  Optional<uint64_t> AllocaSize = AI.getAllocationSizeInBits(m_DL);
+  IGC_ASSERT_MESSAGE(AllocaSize.hasValue(), "VLA is not expected");
+
+  m_ProcessedFs[AI.getFunction()].m_UsedSz += AllocaSize.getValue();
+}
+
+// It initializes all function
+void StackAnalysis::visitFunction(Function &F) {
+  bool isInserted = m_ProcessedFs.insert({&F, {}}).second;
+  IGC_ASSERT_MESSAGE(isInserted, "Error in insertion function in map");
+}
+
+// It performs checking CallGraph and usage of allocs in function
+uint64_t StackAnalysis::checkFunction(Function &F) {
+  // We guarantee this function exists in map as it has been inserted while
+  // visit
+  auto pOnF = m_ProcessedFs.find(&F);
+  IGC_ASSERT_MESSAGE(pOnF != m_ProcessedFs.end(),
+                     "Function must be inserted before checking");
+
+  auto &StateOfF = pOnF->second;
+  StateOfF.m_ProcessingFlag = FunctionState::ProcessingState::Started;
+
+  uint64_t MostUsedStackSize = 0;
+  for (auto &N : *m_CG[&F]) {
+    Function *NextCalledF = N.second->getFunction();
+    if (!NextCalledF || NextCalledF->isDeclaration())
+      continue;
+
+    uint64_t UsedStackSize = 0;
+    switch (m_ProcessedFs[NextCalledF].m_ProcessingFlag) {
+    case FunctionState::ProcessingState::Started: {
+      DiagnosticInfoTPM Warn{
+          "Recursion has been found in call graph. Called function: \"" +
+              NextCalledF->getName() + "\" from \"" + F.getName() +
+              "\"\nStack overflow can occur, but cannot be diagnosed.",
+          DS_Warning};
+      F.getContext().diagnose(Warn);
+      break;
+    }
+    case FunctionState::ProcessingState::NotStarted:
+      UsedStackSize = checkFunction(*NextCalledF);
+      break;
+    case FunctionState::ProcessingState::Finished:
+      UsedStackSize = m_ProcessedFs[NextCalledF].m_UsedSz;
+      break;
+    }
+
+    if (UsedStackSize > MostUsedStackSize) {
+      MostUsedStackSize = UsedStackSize;
+      StateOfF.m_pHeavyFunction = NextCalledF;
+    }
+  }
+
+  StateOfF.m_ProcessingFlag = FunctionState::ProcessingState::Finished;
+  StateOfF.m_UsedSz += MostUsedStackSize;
+  return StateOfF.m_UsedSz;
+}
+
+// It generates trace of functions most occupy stack memory
+std::string StackAnalysis::GenerateCallSequence(Function &F) {
+  auto &FunctionState = m_ProcessedFs[&F];
+  std::string FunctionDump =
+      F.getName().str() + '(' +
+      std::to_string(FunctionState.m_UsedSz / genx::ByteBits) + ')';
+
+  if (FunctionState.m_pHeavyFunction)
+    return FunctionDump + "->" +
+           GenerateCallSequence(*FunctionState.m_pHeavyFunction);
+  else
+    return FunctionDump;
+}
+
+// It begins checking from kernel and generates warning in case of possible
+// stack overflow
+void StackAnalysis::checkKernel(Function &Kernel) {
+  uint64_t const KernelUsedStack = checkFunction(Kernel) / genx::ByteBits;
+  if (KernelUsedStack > m_MaxStackSize) {
+    DiagnosticInfoTPM Warn{"Kernel \"" + Kernel.getName() +
+                               "\" may overflow stack. Used " +
+                               std::to_string(KernelUsedStack) + " bytes of " +
+                               std::to_string(m_MaxStackSize) +
+                               "\nCalls: " + GenerateCallSequence(Kernel),
+                           DS_Warning};
+    Kernel.getContext().diagnose(Warn);
+  }
+}
+
+void StackAnalysis::doAnalysis(Module &M) {
+  // It reserves extra memory for list of functions to avoid reallocations
+  std::vector<Function *> Kernels;
+  Kernels.reserve(M.size());
+  for (auto &F : M) {
+    visit(F);
+    if (genx::isKernel(&F))
+      Kernels.push_back(&F);
+  }
+
+  for (auto *Kernel : Kernels)
+    checkKernel(*Kernel);
+}
+
+int DiagnosticInfoTPM::KindID = 0;
+
+struct FunctionInfo {
+  std::unordered_set<Value *> Calls;
+  llvm::SetVector<Argument *> Args;
+  bool Recreate = false;
+};
 
 // This actually should've been a FunctionGroupPass,
 // but due to the FGPassManager hack we can't run GenXModule twice
@@ -82,6 +265,7 @@ public:
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     ModulePass::getAnalysisUsage(AU);
     AU.addRequired<TargetPassConfig>();
+    AU.addRequired<GenXBackendConfig>();
     AU.setPreservesCFG();
   }
 
@@ -89,6 +273,7 @@ public:
   bool runOnFunction(Function &F);
 
   void visitAllocaInst(AllocaInst &I);
+  void visitFunction(Function &F);
 
 private:
   bool replacePhi(PHINode *Phi);
@@ -103,13 +288,20 @@ private:
   bool replaceInsertElement(InsertElementInst *Insert);
   bool replaceShuffleVector(ShuffleVectorInst *ShuffleVec);
   Value *lookForPtrReplacement(Value *Ptr) const;
-  void addUsers(Value *V);
+  void addUsers(Value *V, bool ProcessCalls = true);
   void collectEachPossibleTPMUsers();
-  void addUsersIfNeeded(Value *V);
+  void collectAllocaUsers();
+  void collectArgUsers(bool ProcessCalls = true);
+  bool processUsers();
+  void processUnchangedCall(CallInst &CI);
+  void addUsersIfNeeded(Value *V, bool ProcessCalls = true);
   Value *NormalizeFuncPtrVec(Value *V, Instruction *InsPoint);
   std::pair<Value *, unsigned> NormalizeVector(Value *From, Type *To,
                                                Instruction *InsertBefore);
   Instruction *RestoreVectorAfterNormalization(Instruction *From, Type *To);
+  Value *ZExtOrTruncIfNeeded(Value *From, Type *To, Instruction *InsertBefore);
+  Value *lookForTruncOffset(Value *V);
+  void switchStack(Module &M);
 
 public:
   static char ID;
@@ -119,14 +311,13 @@ private:
   const GenXSubtarget *m_ST;
   const DataLayout *m_DL;
   std::vector<AllocaInst *> m_alloca;
-  std::vector<Argument *> m_args;
-  std::vector<CallInst *> m_gather;
-  std::vector<CallInst *> m_scatter;
-  std::map<AllocaInst *, CallInst *> m_allocaToIntrinsic;
-  std::queue<Instruction *> m_AIUsers;
+  llvm::SetVector<Argument *> m_args;
+  std::unordered_map<AllocaInst *, CallInst *> m_allocaToIntrinsic;
+  std::queue<std::pair<Instruction *, bool>> m_AIUsers;
   std::set<Instruction *> m_AlreadyAdded;
   PreDefined_Surface m_stack;
   bool m_useGlobalMem = ForceSVMTPM;
+  std::map<Function *, FunctionInfo> m_Calls;
 };
 } // namespace
 
@@ -150,8 +341,8 @@ GenXThreadPrivateMemory::GenXThreadPrivateMemory() : ModulePass(ID) {
   initializeGenXThreadPrivateMemoryPass(*PassRegistry::getPassRegistry());
 }
 
-static Value *ZExtOrTruncIfNeeded(Value *From, Type *To,
-                                  Instruction *InsertBefore) {
+Value *GenXThreadPrivateMemory::ZExtOrTruncIfNeeded(Value *From, Type *To,
+                                                    Instruction *InsertBefore) {
   Type *FromTy = From->getType();
   if (FromTy == To)
     return From;
@@ -164,6 +355,13 @@ static Value *ZExtOrTruncIfNeeded(Value *From, Type *To,
         Res, cast<VectorType>(FromTy)->getElementType(), "", InsertBefore);
     Res = TmpRes;
   }
+  if (auto ToVTy = dyn_cast<VectorType>(To)) {
+    IRBuilder<> Builder(InsertBefore);
+    Res = Builder.CreateVectorSplat(
+        ToVTy->getNumElements(),
+        Res,
+        Res->getName() + ".splat");
+  }
   if (FromTySz < ToTySz)
     Res = CastInst::CreateZExtOrBitCast(Res, To, "", InsertBefore);
   else if (FromTySz > ToTySz)
@@ -171,9 +369,22 @@ static Value *ZExtOrTruncIfNeeded(Value *From, Type *To,
   return Res;
 }
 
+// 32u is max exec_size allowed (see GenXCisaBuilder.cpp:buildIntrinsic
+// GetExecSize lambda) For svm.gather/scatter:
+//    BlockSize is inferred from vec elem type
+//    BlockNum should be TotalMemSize / (ExecSize * BlockSize)
+//      where TotalMemSize is a total amount of mem read/written for
+//      gather/scatter
+// TODO: revise this for non-svm case
+static int getNumBlocksForType(Type *Ty, const DataLayout &DL) {
+  return DL.getTypeSizeInBits(Ty) /
+         (std::min<unsigned>(32u, cast<VectorType>(Ty)->getNumElements()) *
+          DL.getTypeSizeInBits(Ty->getScalarType()));
+}
+
 // Wipe all internal ConstantExprs out of V if it's a ConstantVector of function pointers
 Value *GenXThreadPrivateMemory::NormalizeFuncPtrVec(Value *V, Instruction *InsPoint) {
-  V = breakConstantVector(cast<ConstantVector>(V), InsPoint, InsPoint);
+  V = vc::breakConstantVector(cast<ConstantVector>(V), InsPoint, InsPoint);
   auto *Inst = dyn_cast<InsertElementInst>(V);
   if (!Inst)
     return V;
@@ -230,7 +441,6 @@ GenXThreadPrivateMemory::NormalizeVector(Value *From, Type *To,
   }
   if (To->getScalarType()->isPointerTy() &&
       To->getScalarType()->getPointerElementType()->isFunctionTy()) {
-    Type *I64Ty = Type::getInt64Ty(Inst->getContext());
     To = IGCLLVM::FixedVectorType::get(I64Ty, NumElts);
     Res = CastInst::Create(Instruction::PtrToInt, From, To, "", Inst);
     NumElts *= 2;
@@ -239,6 +449,14 @@ GenXThreadPrivateMemory::NormalizeVector(Value *From, Type *To,
     Res = CastInst::Create(Instruction::BitCast, Res, To, "", Inst);
   } else if (m_DL->getTypeSizeInBits(cast<VectorType>(To)->getElementType()) <
              genx::DWordBits) {
+    auto EltTy = cast<VectorType>(To)->getElementType();
+    auto EltTySz = m_DL->getTypeSizeInBits(EltTy);
+    // if EltTy not Integer we shoud bitcast it before ZE
+    if (!EltTy->isIntegerTy()) {
+      auto Ty = IntegerType::get(*m_ctx, EltTySz);
+      To = IGCLLVM::FixedVectorType::get(Ty, NumElts);
+      From = CastInst::Create(Instruction::BitCast, From, To, "", Inst);
+    }
     To = IGCLLVM::FixedVectorType::get(I32Ty, NumElts);
     Res = CastInst::CreateZExtOrBitCast(From, To, "", Inst);
   } else if (m_DL->getTypeSizeInBits(cast<VectorType>(To)->getElementType()) ==
@@ -282,7 +500,19 @@ GenXThreadPrivateMemory::RestoreVectorAfterNormalization(Instruction *From,
     }
     Restored = CastInst::Create(Instruction::IntToPtr, NewFrom, To);
   } else if (EltSz < genx::DWordBits) {
-    Restored = CastInst::Create(Instruction::Trunc, From, To, "");
+    auto EltTy = cast<VectorType>(To)->getElementType();
+    auto EltTySz = m_DL->getTypeSizeInBits(EltTy);
+    if (!EltTy->isIntegerTy()) {
+      auto Ty = IntegerType::get(*m_ctx, EltTySz);
+      auto NumElts = cast<VectorType>(To)->getNumElements();
+      auto ToTr = IGCLLVM::FixedVectorType::get(Ty, NumElts);
+      auto Trunc = CastInst::Create(Instruction::Trunc, From, ToTr, "");
+      Trunc->insertAfter(From);
+      From = Trunc;
+      Restored = CastInst::Create(Instruction::BitCast, Trunc, To, "");
+    } else {
+      Restored = CastInst::Create(Instruction::Trunc, From, To, "");
+    }
   } else if (EltSz == genx::QWordBits &&
              !(m_useGlobalMem && To->getScalarType()->isIntegerTy(64))) {
     if (!From->getType()->getScalarType()->isPointerTy() &&
@@ -379,8 +609,7 @@ Value *GenXThreadPrivateMemory::lookForPtrReplacement(Value *Ptr) const {
     return ITP->getOperand(0);
   else if (auto AI = dyn_cast<AllocaInst>(Ptr)) {
     auto AllocaIntr = m_allocaToIntrinsic.find(AI);
-    IGC_ASSERT_MESSAGE(AllocaIntr != m_allocaToIntrinsic.end(),
-      "Each alloca must be here");
+    IGC_ASSERT(AllocaIntr != m_allocaToIntrinsic.end());
     return AllocaIntr->second;
   } else if (isa<Argument>(Ptr)) {
     if (PtrTy->isPointerTy()) {
@@ -389,15 +618,22 @@ Value *GenXThreadPrivateMemory::lookForPtrReplacement(Value *Ptr) const {
       return PTI;
     } else
       return Ptr;
-  } else if (isa<ExtractElementInst>(Ptr) &&
-             lookForPtrReplacement(
-                 cast<ExtractElementInst>(Ptr)->getVectorOperand())) {
+  }
+  else if (isa<ExtractElementInst>(Ptr) &&
+           lookForPtrReplacement(
+               cast<ExtractElementInst>(Ptr)->getVectorOperand())) {
     if (PtrTy->isPointerTy()) {
-      auto *PTI = CastInst::Create(Instruction::PtrToInt, Ptr, MemTy);
+      auto* PTI = CastInst::Create(Instruction::PtrToInt, Ptr, MemTy);
       PTI->insertAfter(cast<Instruction>(Ptr));
       return PTI;
-    } else
+    }
+    else
       return Ptr;
+  } else if (auto *SHI = dyn_cast<ShuffleVectorInst>(Ptr)) {
+    auto Splat = ShuffleVectorAnalyzer(SHI).getAsSplat();
+    if (Splat.Input) {
+      return lookForPtrReplacement(Splat.Input);
+    }
   } else if (auto *CI = dyn_cast<CallInst>(Ptr)) {
     if (!IGCLLVM::isIndirectCall(*CI) &&
         (GenXIntrinsic::getAnyIntrinsicID(CI->getCalledFunction()) ==
@@ -419,7 +655,9 @@ Value *GenXThreadPrivateMemory::lookForPtrReplacement(Value *Ptr) const {
   } else if (isa<ConstantPointerNull>(Ptr))
     return ConstantInt::get(MemTy, 0);
 
-  report_fatal_error("Cannot find pointer replacement");
+  DiagnosticInfoTPM Err{Ptr, "Cannot find pointer replacement", DS_Error};
+  Ptr->getContext().diagnose(Err);
+  return nullptr; // to suppress warnings
 }
 
 static std::pair<Value *, Value *>
@@ -553,11 +791,8 @@ bool GenXThreadPrivateMemory::replaceLoad(LoadInst *LdI) {
 
   Value *EltsOffset = FormEltsOffsetVector(NumEltsToLoad, ValueEltSz, LdI);
 
-  unsigned NumBlocks = m_DL->getTypeSizeInBits(LdEltTy) / genx::ByteBits;
-  // This logic is aligned with the on in CisaBuilder and GenXLowering
-  // The reason behind check for == 2 is that svm intrinsics don't support
-  // BlockSize of 2, so for ops with i16s we have to use BlockSize == 1 and NumBlocks == 2
-  Value *logNumBlocks = ConstantInt::get(I32Ty, genx::log2(NumBlocks == 2 ? NumBlocks : 1));
+  // always one element for one channel
+  Value *logNumBlocks = ConstantInt::get(I32Ty, 0);
   Value *Scale = ConstantInt::get(Type::getInt16Ty(*m_ctx), 0);
   Value *Surface = ConstantInt::get(I32Ty,
                                     visa::getReservedSurfaceIndex(m_stack));
@@ -578,7 +813,6 @@ bool GenXThreadPrivateMemory::replaceLoad(LoadInst *LdI) {
                                    EltsOffset, OldValOfTheDataRead},
                                   LdI->getName());
   Gather->insertAfter(LdI);
-  m_gather.push_back(Gather);
   Instruction *ProperGather = RestoreVectorAfterNormalization(Gather, LdTy);
 
   if (!isa<VectorType>(LdI->getType()) &&
@@ -648,9 +882,9 @@ bool GenXThreadPrivateMemory::replaceStore(StoreInst *StI) {
       {Pred->getType(),
        (m_useGlobalMem ? Offset : EltsOffset)->getType(),
        ValueOp->getType()});
-  unsigned NumBlocks = m_DL->getTypeSizeInBits(ValueOpTy->getScalarType()) / genx::ByteBits;
-  // see the comment in replaceLoad above
-  Value *logNumBlocks = ConstantInt::get(I32Ty, genx::log2(NumBlocks == 2 ? NumBlocks : 1));
+
+  // always one element for one channel
+  Value *logNumBlocks = ConstantInt::get(I32Ty, 0);
   Value *Scale = ConstantInt::get(Type::getInt16Ty(*m_ctx), 0);
   Value *Surface = ConstantInt::get(I32Ty,
                                     visa::getReservedSurfaceIndex(m_stack));
@@ -671,7 +905,6 @@ bool GenXThreadPrivateMemory::replaceStore(StoreInst *StI) {
                               UndefValue::get(ValueOpTy->getScalarType()))));
 
   LLVM_DEBUG(dbgs() << *Scatter << "\n");
-  m_scatter.push_back(Scatter);
 
   return true;
 }
@@ -692,7 +925,7 @@ bool GenXThreadPrivateMemory::replacePTI(PtrToIntInst *PTI) {
   return true;
 }
 
-static Value *lookForTruncOffset(Value *V) {
+Value *GenXThreadPrivateMemory::lookForTruncOffset(Value *V) {
   if (auto *I = dyn_cast<TruncInst>(V))
     return I->getOperand(0);
   else {
@@ -744,7 +977,7 @@ bool GenXThreadPrivateMemory::replaceGatherPrivate(CallInst *CI) {
   Value *Pred = CI->getArgOperand(0);
   Value *EltsOffset = CI->getArgOperand(2);
   if (!m_useGlobalMem &&
-      cast<VectorType>(OrigDstTy)->getElementType()->getPrimitiveSizeInBits() ==
+      m_DL->getTypeSizeInBits(cast<VectorType>(OrigDstTy)->getElementType()) ==
           genx::QWordBits) {
     IGC_ASSERT(ValueNumElts ==
                cast<VectorType>(EltsOffset->getType())->getNumElements() * 2);
@@ -766,23 +999,9 @@ bool GenXThreadPrivateMemory::replaceGatherPrivate(CallInst *CI) {
       {NewDstTy, Pred->getType(),
        (m_useGlobalMem ? Offset : EltsOffset)->getType()});
 
-  // 32u is max exec_size allowed (see GenXCisaBuilder.cpp:buildIntrinsic
-  // GetExecSize lambda) For svm.gather/scatter:
-  //    BlockSize is inferred from vec elem type
-  //    BlockNum should be TotalMemSize / (ExecSize * BlockSize)
-  //      where TotalMemSize is a total amount of mem read/written for
-  //      gather/scatter
-  // TODO: revise NumBlocks for non-svm case
   unsigned NumBlocks =
-      (m_useGlobalMem)
-          ? genx::log2(m_DL->getTypeSizeInBits(NewDstTy) /
-                       (genx::ByteBits *
-                        std::min<unsigned>(
-                            32u, cast<VectorType>(NewDstTy)->getNumElements()) *
-                        (m_DL->getTypeSizeInBits(NewDstTy->getScalarType()) /
-                         genx::ByteBits)))
-          : genx::log2(ValueEltSz);
-  Value *logNumBlocks = ConstantInt::get(I32Ty, NumBlocks);
+      (m_useGlobalMem) ? getNumBlocksForType(NewDstTy, *m_DL) : ValueEltSz;
+  Value *logNumBlocks = ConstantInt::get(I32Ty, genx::log2(NumBlocks));
   Value *Scale = ConstantInt::get(Type::getInt16Ty(*m_ctx), 0);
   Value *Surface =
       ConstantInt::get(I32Ty, visa::getReservedSurfaceIndex(m_stack));
@@ -796,7 +1015,6 @@ bool GenXThreadPrivateMemory::replaceGatherPrivate(CallInst *CI) {
                                    EltsOffset, OldValue},
                                   CI->getName());
   Gather->insertAfter(CI);
-  m_gather.push_back(Gather);
   LLVM_DEBUG(dbgs() << *Gather << "\n");
 
   Instruction *ProperGather =
@@ -820,9 +1038,8 @@ bool GenXThreadPrivateMemory::replaceScatterPrivate(CallInst *CI) {
 
   Value *Pred = CI->getArgOperand(0);
   Value *EltsOffset = CI->getArgOperand(2);
-  if (cast<VectorType>(OrigValueTy)
-          ->getElementType()
-          ->getPrimitiveSizeInBits() == genx::QWordBits) {
+  if (m_DL->getTypeSizeInBits(
+          cast<VectorType>(OrigValueTy)->getElementType()) == genx::QWordBits) {
     // TODO: revisit this for splat and/or non-const value cases,
     // e.g. replace EltSz with  (isSplatValue(EltsOffset) ||
     //                          !isa<Constant>(EltsOffset)) ? 0 : EltSZ
@@ -836,29 +1053,31 @@ bool GenXThreadPrivateMemory::replaceScatterPrivate(CallInst *CI) {
   Value *Offset = lookForPtrReplacement(ScatterPtr);
   Offset = ZExtOrTruncIfNeeded(Offset, m_useGlobalMem ? I64Ty : I32Ty, CI);
 
-  if (m_useGlobalMem)
-    EltsOffset = FormEltsOffsetVectorForSVM(Offset, EltsOffset, CI);
+  if (m_useGlobalMem) {
+    Offset =
+        FormEltsOffsetVectorForSVM(lookForTruncOffset(Offset), EltsOffset, CI);
+    if (!Offset->getType()->getScalarType()->isIntegerTy(64))
+      Offset = CastInst::CreateZExtOrBitCast(
+          Offset,
+          IGCLLVM::FixedVectorType::get(
+              I64Ty, cast<VectorType>(EltsOffset->getType())->getNumElements()),
+          "", CI);
+  }
 
   Function *F = GenXIntrinsic::getGenXDeclaration(
       CI->getModule(), IID,
-      {Pred->getType(), EltsOffset->getType(),
-       ValueOp->getType()});
+      {Pred->getType(), Offset->getType(), ValueOp->getType()});
 
-  Value *logNumBlocks = ConstantInt::get(I32Ty, m_useGlobalMem ? 0 : genx::log2(EltSz));
+  Value *LogNumBlocks = ConstantInt::get(I32Ty, genx::log2(EltSz));
   Value *Scale = ConstantInt::get(Type::getInt16Ty(*m_ctx), 0); // scale is always 0
   Value *Surface = ConstantInt::get(I32Ty,
                                     visa::getReservedSurfaceIndex(m_stack));
   CallInst *ScatterStScaled =
       m_useGlobalMem
-          ? IntrinsicInst::Create(
-                F,
-                {Pred, logNumBlocks, EltsOffset, ValueOp})
-          : IntrinsicInst::Create(
-                F, {Pred, logNumBlocks,
-                    Scale, Surface,
-                    Offset, EltsOffset, ValueOp});
+          ? IntrinsicInst::Create(F, {Pred, LogNumBlocks, Offset, ValueOp})
+          : IntrinsicInst::Create(F, {Pred, LogNumBlocks, Scale, Surface,
+                                      Offset, EltsOffset, ValueOp});
   ScatterStScaled->insertAfter(CI);
-  m_scatter.push_back(ScatterStScaled);
   LLVM_DEBUG(dbgs() << *ScatterStScaled << "\n");
   CI->replaceAllUsesWith(ScatterStScaled);
   CI->eraseFromParent();
@@ -1032,170 +1251,6 @@ static void EraseUsers(Instruction *Inst) {
   }
 }
 
-void SplitScatter(CallInst *CI) {
-  auto IID = static_cast<llvm::GenXIntrinsic::ID>(
-      GenXIntrinsic::getAnyIntrinsicID(CI));
-  IGC_ASSERT((IID == llvm::GenXIntrinsic::genx_scatter_scaled) ||
-             (IID == llvm::GenXIntrinsic::genx_svm_scatter));
-  Type *DataTy = nullptr;
-  if (IID == llvm::GenXIntrinsic::genx_scatter_scaled) {
-    DataTy = CI->getArgOperand(5)->getType();
-  } else if (IID == llvm::GenXIntrinsic::genx_svm_scatter) {
-    DataTy = CI->getArgOperand(2)->getType();
-  }
-  unsigned NumElts = cast<VectorType>(DataTy)->getNumElements();
-  IGC_ASSERT(NumElts % 2 == 0);
-
-  Type *I32Ty = Type::getInt32Ty(CI->getContext());
-  std::pair<Value *, Value *> Splitters = GetUndefPair(I32Ty, NumElts / 2);
-  Splitters.first = FillVecWithSeqVals(Splitters.first, 0, CI);
-  Splitters.second = FillVecWithSeqVals(Splitters.second, NumElts / 2, CI);
-
-  Value *Pred = nullptr;
-  Value *EltOffsets = nullptr;
-  Value *OldVal = nullptr;
-  if (IID == llvm::GenXIntrinsic::genx_scatter_scaled) {
-    Pred = CI->getArgOperand(0);
-    EltOffsets = CI->getArgOperand(5);
-    OldVal = CI->getArgOperand(6);
-  } else if (IID == llvm::GenXIntrinsic::genx_svm_scatter) {
-    Pred = CI->getArgOperand(0);
-    EltOffsets = CI->getArgOperand(2);
-    OldVal = CI->getArgOperand(3);
-  }
-  IGC_ASSERT(Pred && EltOffsets && OldVal);
-
-  std::pair<Value *, Value *> NewPreds = SplitVec(Pred, NumElts, CI, Splitters);
-
-  std::pair<Value *, Value *> NewEltOffsets =
-      SplitVec(EltOffsets, NumElts, CI, Splitters);
-
-  std::pair<Value *, Value *> OldVals =
-      SplitVec(OldVal, NumElts, CI, Splitters);
-
-  Function *F = GenXIntrinsic::getGenXDeclaration(CI->getModule(), IID,
-                                          {NewPreds.first->getType(),
-                                           NewEltOffsets.first->getType(),
-                                           OldVals.first->getType()});
-
-  CallInst *FirstScatter = nullptr;
-  CallInst *SecondScatter = nullptr;
-  if (IID == llvm::GenXIntrinsic::genx_scatter_scaled) {
-    Value *LogNumBlock = CI->getArgOperand(1);
-    Value *Scale = CI->getArgOperand(2);
-    Value *Surface = CI->getArgOperand(3);
-    Value *Offset = CI->getArgOperand(4);
-
-    FirstScatter =
-        IntrinsicInst::Create(F, {NewPreds.first, LogNumBlock, Scale, Surface,
-                                  Offset, NewEltOffsets.first, OldVals.first});
-    SecondScatter = IntrinsicInst::Create(
-        F, {NewPreds.second, LogNumBlock, Scale, Surface, Offset,
-            NewEltOffsets.second, OldVals.second});
-  } else if (IID == llvm::GenXIntrinsic::genx_svm_scatter) {
-    Value *LogNumBlock = CI->getArgOperand(1);
-    FirstScatter = IntrinsicInst::Create(
-        F, {NewPreds.first, LogNumBlock, NewEltOffsets.first, OldVals.first});
-    SecondScatter =
-        IntrinsicInst::Create(F, {NewPreds.second, LogNumBlock,
-                                  NewEltOffsets.second, OldVals.second});
-  }
-  IGC_ASSERT(FirstScatter && SecondScatter);
-
-  auto *MD = CI->getMetadata(InstMD::SVMBlockType);
-  if (MD) {
-    FirstScatter->setMetadata(InstMD::SVMBlockType, MD);
-    SecondScatter->setMetadata(InstMD::SVMBlockType, MD);
-  }
-
-  FirstScatter->insertAfter(CI);
-  SecondScatter->insertAfter(FirstScatter);
-
-  CI->eraseFromParent();
-}
-
-void SplitGather(CallInst *CI) {
-  auto IID = static_cast<llvm::GenXIntrinsic::ID>(
-      GenXIntrinsic::getAnyIntrinsicID(CI));
-  IGC_ASSERT((IID == llvm::GenXIntrinsic::genx_gather_scaled) ||
-             (IID == llvm::GenXIntrinsic::genx_svm_gather));
-  Type *DstTy = CI->getType();
-  unsigned NumElts = cast<VectorType>(DstTy)->getNumElements();
-  IGC_ASSERT(NumElts % 2 == 0);
-
-  Type *I32Ty = Type::getInt32Ty(CI->getContext());
-  std::pair<Value *, Value *> Splitters = GetUndefPair(I32Ty, NumElts / 2);
-  Splitters.first = FillVecWithSeqVals(Splitters.first, 0, CI);
-  Splitters.second = FillVecWithSeqVals(Splitters.second, NumElts / 2, CI);
-
-  Value *Pred = nullptr;
-  Value *EltOffsets = nullptr;
-  Value *OldVal = nullptr;
-  if (IID == llvm::GenXIntrinsic::genx_gather_scaled) {
-    Pred = CI->getArgOperand(0);
-    EltOffsets = CI->getArgOperand(5);
-    OldVal = CI->getArgOperand(6);
-  } else if (IID == llvm::GenXIntrinsic::genx_svm_gather) {
-    Pred = CI->getArgOperand(0);
-    EltOffsets = CI->getArgOperand(2);
-    OldVal = CI->getArgOperand(3);
-  }
-  IGC_ASSERT(Pred && EltOffsets && OldVal);
-
-  std::pair<Value *, Value *> NewPreds = SplitVec(Pred, NumElts, CI, Splitters);
-
-  std::pair<Value *, Value *> NewEltOffsets =
-      SplitVec(EltOffsets, NumElts, CI, Splitters);
-  std::pair<Value *, Value *> OldVals =
-      SplitVec(OldVal, NumElts, CI, Splitters);
-  Function *F = GenXIntrinsic::getGenXDeclaration(CI->getModule(), IID,
-                                          {OldVals.first->getType(),
-                                           NewPreds.first->getType(),
-                                           NewEltOffsets.first->getType()});
-
-  CallInst *FirstGather = nullptr;
-  CallInst *SecondGather = nullptr;
-  if (IID == llvm::GenXIntrinsic::genx_gather_scaled) {
-    Value *LogNumBlock = CI->getArgOperand(1);
-    Value *Scale = CI->getArgOperand(2);
-    Value *Surface = CI->getArgOperand(3);
-    Value *Offset = CI->getArgOperand(4);
-
-    FirstGather =
-        IntrinsicInst::Create(F, {NewPreds.first, LogNumBlock, Scale, Surface,
-                                  Offset, NewEltOffsets.first, OldVals.first});
-    SecondGather = IntrinsicInst::Create(
-        F, {NewPreds.second, LogNumBlock, Scale, Surface, Offset,
-            NewEltOffsets.second, OldVals.second});
-  } else if (IID == llvm::GenXIntrinsic::genx_svm_gather) {
-    Value *LogNumBlock = CI->getArgOperand(1);
-    FirstGather = IntrinsicInst::Create(
-        F, {NewPreds.first, LogNumBlock, NewEltOffsets.first, OldVals.first});
-    SecondGather =
-        IntrinsicInst::Create(F, {NewPreds.second, LogNumBlock,
-                                  NewEltOffsets.second, OldVals.second});
-  }
-  IGC_ASSERT(FirstGather && SecondGather);
-
-  auto *MD = CI->getMetadata(InstMD::SVMBlockType);
-  if (MD) {
-    FirstGather->setMetadata(InstMD::SVMBlockType, MD);
-    SecondGather->setMetadata(InstMD::SVMBlockType, MD);
-  }
-
-  FirstGather->insertAfter(CI);
-  SecondGather->insertAfter(FirstGather);
-
-  Value *Joiner = FillVecWithSeqVals(GetUndefVec(I32Ty, NumElts), 0, CI);
-  IRBuilder<> Builder(CI);
-  Builder.SetInsertPoint(SecondGather->getNextNode());
-  Value *JointGather =
-      Builder.CreateShuffleVector(FirstGather, SecondGather, Joiner);
-
-  CI->replaceAllUsesWith(JointGather);
-  CI->eraseFromParent();
-}
-
 class SVMChecker {
   static constexpr unsigned LoadsThreshold = 1;
 
@@ -1231,7 +1286,7 @@ public:
         return LoadsThreshold + 1;
       }
     } else if (isa<PHINode>(V) || isa<ICmpInst>(V)) {
-      // do not go thru phi as loops may appear and
+      // do not go thru phi as cycles may appear and
       // it doesn't seem necessary for the analysis now
       return 0;
     }
@@ -1245,35 +1300,82 @@ public:
   bool operator()(Value *V) { return checkSVMNecessary(V) > LoadsThreshold; }
 };
 
-void GenXThreadPrivateMemory::addUsers(Value *V) {
+void GenXThreadPrivateMemory::switchStack(Module &M) {
+  LLVM_DEBUG(dbgs() << "Switching TPM to SVM\n");
+  IGC_ASSERT(m_ST->isOCLRuntime());
+  M.addModuleFlag(Module::ModFlagBehavior::Error, ModuleMD::UseSVMStack, 1);
+  m_useGlobalMem = true;
+}
+
+void GenXThreadPrivateMemory::addUsers(Value *V, bool ProcessCalls) {
   IGC_ASSERT(isa<Instruction>(V) || isa<Argument>(V));
-  for (const auto &Usr : V->users()) {
-    Instruction *ToAdd = cast<Instruction>(Usr);
+  if (ProcessCalls) {
+    if (auto *CI = dyn_cast<CallInst>(V)) {
+      auto IID = GenXIntrinsic::getAnyIntrinsicID(CI);
+      switch (IID) {
+      case GenXIntrinsic::genx_svm_gather:
+      case GenXIntrinsic::genx_svm_scatter:
+      case GenXIntrinsic::genx_svm_block_ld:
+      case GenXIntrinsic::genx_svm_block_st:
+      case GenXIntrinsic::genx_gather_private:
+      case GenXIntrinsic::genx_scatter_private:
+        ProcessCalls = false;
+        break;
+      default:
+        break;
+      }
+    } else if (isa<LoadInst>(V) || isa<StoreInst>(V))
+      ProcessCalls = false;
+  }
+  for (const auto &U : V->uses()) {
+    Instruction *ToAdd = cast<Instruction>(U.getUser());
+    if (auto *CI = dyn_cast<CallInst>(ToAdd)) {
+      Function *Callee = nullptr;
+      if ((Callee = CI->getCalledFunction()) &&
+          GenXIntrinsic::getAnyIntrinsicID(Callee) ==
+              GenXIntrinsic::not_any_intrinsic &&
+          V->getType()->isPointerTy() && ProcessCalls) {
+        m_Calls[CI->getCalledFunction()].Calls.insert(CI);
+        auto *ArgToTrack =
+            IGCLLVM::getArg(*Callee, IGCLLVM::getArgOperandNo(*CI, &U));
+        LLVM_DEBUG(dbgs() << "Adding arg " << *ArgToTrack << " of "
+                          << Callee->getName() << "\nMet in " << *CI << "\n");
+        m_Calls[CI->getCalledFunction()].Args.insert(ArgToTrack);
+      }
+    }
     auto Found = m_AlreadyAdded.find(ToAdd);
     if (Found == m_AlreadyAdded.end()) {
       m_AlreadyAdded.insert(ToAdd);
-      m_AIUsers.push(ToAdd);
+      m_AIUsers.push({ToAdd, ProcessCalls});
     }
   }
 }
 
 void GenXThreadPrivateMemory::collectEachPossibleTPMUsers() {
+  collectAllocaUsers();
+  collectArgUsers();
+}
+
+void GenXThreadPrivateMemory::collectAllocaUsers() {
   IGC_ASSERT(m_AIUsers.empty());
   // At first collect every alloca user
-  for (auto B = m_allocaToIntrinsic.begin(), E = m_allocaToIntrinsic.end();
-       B != E; ++B) {
-    Instruction *I = dyn_cast<Instruction>(B->first);
+  for (auto Alloca : m_alloca) {
+    Instruction *I = dyn_cast<Instruction>(Alloca);
     IGC_ASSERT(I);
     addUsers(I);
   }
+}
+
+void GenXThreadPrivateMemory::collectArgUsers(bool ProcessCalls) {
+  // IGC_ASSERT(m_AIUsers.empty());
   // Then collect all pointer args - they may be used
   // in loads/stores we need to lower to svm intrinsics
   // m_args already contatins only args that require processing
   for (auto &Arg : m_args)
-    addUsers(Arg);
+    addUsers(Arg, ProcessCalls);
 }
 
-void GenXThreadPrivateMemory::addUsersIfNeeded(Value *V) {
+void GenXThreadPrivateMemory::addUsersIfNeeded(Value *V, bool ProcessCalls) {
   bool isGatherScatterPrivate = false;
   if (IntrinsicInst *CI = dyn_cast<IntrinsicInst>(V)) {
     unsigned ID = GenXIntrinsic::getAnyIntrinsicID(CI);
@@ -1293,48 +1395,241 @@ void GenXThreadPrivateMemory::addUsersIfNeeded(Value *V) {
     return;
   if (m_useGlobalMem ||
       (!isa<LoadInst>(V) && !isa<StoreInst>(V) && !isGatherScatterPrivate))
-    addUsers(V);
+    addUsers(V, ProcessCalls);
 }
 
 bool GenXThreadPrivateMemory::runOnModule(Module &M) {
   m_ST = &getAnalysis<TargetPassConfig>()
               .getTM<GenXTargetMachine>()
               .getGenXSubtarget();
+  m_DL = &M.getDataLayout();
   if (!m_ST->isOCLRuntime())
     m_useGlobalMem = false;
+  GenXBackendConfig &BEConf = getAnalysis<GenXBackendConfig>();
+  CallGraph CG(M);
+  if (PerformStackAnalysis)
+    StackAnalysis{*m_DL, CG,
+                  m_useGlobalMem ? BEConf.getStatelessPrivateMemSize()
+                                 : visa::StackPerThreadScratch}
+        .doAnalysis(M);
   for (auto &F : M)
     visit(F);
   if (m_useGlobalMem ||
       (m_ST->isOCLRuntime() && std::find_if(m_alloca.begin(), m_alloca.end(),
-                                            SVMChecker()) != m_alloca.end())) {
-    LLVM_DEBUG(dbgs() << "Switching TPM to SVM\n");
-    M.addModuleFlag(Module::ModFlagBehavior::Error, ModuleMD::UseSVMStack, 1);
-    m_useGlobalMem = true;
-  }
+                                            SVMChecker()) != m_alloca.end()))
+    switchStack(M);
   bool Result = false;
-  for (auto &F : M)
-    Result |= runOnFunction(F);
+
+  std::unordered_set<Function *> Visited;
+  std::queue<Function *> Worklist;
+  std::for_each(M.begin(), M.end(), [&Worklist](Function &F) {
+    if (genx::isKernel(&F))
+      Worklist.push(&F);
+  });
+
+  while (!Worklist.empty()) {
+    auto *F = Worklist.front();
+    Worklist.pop();
+    if (Visited.count(F) > 0)
+      continue;
+    Visited.insert(F);
+    Result |= runOnFunction(*F);
+    for (auto &N : *CG[F]) {
+      if (N.second->getFunction() &&
+          GenXIntrinsic::getAnyIntrinsicID(N.second->getFunction()) ==
+              GenXIntrinsic::not_any_intrinsic) {
+        Worklist.push(N.second->getFunction());
+        LLVM_DEBUG(dbgs() << "Adding func "
+                          << N.second->getFunction()->getName()
+                          << " to worklist\n");
+      }
+    }
+    if (m_Calls[F].Recreate) {
+      LLVM_DEBUG(dbgs() << "Recreating func " << F->getName() << ": "
+                        << *F->getType() << " -> ");
+      // rewrite func arg types
+      auto FTy = F->getFunctionType();
+      SmallVector<Type *, 4> ArgTys;
+      auto *NewArgTy = IntegerType::get(*m_ctx, m_useGlobalMem ? 64 : 32);
+      for (unsigned i = 0, e = FTy->getNumParams(); i != e; ++i) {
+        if (m_Calls[F].Args.count(IGCLLVM::getArg(*F, i)) > 0)
+          ArgTys.push_back(NewArgTy);
+        else
+          ArgTys.push_back(FTy->getParamType(i));
+      }
+      FTy = FunctionType::get(FTy->getReturnType(), ArgTys, false);
+      // Create the new function.
+      auto *NewFunc = Function::Create(FTy, F->getLinkage(), "");
+      LLVM_DEBUG(dbgs() << *FTy << "\n");
+      NewFunc->takeName(F);
+      NewFunc->copyAttributesFrom(F);
+      F->getParent()->getFunctionList().insert(F->getIterator(), NewFunc);
+      for (auto &NewArg : NewFunc->args()) {
+        auto *OldArg = IGCLLVM::getArg(*F, NewArg.getArgNo());
+        while (!OldArg->user_empty()) {
+          auto *U = OldArg->user_back();
+          if (m_Calls[F].Args.count(OldArg) > 0 && isa<CastInst>(U)) {
+            // we should process a type-changed arg
+            IGC_ASSERT(NewArg.getType() == NewArgTy);
+            if (isa<PtrToIntInst>(U)) {
+              IGC_ASSERT(U->getType()->getScalarType() == NewArgTy);
+              U->replaceAllUsesWith(&NewArg);
+              cast<Instruction>(U)->eraseFromParent();
+            } else if (auto *BC = dyn_cast<BitCastInst>(U)) {
+              auto *NewBC = CastInst::CreateBitOrPointerCast(
+                  &NewArg, BC->getType(), "", BC);
+              BC->replaceAllUsesWith(NewBC);
+              BC->eraseFromParent();
+            } else
+              IGC_ASSERT_MESSAGE(0, "Unsupported cast of a new func arg");
+          } else
+            cast<Instruction>(U)->replaceUsesOfWith(OldArg, &NewArg);
+        }
+        NewArg.takeName(OldArg);
+      }
+      NewFunc->getBasicBlockList().splice(NewFunc->begin(),
+                                          F->getBasicBlockList());
+      while (!F->use_empty()) {
+        auto *U = F->user_back();
+        IGC_ASSERT(checkFunctionCall(U, F));
+        auto *OrigCall = cast<CallInst>(U);
+
+        std::vector<Value *> Args;
+        std::copy(OrigCall->arg_begin(), OrigCall->arg_end(),
+                  std::back_inserter(Args));
+        CallInst *NewCall = CallInst::Create(NewFunc, Args, "", OrigCall);
+        IGC_ASSERT(nullptr != NewCall);
+        NewCall->setCallingConv(OrigCall->getCallingConv());
+        // TODO:
+        // check if this necessary, as we can't assign old mem-bound
+        // attrs to new i64 args
+        // NewCall->setAttributes(OrigCall->getAttributes());
+        if (OrigCall->isTailCall())
+          NewCall->setTailCall();
+        NewCall->setDebugLoc(OrigCall->getDebugLoc());
+        NewCall->takeName(OrigCall);
+        OrigCall->replaceAllUsesWith(NewCall);
+        OrigCall->eraseFromParent();
+      }
+      F->eraseFromParent();
+    }
+  }
   return Result;
+}
+
+bool GenXThreadPrivateMemory::processUsers() {
+  bool Changed = false;
+  while (!m_AIUsers.empty()) {
+    Instruction *I = m_AIUsers.front().first;
+    bool ProcessCalls = m_AIUsers.front().second;
+    LLVM_DEBUG(dbgs() << "Processing inst: " << *I << "\n");
+    m_AIUsers.pop();
+
+    addUsersIfNeeded(I, ProcessCalls);
+    bool ChangeRequired = false;
+    if (auto *LdI = dyn_cast<LoadInst>(I)) {
+      Changed |= replaceLoad(LdI);
+      ChangeRequired = true;
+    } else if (auto *StI = dyn_cast<StoreInst>(I)) {
+      Changed |= replaceStore(StI);
+      ChangeRequired = true;
+    } else if (auto *PTI = dyn_cast<PtrToIntInst>(I)) {
+      Changed |= replacePTI(PTI);
+      ChangeRequired = true;
+    } else if (auto *AddrCast = dyn_cast<AddrSpaceCastInst>(I)) {
+      Changed |= replaceAddrSpaceCast(AddrCast);
+      ChangeRequired = true;
+    } else if (isa<IntToPtrInst>(I) || isa<BitCastInst>(I)) {
+      // resolve all IntToPtr users and remove it.
+      if (I->use_empty()) {
+        I->eraseFromParent();
+        Changed = true;
+      }
+    } else if (auto *CI = dyn_cast<CallInst>(I)) {
+      unsigned ID = GenXIntrinsic::getAnyIntrinsicID(CI);
+      if (ID == GenXIntrinsic::genx_gather_private) {
+        Changed |= replaceGatherPrivate(CI);
+        ChangeRequired = true;
+      } else if (ID == GenXIntrinsic::genx_scatter_private) {
+        Changed |= replaceScatterPrivate(CI);
+        ChangeRequired = true;
+      } else if (ID == Intrinsic::lifetime_start ||
+                 ID == Intrinsic::lifetime_end) {
+        CI->eraseFromParent();
+        Changed = true;
+      } else if (ID == GenXIntrinsic::not_any_intrinsic) {
+        if (m_Calls[CI->getCalledFunction()].Calls.count(CI) > 0) {
+          for (unsigned i = 0; i < CI->getNumArgOperands(); i++) {
+            if (m_Calls[CI->getCalledFunction()].Args.count(
+                    IGCLLVM::getArg(*CI->getCalledFunction(), i)) > 0)
+              CI->replaceUsesOfWith(
+                  CI->getArgOperand(i),
+                  lookForPtrReplacement(CI->getArgOperand(i)));
+          }
+          Changed = true;
+        } else {
+          processUnchangedCall(*CI);
+          Changed = true;
+        }
+      }
+    } else if (PHINode *Phi = dyn_cast<PHINode>(I)) {
+      if (isa<PointerType>(Phi->getType())) {
+        Changed |= replacePhi(Phi);
+        ChangeRequired = true;
+      }
+    } else if (SelectInst *Sel = dyn_cast<SelectInst>(I)) {
+      if (isa<PointerType>(Sel->getType())) {
+        Changed |= replaceSelect(Sel);
+        ChangeRequired = true;
+      }
+    }
+    if (m_AIUsers.empty()) {
+      if (!Changed && ChangeRequired) {
+        DiagnosticInfoTPM Err{
+            I, "Thread private memory: cannot resolve all alloca uses",
+            DS_Error};
+        I->getContext().diagnose(Err);
+      }
+      Changed = false;
+      collectEachPossibleTPMUsers();
+    }
+  }
+  return Changed;
+}
+
+// TPM tries to rewrite function declaration. It not always can do this.
+// This method fixes call site for such functions. Otherwise TPM may delete
+// call as PotentiallyDeadInst.
+void GenXThreadPrivateMemory::processUnchangedCall(CallInst &CI) {
+  auto &&PointerArgs = make_filter_range(CI.args(), [](const Use &U) {
+    return U.get()->getType()->isPointerTy();
+  });
+  for (Use &Arg : PointerArgs) {
+    Value *Replacement = lookForPtrReplacement(Arg.get());
+    // FIXME: Currently TPM presumes that it can replace all pointers with
+    //        integers. Case where pointer call arg has no replace is possible,
+    //        but lookForPtrReplacement won't return nullptr in this case it
+    //        will report an error.
+    if (!Replacement)
+      continue;
+    Value *BackToPtr =
+        new IntToPtrInst{Replacement, Arg.get()->getType(),
+                         Replacement->getName() + ".cast.back", &CI};
+    Arg = BackToPtr;
+  }
 }
 
 bool GenXThreadPrivateMemory::runOnFunction(Function &F) {
   // skip function which is not a kernel or stackfunc
   // typically it's an emulation-related func (__cm_intrinsic_impl_*)
-  if (GenXIntrinsic::getAnyIntrinsicID(&F) !=
-          GenXIntrinsic::not_any_intrinsic ||
-      !(F.hasFnAttribute(genx::FunctionMD::CMStackCall) ||
-        F.hasFnAttribute(genx::FunctionMD::CMGenXMain)))
+  if (GenXIntrinsic::getAnyIntrinsicID(&F) != GenXIntrinsic::not_any_intrinsic)
     return false;
   LLVM_DEBUG(dbgs() << "Running TPM on " << F.getName() << "\n");
-  m_DL = &F.getParent()->getDataLayout();
   m_stack = m_ST->stackSurface();
 
   m_ctx = &F.getContext();
-  m_DL = &F.getParent()->getDataLayout();
   m_alloca.clear();
   m_args.clear();
-  m_gather.clear();
-  m_scatter.clear();
   m_allocaToIntrinsic.clear();
   m_AIUsers = {};
   m_AlreadyAdded.clear();
@@ -1358,111 +1653,35 @@ bool GenXThreadPrivateMemory::runOnFunction(Function &F) {
 
   // Firstly, we resolve dependencies in PHI nodes (see comments in
   // preparePhiForReplacement).
+  LLVM_DEBUG(dbgs() << "Processing phis\n");
   collectEachPossibleTPMUsers();
   bool Changed = false;
   while (!m_AIUsers.empty()) {
-    Instruction *I = m_AIUsers.front();
+    Instruction *I = m_AIUsers.front().first;
     m_AIUsers.pop();
 
-    addUsersIfNeeded(I);
+    addUsersIfNeeded(I, false);
 
     if (PHINode *Phi = dyn_cast<PHINode>(I))
       Changed |= preparePhiForReplacement(Phi);
   }
+  LLVM_DEBUG(dbgs() << "Finished processing phis\n");
 
   // Main loop where instructions are replaced one by one.
   m_AlreadyAdded.clear();
-  collectEachPossibleTPMUsers();
-  while (!m_AIUsers.empty()) {
-    Instruction *I = m_AIUsers.front();
-    LLVM_DEBUG(dbgs() << "Processing inst: " << *I << "\n");
-    m_AIUsers.pop();
+  LLVM_DEBUG(dbgs() << "Processing allocas\n");
+  collectAllocaUsers();
+  Changed |= processUsers();
 
-    addUsersIfNeeded(I);
+  LLVM_DEBUG(dbgs() << "Processing args\n");
+  collectArgUsers(!genx::isKernel(&F));
+  Changed |= processUsers();
 
-    if (auto *LdI = dyn_cast<LoadInst>(I))
-      Changed |= replaceLoad(LdI);
-    else if (auto *StI = dyn_cast<StoreInst>(I))
-      Changed |= replaceStore(StI);
-    else if (auto *PTI = dyn_cast<PtrToIntInst>(I))
-      Changed |= replacePTI(PTI);
-    else if (auto* AddrCast = dyn_cast<AddrSpaceCastInst>(I))
-      Changed |= replaceAddrSpaceCast(AddrCast);
-    else if (isa<IntToPtrInst>(I) || isa<BitCastInst>(I)) {
-      // resolve all IntToPtr users and remove it.
-      if (I->use_empty()) {
-        I->eraseFromParent();
-        Changed = true;
-      }
-    } else if (auto *CI = dyn_cast<CallInst>(I)) {
-      unsigned ID = GenXIntrinsic::getAnyIntrinsicID(CI);
-      if (ID == GenXIntrinsic::genx_gather_private)
-        Changed |= replaceGatherPrivate(CI);
-      else if (ID == GenXIntrinsic::genx_scatter_private)
-        Changed |= replaceScatterPrivate(CI);
-      else if (ID == Intrinsic::lifetime_start ||
-               ID == Intrinsic::lifetime_end) {
-        CI->eraseFromParent();
-        Changed = true;
-      } else if (ID == GenXIntrinsic::not_any_intrinsic) {
-        bool ArgChanged = false;
-        std::for_each(CI->arg_begin(), CI->arg_end(),
-                      [this, &CI, &ArgChanged](Value *Op) {
-                        if (auto *AI = dyn_cast<AllocaInst>(Op)) {
-                          CI->replaceUsesOfWith(AI, m_allocaToIntrinsic.at(AI));
-                          ArgChanged = true;
-                        }
-                      });
-        IGC_ASSERT_MESSAGE(
-            ArgChanged, "Cannot analyze modified alloca passed to other func");
-        Changed = true;
-      }
-    } else if (PHINode *Phi = dyn_cast<PHINode>(I)) {
-      if (isa<PointerType>(Phi->getType()))
-        Changed |= replacePhi(Phi);
-    } else if (SelectInst *Sel = dyn_cast<SelectInst>(I)) {
-      if (isa<PointerType>(Sel->getType()))
-        Changed |= replaceSelect(Sel);
-    }
-
-    if (m_AIUsers.empty()) {
-      if (!Changed)
-        report_fatal_error("Thread private memory: cannot resolve all alloca uses");
-      Changed = false;
-      collectEachPossibleTPMUsers();
-    }
-  }
-
-  for (auto AllocaPair : m_allocaToIntrinsic) {
-    EraseUsers(AllocaPair.first);
-    IGC_ASSERT_MESSAGE(AllocaPair.first->use_empty(),
-      "uses of replaced alloca aren't empty");
-    AllocaPair.first->eraseFromParent();
-  }
-
-  // TODO: Rewrite split conditions due to possible exec sizes are 1, 2, 4, 8,
-  // 16 and 32.
-  for (auto CI : m_gather) {
-    Type *DstTy = CI->getType();
-    unsigned NumElts = cast<VectorType>(DstTy)->getNumElements();
-    unsigned EltSz =
-        getTypeSize<genx::ByteBits>(cast<VectorType>(DstTy)->getElementType(), m_DL);
-    unsigned ExecSz = NumElts * EltSz;
-
-    if (ExecSz > 2 * m_ST->getGRFWidth() || NumElts > 32)
-      SplitGather(CI);
-  }
-
-  for (auto CI : m_scatter) {
-    Type *DataTy =
-        CI->getArgOperand(m_useGlobalMem ? 3 : 5)->getType();
-    unsigned NumElts = cast<VectorType>(DataTy)->getNumElements();
-    unsigned EltSz =
-        getTypeSize<genx::ByteBits>(cast<VectorType>(DataTy)->getElementType(), m_DL);
-    unsigned ExecSz = NumElts * EltSz;
-
-    if (ExecSz > 2 * m_ST->getGRFWidth() || NumElts > 32)
-      SplitScatter(CI);
+  for (auto Alloca : m_alloca) {
+    EraseUsers(Alloca);
+    IGC_ASSERT_MESSAGE(Alloca->use_empty(),
+                       "uses of replaced alloca aren't empty");
+    Alloca->eraseFromParent();
   }
 
   return !m_allocaToIntrinsic.empty();
@@ -1470,4 +1689,61 @@ bool GenXThreadPrivateMemory::runOnFunction(Function &F) {
 
 void GenXThreadPrivateMemory::visitAllocaInst(AllocaInst &I) {
   m_alloca.push_back(&I);
+}
+
+void GenXThreadPrivateMemory::visitFunction(Function &F) {
+  LLVM_DEBUG(dbgs() << "Visiting func " << F.getName() << "\n");
+  if (GenXIntrinsic::isAnyNonTrivialIntrinsic(&F))
+    return;
+  // here we don't use genx::KernelMetadata as it's only able to
+  // deal with kernels while we want to look at functions as well
+  NamedMDNode *Named =
+      F.getParent()->getNamedMetadata(genx::FunctionMD::GenXKernels);
+
+  if (!Named)
+    return;
+
+  auto NodeIt =
+      std::find_if(Named->op_begin(), Named->op_end(), [&F](MDNode *N) {
+        return N->getNumOperands() > KernelMDOp::ArgTypeDescs &&
+               getValueAsMetadata(N->getOperand(KernelMDOp::FunctionRef)) == &F;
+      });
+  if (NodeIt == Named->op_end()) {
+    // not a kernel
+    // check if all call uses of F were met in allocas du chains
+    if (!m_Calls[&F].Calls.empty()) {
+      if (std::all_of(F.user_begin(), F.user_end(), [&F, this](User *U) {
+            return checkFunctionCall(U, &F) && m_Calls[&F].Calls.count(U) > 0;
+          })) {
+        m_args = m_Calls[&F].Args;
+        LLVM_DEBUG(dbgs() << "Confirmed " << m_args.size() << " args of "
+                          << F.getName() << "\n");
+        m_Calls[&F].Recreate = true;
+      } else {
+        DiagnosticInfoTPM Warn(
+            F.getName() + " args are used in TPM, but rewriting impossible",
+            DS_Warning);
+        F.getContext().diagnose(Warn);
+      }
+    }
+    return;
+  }
+  auto *Node = *NodeIt;
+  if (Node->getNumOperands() <= KernelMDOp::ArgTypeDescs)
+    return;
+
+  MDNode *ArgDescNode =
+      cast<MDNode>(Node->getOperand(KernelMDOp::ArgTypeDescs));
+
+  for (auto &Arg : F.args())
+    if (ArgDescNode->getNumOperands() > Arg.getArgNo() &&
+        cast<MDString>(ArgDescNode->getOperand(Arg.getArgNo()))
+                ->getString()
+                .find_lower("svmptr_t") != StringRef::npos) {
+      if (!m_useGlobalMem)
+        switchStack(*F.getParent());
+      LLVM_DEBUG(dbgs() << "Adding svm arg " << Arg << " of " << F.getName()
+                        << "\n");
+      m_args.insert(&Arg);
+    }
 }

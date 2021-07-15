@@ -1,28 +1,10 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2017-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
+============================= end_copyright_notice ===========================*/
 
 #ifndef VISA_BUILDER_DEFINITION_H
 #define VISA_BUILDER_DEFINITION_H
@@ -236,6 +218,32 @@ public:
     VISA_BUILDER_API virtual int AppendVISATwoDstArithmeticInst(ISA_Opcode opcode, VISA_PredOpnd *pred, VISA_EMask_Ctrl emask,
                                           VISA_Exec_Size executionSize, VISA_VectorOpnd *dst1, VISA_VectorOpnd *carry_borrow, VISA_VectorOpnd *src0, VISA_VectorOpnd *src1) = 0;
 
+    /// AppendVISADpasInst -- append a DPAS instruction to this kernel.
+    ///    op (execSize) dst src0 src1 src2
+    /// Precision, depth, repeat count are constant and considered as fields
+    /// of the inst (not operands.). Note that src0 could be null operand.
+    VISA_BUILDER_API virtual int AppendVISADpasInst(ISA_Opcode opcode, VISA_EMask_Ctrl emask, VISA_Exec_Size executionSize,
+        VISA_RawOpnd *tmpDst, VISA_RawOpnd *src0, VISA_RawOpnd *src1, VISA_VectorOpnd *src2,
+        GenPrecision A, GenPrecision W, uint8_t D, uint8_t C) = 0;
+
+    /// AppendVISABfnInst -- append a BFN instruction to this kernel.
+    ///    [pred] op.booleanFuncCtrl[.sat] (emask, execSize) dst src0 src1 src2
+    /// <booleanFuncCtrl> is constant and is considered as a field of the inst,
+    /// not as an operand.
+    VISA_BUILDER_API virtual int AppendVISABfnInst(uint8_t booleanFuncCtrl, VISA_PredOpnd *pred, bool satMode, VISA_EMask_Ctrl emask,
+        VISA_Exec_Size executionSize, VISA_VectorOpnd *tmpDst, VISA_VectorOpnd *src0, VISA_VectorOpnd *src1, VISA_VectorOpnd *sdrc2) = 0;
+
+    /// AppendVISAQwordGatherInst -- append a qword scattered read instruction to this kernel
+    VISA_BUILDER_API virtual int AppendVISAQwordGatherInst(VISA_PredOpnd *pred,
+        VISA_EMask_Ctrl emask, VISA_Exec_Size executionSize,
+        VISA_SVM_Block_Num numBlocks, VISA_StateOpndHandle *surface,
+        VISA_RawOpnd* address, VISA_RawOpnd *src) = 0;
+
+    /// AppendVISAQwordScatterInst -- append a qword scattered write instruction to this kernel
+    VISA_BUILDER_API virtual int AppendVISAQwordScatterInst(VISA_PredOpnd *pred,
+        VISA_EMask_Ctrl emask, VISA_Exec_Size executionSize,
+        VISA_SVM_Block_Num numBlocks, VISA_StateOpndHandle *surface,
+        VISA_RawOpnd* address, VISA_RawOpnd *dst) = 0;
 
 
 

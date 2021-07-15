@@ -13,7 +13,6 @@ namespace IGC
 {
   struct DebugEmitterOpts {
     bool DebugEnabled = false;
-    bool isDirectElf = false;
     bool UseNewRegisterEncoding = true;
     bool EnableSIMDLaneDebugging = true;
     bool EnableGTLocationDebugging = false;
@@ -22,7 +21,8 @@ namespace IGC
     bool EmitDebugLoc = false;
     bool EmitOffsetInDbgLoc = false;
     bool EnableRelocation = false;
-    bool EnableElf2ZEBinary = false;
+    bool ZeBinCompatible = false;
+    bool EnforceAMD64Machine = false;
     bool EmitPrologueEnd = true;
     bool ScratchOffsetInOW = true;
     bool EmitATLinkageName = true;

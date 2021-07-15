@@ -6,19 +6,16 @@ SPDX-License-Identifier: MIT
 
 ============================= end_copyright_notice ===========================*/
 
-#ifndef _MERGEURBWRITES_H_
-#define _MERGEURBWRITES_H_
+#pragma once
 
-#include "common/LLVMWarningsPush.hpp"
-#include <llvm/Pass.h>
-#include "common/LLVMWarningsPop.hpp"
+namespace llvm
+{
+    class PassRegistry;
+    class FunctionPass;
+}
 
 namespace IGC
 {
-
-    class CShader;
+    void initializeMergeURBWritesPass(llvm::PassRegistry&);
     llvm::FunctionPass* createMergeURBWritesPass();
-
 }
-
-#endif // _MERGEURBWRITES_H_

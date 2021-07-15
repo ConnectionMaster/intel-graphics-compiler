@@ -1,24 +1,8 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (c) 2000-2021 Intel Corporation
+Copyright (C) 2020-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"),
-to deal in the Software without restriction, including without limitation
-the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom
-the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-IN THE SOFTWARE.
+SPDX-License-Identifier: MIT
 
 ============================= end_copyright_notice ===========================*/
 
@@ -93,6 +77,12 @@ void GenXOCLRuntimeInfo::KernelInfo::setInstructionUsageProperties(
         case GenXIntrinsic::genx_sudp4a_sat:
         case GenXIntrinsic::genx_usdp4a_sat:
         case GenXIntrinsic::genx_uudp4a_sat:
+        case GenXIntrinsic::genx_dpas:
+        case GenXIntrinsic::genx_dpas2:
+        case GenXIntrinsic::genx_dpasw:
+        case GenXIntrinsic::genx_dpas_nosrc0:
+        case GenXIntrinsic::genx_dpasw_nosrc0:
+          UsesDPAS = true;
           break;
 #if 0
         // ThreadPrivateMemSize was not copied to igcmc structures
@@ -593,7 +583,7 @@ getGenBinary(const FunctionGroup &FG, VISABuilder &VB,
   VISAKernel *BuiltKernel = VB.GetVISAKernel(FG.getHead()->getName().str());
   appendFuncBinary(GenBinary, *FG.getHead(), *BuiltKernel);
   for (Function *F : FG) {
-    if (F->hasFnAttribute(genx::FunctionMD::ReferencedIndirectly)) {
+    if (genx::isReferencedIndirectly(F)) {
       VISAKernel *ExtKernel = VB.GetVISAKernel(F->getName().str());
       IGC_ASSERT_MESSAGE(ExtKernel, "Kernel is null");
       appendFuncBinary(GenBinary, *F, *ExtKernel);
@@ -618,6 +608,13 @@ static void appendGlobalVariableData(
   Accumulator.append(GVInfo.GV, Data.begin(), Data.end());
 }
 
+static unsigned getAlignment(const GlobalVariable &GV) {
+  unsigned Align = GV.getAlignment();
+  if (Align)
+    return Align;
+  return GV.getParent()->getDataLayout().getABITypeAlignment(GV.getValueType());
+}
+
 template <typename GlobalsRangeT>
 std::vector<GVEncodingInfo>
 prepareGlobalInfosForEncoding(GlobalsRangeT &&Globals) {
@@ -630,7 +627,7 @@ prepareGlobalInfosForEncoding(GlobalsRangeT &&Globals) {
   std::transform(RealGlobals.begin(), std::prev(RealGlobals.end()),
                  std::next(RealGlobals.begin()), std::back_inserter(Infos),
                  [](const GlobalVariable &GV, const GlobalVariable &NextGV) {
-                   return GVEncodingInfo{&GV, NextGV.getAlignment()};
+                   return GVEncodingInfo{&GV, getAlignment(NextGV)};
                  });
   Infos.push_back({&*std::prev(RealGlobals.end()), 1u});
   return std::move(Infos);
@@ -736,7 +733,7 @@ RuntimeInfoCollector::collectFunctionGroupInfo(const FunctionGroup &FG) const {
   for (Function *F: FG) {
     if (F == KernelFunction)
       continue;
-    if (F->hasFnAttribute(genx::FunctionMD::CMStackCall)) {
+    if (genx::requiresStackCall(F)) {
       const std::string FuncName = F->getName().str();
       VISAKernel *VF = VB.GetVISAKernel(FuncName);
       IGC_ASSERT_MESSAGE(VF, "Function is null");

@@ -1,35 +1,19 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
+============================= end_copyright_notice ===========================*/
 
 #include "LoopAnalysis.h"
 #include "G4_Kernel.hpp"
+#include "G4_BB.hpp"
+#include "BitSet.h"
 
 using namespace vISA;
 
-G4_BB* Dominator::InterSect(G4_BB* bb, int i, int k)
+G4_BB* ImmDominator::InterSect(G4_BB* bb, int i, int k)
 {
     recomputeIfStale();
 
@@ -86,7 +70,7 @@ G4_BB* Dominator::InterSect(G4_BB* bb, int i, int k)
 * 1. Single pred assginment.
 * 2. To reduce the back trace in the intersect function, a temp buffer for predictor of each nodes is used to record the back trace result.
 */
-void Dominator::runIDOM()
+void ImmDominator::runIDOM()
 {
     iDoms.resize(kernel.fg.size());
     immDoms.resize(kernel.fg.size());
@@ -177,27 +161,25 @@ void Dominator::runIDOM()
 
 void Dominator::runDOM()
 {
-    Doms.resize(kernel.fg.size());
+    // Use bit-set to represent BBs in dominator computation.
+
+    // domBS holds a bitset for every BB in program. Bitset instance
+    // at given index represents list of BBs that dominate BB#index.
+    std::vector<BitSet> domsBS;
+
+    // Construct bitsets corresponding to all BBs. Initialize all
+    // bits to 1.
+    for (unsigned int i = 0; i != kernel.fg.size(); ++i)
+        domsBS.emplace_back(kernel.fg.size(), true);
+
     entryBB = kernel.fg.getEntryBB();
 
     MUST_BE_TRUE(entryBB != nullptr, "Entry BB not found!");
 
-    Doms[entryBB->getId()] = { entryBB };
-    std::unordered_set<G4_BB*> allBBs;
-    for (auto I = kernel.fg.cbegin(), E = kernel.fg.cend(); I != E; ++I)
-    {
-        auto bb = *I;
-        allBBs.insert(bb);
-    }
-
-    for (auto I = kernel.fg.cbegin(), E = kernel.fg.cend(); I != E; ++I)
-    {
-        auto bb = *I;
-        if (bb != entryBB)
-        {
-            Doms[bb->getId()] = allBBs;
-        }
-    }
+    // In dominator computation, entryBB is it's only dominator. All
+    // other BBs have dominator set to every other BB in program.
+    domsBS[entryBB->getId()].clear();
+    domsBS[entryBB->getId()].set(entryBB->getId(), true);
 
     // Actual dom computation
     bool change = true;
@@ -210,58 +192,51 @@ void Dominator::runDOM()
             if (bb == entryBB)
                 continue;
 
-            std::unordered_set<G4_BB*> tmp = { bb };
+            auto oldBS = domsBS[bb->getId()];
 
-            // Compute intersection of dom of preds
-            std::unordered_map<G4_BB*, unsigned int> numInstances;
-
-            //
+            domsBS[bb->getId()].setAll();
+            // Dominators[BB] = Intersection(Dominators[All Pred BBs]) + BB
             for (auto preds : bb->Preds)
             {
-                auto& domPred = Doms[preds->getId()];
-                for (auto domPredBB : domPred)
-                {
-                    auto it = numInstances.find(domPredBB);
-                    if (it == numInstances.end())  //Not found
-                        numInstances.insert(std::make_pair(domPredBB, 1));
-                    else
-                        it->second = it->second + 1;
-                }
+                domsBS[bb->getId()] &= domsBS[preds->getId()];
             }
 
-            // Common BBs appear in numInstances map with second value == bb->Preds count
-            for (auto commonBBs : numInstances)
-            {
-                if (commonBBs.second == bb->Preds.size()) //same size means the bb from all preds.
-                    tmp.insert(commonBBs.first);
-            }
+            // Add bb to it's own dominator set
+            domsBS[bb->getId()].set(bb->getId(), true);
 
-            // Check if Dom set changed for bb in current iter
-            if (tmp.size() != Doms[bb->getId()].size())  //Same size
+            if (oldBS != domsBS[bb->getId()])
             {
-                Doms[bb->getId()] = tmp;
+                // Dominator for bb was modified
                 change = true;
-                continue;
-            }
-            else //Same
-            {
-                auto& domBB = Doms[bb->getId()];
-                for (auto tmpBB : tmp)
-                {
-                    if (domBB.find(tmpBB) == domBB.end()) //Same BB
-                    {
-                        Doms[bb->getId()] = tmp;
-                        change = true;
-                        break;
-                    }
-                    if (change)
-                        break;
-                }
+                break;
             }
         }
     }
 
-    updateImmDom();
+    std::vector<G4_BB*> indexedBBs;
+    indexedBBs.resize(kernel.fg.size());
+    for (auto I = kernel.fg.cbegin(), E = kernel.fg.cend(); I != E; ++I)
+    {
+        auto BB = *I;
+        indexedBBs[BB->getId()] = BB;
+    }
+
+    Doms.resize(kernel.fg.size());
+    for (auto I = kernel.fg.cbegin(), E = kernel.fg.cend(); I != E; ++I)
+    {
+        auto BB = *I;
+
+        auto& domBS = domsBS[BB->getId()];
+
+        for (unsigned int i = 0; i != domsBS.size(); ++i)
+        {
+            if (domBS.isSet(i))
+            {
+                auto domBB = indexedBBs[i];
+                Doms[BB->getId()].insert(domBB);
+            }
+        }
+    }
 }
 
 
@@ -272,14 +247,14 @@ std::unordered_set<G4_BB*>& Dominator::getDom(G4_BB* bb)
     return Doms[bb->getId()];
 }
 
-std::vector<G4_BB*>& Dominator::getImmDom(G4_BB* bb)
+std::vector<G4_BB*>& ImmDominator::getImmDom(G4_BB* bb)
 {
     recomputeIfStale();
 
     return immDoms[bb->getId()];
 }
 
-void Dominator::updateImmDom()
+void ImmDominator::updateImmDom()
 {
     std::vector<BitSet> domBits(kernel.fg.size());
 
@@ -291,7 +266,7 @@ void Dominator::updateImmDom()
     // Update immDom vector with correct ordering
     for (auto bb : kernel.fg)
     {
-        auto& DomBBs = Doms[bb->getId()];
+        auto& DomBBs = kernel.fg.getDominator().getDom(bb);
 
         for (auto domBB : DomBBs)
         {
@@ -302,7 +277,7 @@ void Dominator::updateImmDom()
     iDoms.resize(kernel.fg.size());
     for (auto bb : kernel.fg)
     {
-        auto& DomBBs = Doms[bb->getId()];
+        auto& DomBBs = kernel.fg.getDominator().getDom(bb);
         BitSet tmpBits = domBits[bb->getId()];
         tmpBits.set(bb->getId(), false);
         iDoms[bb->getId()] = bb;
@@ -320,35 +295,69 @@ void Dominator::updateImmDom()
     }
 }
 
-void vISA::Dominator::reset()
+void ImmDominator::reset()
 {
     iDoms.clear();
-    Doms.clear();
     immDoms.clear();
 
     setStale();
 }
 
-void vISA::Dominator::run()
+void ImmDominator::run()
+{
+    // this function re-runs analysis. caller needs to check if
+    // analysis is stale.
+    entryBB = kernel.fg.getEntryBB();
+
+    runIDOM();
+
+    setValid();
+}
+
+void ImmDominator::dump(std::ostream& os)
+{
+    if (isStale())
+        os << "Imm dominator data is stale.\n";
+
+    os << "\n\nImm dom:\n";
+    dumpImmDom(os);
+}
+
+void Dominator::reset()
+{
+    Doms.clear();
+
+    setStale();
+}
+
+void Dominator::run()
 {
     // this function re-runs analysis. caller needs to check if
     // analysis is stale.
     entryBB = kernel.fg.getEntryBB();
 
     runDOM();
-    runIDOM();
 
     setValid();
 }
 
-const std::vector<G4_BB*>& vISA::Dominator::getIDoms()
+void Dominator::dump(std::ostream& os)
+{
+    if (isStale())
+        os << "Dominator data is stale.\n";
+
+    os << "Dom:\n";
+    dumpDom(os);
+}
+
+const std::vector<G4_BB*>& ImmDominator::getIDoms()
 {
     recomputeIfStale();
 
     return iDoms;
 }
 
-G4_BB* Dominator::getCommonImmDom(const std::unordered_set<G4_BB*>& bbs)
+G4_BB* ImmDominator::getCommonImmDom(const std::unordered_set<G4_BB*>& bbs)
 {
     recomputeIfStale();
 
@@ -362,7 +371,7 @@ G4_BB* Dominator::getCommonImmDom(const std::unordered_set<G4_BB*>& bbs)
     {
         maxId = std::max(maxId, bb->getId());
 
-        const auto& DomBB = Doms[bb->getId()];
+        const auto& DomBB = kernel.fg.getDominator().getDom(bb);
         for (G4_BB*& dom : commonImmDoms)
         {
             if (dom != nullptr && DomBB.find(dom) == DomBB.end())
@@ -388,26 +397,57 @@ G4_BB* Dominator::getCommonImmDom(const std::unordered_set<G4_BB*>& bbs)
     return entryBB;
 }
 
-void Dominator::dumpImmDom()
+void ImmDominator::dumpImmDom(std::ostream& os)
 {
     for (auto bb : kernel.fg)
     {
-        printf("BB%d - ", bb->getId());
+        os << "BB" << bb->getId() << " - ";
         auto& domBBs = immDoms[bb->getId()];
         for (auto domBB : domBBs)
         {
-            printf("BB%d", domBB->getId());
+            os << "BB" << domBB->getId();
             if (domBB->getLabel())
             {
-                printf(" (%s)", domBB->getLabel()->getLabel());
+                os << " (" << domBB->getLabel()->getLabel() << ")";
             }
-            printf(", ");
+            os << ", ";
         }
-        printf("\n");
+        os << "\n";
     }
 }
 
-void vISA::Analysis::recomputeIfStale()
+void vISA::Dominator::dumpDom(std::ostream& os)
+{
+    for (auto bb : kernel.fg)
+    {
+        os << "BB" << bb->getId() << " - ";
+        auto& domBBs = Doms[bb->getId()];
+        for (auto domBB : domBBs)
+        {
+            os << "BB" << domBB->getId();
+            if (domBB->getLabel())
+            {
+                os << " (" << domBB->getLabel()->getLabel() << ")";
+            }
+            os << ", ";
+        }
+        os << "\n";
+    }
+}
+
+// return true if bb1 dominates bb2
+bool Dominator::dominates(G4_BB* bb1, G4_BB* bb2)
+{
+    recomputeIfStale();
+
+    auto& dom = getDom(bb2);
+    if (dom.find(bb1) != dom.end())
+        return true;
+
+    return false;
+}
+
+void Analysis::recomputeIfStale()
 {
     if (!isStale() || inProgress)
         return;
@@ -422,7 +462,7 @@ PostDom::PostDom(G4_Kernel& k) : kernel(k)
 {
 }
 
-void vISA::PostDom::reset()
+void PostDom::reset()
 {
     postDoms.clear();
     immPostDoms.clear();
@@ -533,24 +573,25 @@ std::unordered_set<G4_BB*>& PostDom::getPostDom(G4_BB* bb)
     return postDoms[bb->getId()];
 }
 
-void PostDom::dumpImmDom()
+void PostDom::dumpImmDom(std::ostream& os)
 {
-    recomputeIfStale();
+    if (isStale())
+        os << "PostDom data is stale.\n";
 
     for (auto bb : kernel.fg)
     {
-        printf("BB%d - ", bb->getId());
+        os << "BB" << bb->getId();
         auto& pdomBBs = immPostDoms[bb->getId()];
         for (auto pdomBB : pdomBBs)
         {
-            printf("BB%d", pdomBB->getId());
+            os << "BB" << pdomBB->getId();
             if (pdomBB->getLabel())
             {
-                printf(" (%s)", pdomBB->getLabel()->getLabel());
+                os << " (" << pdomBB->getLabel()->getLabel() << ")";
             }
-            printf(", ");
+            os << ", ";
         }
-        printf("\n");
+        os << "\n";
     }
 }
 
@@ -623,4 +664,521 @@ G4_BB* PostDom::getCommonImmDom(std::unordered_set<G4_BB*>& bbs)
     }
 
     return exitBB;
+}
+
+LoopDetection::LoopDetection(G4_Kernel& k) : kernel(k), fg(k.fg)
+{
+}
+
+std::vector<Loop*> vISA::LoopDetection::getTopLoops()
+{
+    recomputeIfStale();
+
+    return topLoops;
+}
+
+Loop* Loop::getInnerMostLoop(const G4_BB* bb)
+{
+    // if current loop contains bb, recurse loop tree and return
+    // most nested loop containing it.
+    // if current loop doesnt contain bb then return nullptr.
+    if (!contains(bb))
+        return nullptr;
+
+    for (auto& nested : immNested)
+        if(auto innerMost = nested->getInnerMostLoop(bb))
+            return innerMost;
+
+    return this;
+}
+
+Loop* LoopDetection::getInnerMostLoop(const G4_BB* bb)
+{
+    recomputeIfStale();
+
+    for (auto& loop : topLoops)
+        if (auto innerMost = loop->getInnerMostLoop(bb))
+            return innerMost;
+
+    return nullptr;
+}
+
+void LoopDetection::reset()
+{
+    allLoops.clear();
+    topLoops.clear();
+
+    PreIdRPostId.clear();
+
+    setStale();
+}
+
+// Adapted from FlowGraph::DFSTraverse.
+// No changes are made to any G4_BB member or to FlowGraph.
+void LoopDetection::DFSTraverse(const G4_BB* startBB, unsigned& preId, unsigned& postId, BackEdges& bes)
+{
+    std::stack<const G4_BB*> traversalStack;
+    traversalStack.push(startBB);
+
+    auto getPreId = [&](const G4_BB* bb)
+    {
+        return PreIdRPostId[bb].first;
+    };
+
+    auto getRPostId = [&](const G4_BB* bb)
+    {
+        return PreIdRPostId[bb].second;
+    };
+
+    auto setPreId = [&](const G4_BB* bb, unsigned int id)
+    {
+        PreIdRPostId[bb].first = id;
+    };
+
+    auto setRPostId = [&](const G4_BB* bb, unsigned int id)
+    {
+        PreIdRPostId[bb].second = id;
+    };
+
+    while (!traversalStack.empty())
+    {
+        auto bb = traversalStack.top();
+        if (getPreId(bb) != UINT_MAX)
+        {
+            // Pre-processed already and continue to the next one.
+            // Before doing so, set postId if not set before.
+            traversalStack.pop();
+            if (getRPostId(bb) == UINT_MAX)
+            {
+            // All bb's succ has been visited (PreId is set) at this time.
+            // if any of its succ has not been finished (RPostId not set),
+            // bb->succ forms a backedge.
+            //
+            // Note: originally, CALL and EXIT will not check back-edges, here
+            //       we skip checking for them as well. (INIT & RETURN should
+            //       be checked as well ?)
+            if (!(bb->getBBType() & (G4_BB_CALL_TYPE | G4_BB_EXIT_TYPE)))
+            {
+                for (auto succBB : bb->Succs)
+                {
+                    if (getRPostId(succBB) == UINT_MAX)
+                    {
+                        BackEdge be = std::make_pair(const_cast<G4_BB*>(bb), succBB);
+                        bes.push_back(be);
+                    }
+                }
+            }
+
+            // Need to keep this after backedge checking so that self-backedge
+            // (single-bb loop) will not be missed.
+            setRPostId(bb, postId++);
+            }
+            continue;
+        }
+
+        setPreId(bb, preId++);
+
+        if (bb->getBBType() & G4_BB_CALL_TYPE)
+        {
+            const G4_BB* returnBB = bb->BBAfterCall();
+
+            if (getPreId(returnBB) == UINT_MAX)
+            {
+                traversalStack.push(returnBB);
+            }
+            else
+            {
+                MUST_BE_TRUE(false, ERROR_FLOWGRAPH);
+            }
+        }
+        else if (bb->getBBType() & G4_BB_EXIT_TYPE)
+        {
+            // Skip
+        }
+        else
+        {
+            // To be consistent with previous behavior, use reverse_iter.
+            auto RIE = bb->Succs.rend();
+            for (auto rit = bb->Succs.rbegin(); rit != RIE; ++rit)
+            {
+                const G4_BB* succBB = *rit;
+                if (getPreId(succBB) == UINT_MAX)
+                {
+                    traversalStack.push(succBB);
+                }
+            }
+        }
+    }
+}
+
+void LoopDetection::findDominatingBackEdges(BackEdges& bes)
+{
+    const auto& BBs = fg.getBBList();
+
+    for (auto& bb : BBs)
+    {
+        PreIdRPostId[bb] = std::make_pair(UINT_MAX, UINT_MAX);
+    }
+
+    unsigned preId = 0;
+    unsigned postID = 0;
+
+    DFSTraverse(fg.getEntryBB(), preId, postID, bes);
+
+    for (auto fn : fg.funcInfoTable)
+    {
+        DFSTraverse(fn->getInitBB(), preId, postID, bes);
+    }
+}
+
+void LoopDetection::populateLoop(BackEdge& backEdge)
+{
+    // check whether dst dominates src
+    auto src = const_cast<G4_BB*>(backEdge.first);
+    auto dst = const_cast<G4_BB*>(backEdge.second);
+
+    auto& domSecond = fg.getDominator().getDom(src);
+    if (domSecond.find(dst) != domSecond.end())
+    {
+        // this is a natural loop back edge. populate all bbs in loop.
+        Loop newLoop(backEdge);
+        newLoop.id = allLoops.size() + 1;
+
+        newLoop.addBBToLoop(src);
+        newLoop.addBBToLoop(dst);
+
+        std::stack<G4_BB*> traversal;
+        traversal.push(src);
+        while (!traversal.empty())
+        {
+            auto bb = traversal.top();
+            traversal.pop();
+
+            // check whether bb's preds are dominated by loop header.
+            // if yes, add them to traversal.
+            for (auto predIt = bb->Preds.begin(); predIt != bb->Preds.end(); ++predIt)
+            {
+                auto pred = (*predIt);
+                // pred is loop header, which is already added to list of loop BBs
+                if (pred == dst)
+                    continue;
+
+                if (dst->dominates(pred) &&
+                    !newLoop.contains(pred))
+                {
+                    // pred is part of loop
+                    newLoop.addBBToLoop(pred);
+                    traversal.push(pred);
+                }
+            }
+        }
+
+        allLoops.emplace_back(newLoop);
+    }
+}
+
+void LoopDetection::computeLoopTree()
+{
+    // create loop tree by iterating over allLoops in descending order
+    // of BB count.
+    std::vector<Loop*> sortedLoops;
+    std::for_each(allLoops.begin(), allLoops.end(), [&](Loop& l) { sortedLoops.push_back(&l); });
+
+    // sorting loops by size of contained BBs makes it easy to create
+    // tree structure relationship of loops.
+    // 1. If loop A has more BBs than loop B then A is either some parent of B or no relationship exists.
+    // 2. For loop A to be a parent of loop B, all BBs of loop B have to be contained in loop A as well.
+    //
+    // processing loops in sorted order of BB size guarantees that we'll create tree in top-down order.
+    // we'll never encounter a situation where new loop to be added to tree is parent of an existing
+    // loop already present in the tree.
+    std::sort(sortedLoops.begin(), sortedLoops.end(), [](Loop* l1, Loop* l2) { return l2->getBBSize() < l1->getBBSize(); });
+
+    for (auto loop : sortedLoops)
+    {
+        addLoop(loop, nullptr);
+    }
+}
+
+void LoopDetection::addLoop(Loop* newLoop, Loop* aParent)
+{
+    if (topLoops.size() == 0)
+    {
+        topLoops.push_back(newLoop);
+        return;
+    }
+
+    // find a place in existing loop tree to insert new loop passed in.
+    // following scenarios exist:
+    // a. loop is nested loop of an existing loop,
+    // b. loop is not nested but is sibling of existing loop,
+    // c. loop is top level parent loop of a certain tree
+
+    // check if newLoop fits in to any existing current top level loop
+    auto siblings = aParent ? aParent->getAllSiblings(topLoops) : topLoops;
+    for (auto& sibling : siblings)
+    {
+        if (newLoop->fullSubset(sibling))
+        {
+            if (sibling->immNested.size() > 0)
+            {
+                addLoop(newLoop, sibling->immNested[0]);
+            }
+            else
+            {
+                sibling->immNested.push_back(newLoop);
+                newLoop->parent = sibling;
+            }
+            return;
+        }
+        else if (newLoop->fullSuperset(sibling))
+        {
+            MUST_BE_TRUE(false, "Not expecting to see parent loop here");
+            return;
+        }
+    }
+
+    // add new sibling to current level
+    newLoop->parent = siblings[0]->parent;
+    if (newLoop->parent)
+    {
+        siblings[0]->parent->immNested.push_back(newLoop);
+    }
+    else
+    {
+        topLoops.push_back(newLoop);
+    }
+}
+
+void LoopDetection::run()
+{
+    BackEdges backEdges;
+    findDominatingBackEdges(backEdges);
+    for (auto& be : backEdges)
+    {
+        populateLoop(be);
+    }
+
+    computeLoopTree();
+
+    setValid();
+}
+
+void LoopDetection::dump(std::ostream& os)
+{
+    if(isStale())
+        os << "Loop info is stale.\n";
+
+    os << "\n\n\nLoop tree:\n";
+
+    for (auto loop : topLoops)
+    {
+        loop->dump();
+    }
+}
+
+// add bb to current loop and to all valid parents
+void Loop::addBBToLoopHierarchy(G4_BB* bb)
+{
+    addBBToLoop(bb);
+
+    if (parent)
+        parent->addBBToLoopHierarchy(bb);
+}
+
+void vISA::Loop::addBBToLoop(G4_BB* bb)
+{
+    if (!contains(bb))
+    {
+        BBs.push_back(bb);
+        BBsLookup.insert(bb);
+    }
+}
+
+bool Loop::fullSubset(Loop* other)
+{
+    if (BBs.size() > other->BBs.size())
+        return false;
+
+    // to avoid O(N^2) lookup, use unordered set of other loop's BBs for lookup
+    auto& otherBBs = other->BBsLookup;
+
+    // check whether current loop's all BBs are fully contained in "other" loop
+    for (auto bb : BBs)
+    {
+        if (otherBBs.find(bb) == otherBBs.end())
+            return false;
+    }
+
+    return true;
+}
+
+bool Loop::fullSuperset(Loop* other)
+{
+    return other->fullSubset(this);
+}
+
+std::vector<Loop*> Loop::getAllSiblings(std::vector<Loop*>& topLoops)
+{
+    if (parent)
+        return parent->immNested;
+
+    return topLoops;
+}
+
+unsigned int Loop::getNestingLevel()
+{
+    if (!parent)
+        return 1;
+
+    return parent->getNestingLevel()+1;
+}
+
+void Loop::dump(std::ostream& os)
+{
+    auto nestingLevel = getNestingLevel();
+    nestingLevel = nestingLevel > 0 ? nestingLevel : 1;
+    for (unsigned int i = 0; i != nestingLevel - 1; ++i)
+    {
+        os << "\t";
+    }
+    os << "L" << id << ": - { ";
+    for (auto bb : BBs)
+    {
+        os << bb->getId();
+        if (bb != BBs.back())
+            os << ", ";
+    }
+    os << " } ";
+
+    os << " BE: {BB" << be.first->getId() << " -> BB" << be.second->getId() << "}\n";
+
+    for (auto& nested : immNested)
+    {
+        nested->dump();
+    }
+}
+
+bool Loop::contains(const G4_BB* bb)
+{
+    return BBsLookup.find(bb) != BBsLookup.end();
+}
+
+bool VarReferences::isUniqueDef(G4_DstRegRegion* dst)
+{
+    recomputeIfStale();
+
+    auto dcl = dst->getTopDcl();
+
+    // return true if spilled variable has a single static def
+    // and it is not live-in to current bb (eg, loop, sub).
+    if (getDefCount(dcl) != 1)
+    {
+        // check whether multiple defs exist in program for current
+        // lb, rb
+        auto lb = dst->getLeftBound();
+        auto rb = dst->getRightBound();
+
+        unsigned int count = 0;
+        const auto& defs = getDefs(dcl);
+        for (auto& def : *defs)
+        {
+            if (std::get<2>(def) <= rb &&
+                std::get<3>(def) >= lb)
+                ++count;
+        }
+
+        if (count > 1)
+            return false;
+    }
+
+    return true;
+}
+
+unsigned int VarReferences::getDefCount(G4_Declare* dcl)
+{
+    auto defs = getDefs(dcl);
+    if (defs)
+        return defs->size();
+    return 0;
+}
+
+const VarReferences::Defs* VarReferences::getDefs(G4_Declare* dcl)
+{
+    recomputeIfStale();
+
+    auto it = VarRefs.find(dcl);
+    if (it != VarRefs.end())
+        return &(it->second.first);
+
+    return nullptr;
+}
+
+const VarReferences::Uses* VarReferences::getUses(G4_Declare* dcl)
+{
+    recomputeIfStale();
+
+    auto it = VarRefs.find(dcl);
+    if (it != VarRefs.end())
+        return &(it->second.second);
+
+    return nullptr;
+}
+
+void VarReferences::reset()
+{
+    VarRefs.clear();
+
+    setStale();
+}
+
+void VarReferences::run()
+{
+    for (auto bb : kernel.fg)
+    {
+        for (auto inst : *bb)
+        {
+            if (inst->isPseudoKill())
+                continue;
+
+            auto dst = inst->getDst();
+
+            if (dst && !dst->isNullReg())
+            {
+                auto topdcl = dst->getTopDcl();
+
+                if (topdcl)
+                {
+                    auto lb = dst->getLeftBound();
+                    auto rb = dst->getRightBound();
+                    auto& Defs = VarRefs[topdcl].first;
+                    Defs.push_back(std::make_tuple(inst, bb, lb, rb));
+                }
+            }
+
+            for (unsigned int i = 0; i != inst->getNumSrc(); ++i)
+            {
+                auto src = inst->getSrc(i);
+                if (src && src->isSrcRegRegion())
+                {
+                    auto topdcl = src->asSrcRegRegion()->getTopDcl();
+                    if (topdcl)
+                    {
+                        auto& Uses = VarRefs[topdcl].second;
+                        Uses.push_back(std::make_tuple(inst, bb));
+                    }
+                }
+            }
+        }
+    }
+
+    setValid();
+}
+
+void VarReferences::dump(std::ostream& os)
+{
+    if (isStale())
+        os << "Data is stale.\n";
+
+    os << "#Dcls with defs/uses: " << VarRefs.size();
 }

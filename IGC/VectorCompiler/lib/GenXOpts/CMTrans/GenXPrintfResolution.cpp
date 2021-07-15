@@ -1,24 +1,8 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (c) 2021 Intel Corporation
+Copyright (C) 2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"),
-to deal in the Software without restriction, including without limitation
-the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom
-the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-IN THE SOFTWARE.
+SPDX-License-Identifier: MIT
 
 ============================= end_copyright_notice ===========================*/
 
@@ -41,8 +25,8 @@ IN THE SOFTWARE.
 //===----------------------------------------------------------------------===//
 
 #include "vc/GenXOpts/GenXOpts.h"
-#include "vc/GenXOpts/Utils/BiFTools.h"
-#include "vc/GenXOpts/Utils/Printf.h"
+#include "vc/Utils/GenX/Printf.h"
+#include "vc/Utils/General/BiF.h"
 
 #include "vc/BiF/PrintfIface.h"
 #include "vc/BiF/Tools.h"
@@ -69,6 +53,7 @@ IN THE SOFTWARE.
 #include <vector>
 
 using namespace llvm;
+using namespace vc;
 using namespace vc::bif::printf;
 
 namespace PrintfImplFunc {
@@ -99,7 +84,7 @@ private:
   void handlePrintfCall(CallInst &OrigPrintf);
   void addPrintfImplDeclarations(Module &M);
   void updatePrintfImplDeclarations(Module &M);
-  void setAlwaysInlineForPrintfImpl();
+  void preparePrintfImplForInlining();
   CallInst &createPrintfInitCall(CallInst &OrigPrintf, int FmtStrSize,
                                  const PrintfArgInfoSeq &ArgsInfo);
   CallInst &createPrintfFmtCall(CallInst &OrigPrintf, CallInst &InitCall);
@@ -178,7 +163,7 @@ bool GenXPrintfResolution::runOnModule(Module &M) {
     IGC_ASSERT_MESSAGE(0, "Error linking printf implementation builtin module");
   }
   updatePrintfImplDeclarations(M);
-  setAlwaysInlineForPrintfImpl();
+  preparePrintfImplForInlining();
   return true;
 }
 
@@ -189,9 +174,9 @@ std::unique_ptr<Module> GenXPrintfResolution::getBiFModule(LLVMContext &Ctx) {
     IGC_ASSERT_MESSAGE(
         vc::bif::disabled(),
         "printf bif module can be empty only if vc bif was disabled");
-    report_fatal_error("printf is not supported when VC BiF is disabled");
+    report_fatal_error("printf implementation module is absent");
   }
-  return getBiFModuleOrReportError(PrintfBiFModuleBuffer, Ctx);
+  return vc::getBiFModuleOrReportError(PrintfBiFModuleBuffer, Ctx);
 }
 
 static void assertPrintfCall(const CallInst &CI) {
@@ -279,11 +264,14 @@ void GenXPrintfResolution::addPrintfImplDeclarations(Module &M) {
                                                    PrintfImplTy[FuncID]);
 }
 
-void GenXPrintfResolution::setAlwaysInlineForPrintfImpl() {
+// The function must be internal and have always inline attribute for
+// always-inline pass to inline it and remove the original function body
+// (the both are critical for GenXPrintfLegalization to work correctly).
+void GenXPrintfResolution::preparePrintfImplForInlining() {
   for (auto Callee : PrintfImplDecl) {
     auto *Func = cast<Function>(Callee.getCallee());
-    if (!Func->hasFnAttribute(Attribute::AlwaysInline))
-      Func->addFnAttr(Attribute::AlwaysInline);
+    Func->setLinkage(GlobalValue::LinkageTypes::InternalLinkage);
+    Func->addFnAttr(Attribute::AlwaysInline);
   }
 }
 

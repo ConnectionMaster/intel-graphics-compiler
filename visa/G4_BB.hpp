@@ -1,28 +1,11 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
+============================= end_copyright_notice ===========================*/
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
 #ifndef G4_BB_H
 #define G4_BB_H
 
@@ -41,7 +24,7 @@ typedef BB_LIST::const_iterator           BB_LIST_CITER;
 typedef BB_LIST::reverse_iterator         BB_LIST_RITER;
 
 //
-// Block types (relevant for inter-procedural analysis).
+// Block types
 //
 enum G4_BB_TYPE
 {
@@ -49,7 +32,8 @@ enum G4_BB_TYPE
     G4_BB_CALL_TYPE   = 0x01,
     G4_BB_RETURN_TYPE = 0x02,
     G4_BB_INIT_TYPE   = 0x04,
-    G4_BB_EXIT_TYPE   = 0x08
+    G4_BB_EXIT_TYPE   = 0x08,
+    G4_BB_NM_WA_TYPE  = 0x10
 };
 
 class FuncInfo;
@@ -233,7 +217,7 @@ public:
     G4_opcode  getLastOpcode() const;
 
     unsigned   getId() const {return id;}
-    void       setId(unsigned i) {id = i;}
+    void       setId(unsigned i);
 
     unsigned getPreId() const      {return preId;}
     void     setPreId(unsigned i)  {preId = i;}
@@ -288,8 +272,8 @@ public:
     void emit(std::ostream& output);
     void emitInstruction(std::ostream& output, INST_LIST_ITER &it);
     void emitBasicInstruction(std::ostream& output, INST_LIST_ITER &it);
-    void emitBasicInstructionIga(char* instSyntax, std::ostream& output, INST_LIST_ITER &it, int *suppressRegs, int *lastRegs);
-    void emitInstructionInfo(std::ostream& output, INST_LIST_ITER &it);
+    void emitBasicInstructionComment(std::ostream& output, INST_LIST_ITER &it, int *suppressRegs, int *lastRegs);
+    void emitInstructionSourceLineMapping(std::ostream& output, INST_LIST_ITER &it);
     void emitBankConflict(std::ostream& output, const G4_INST *inst);
 
     uint32_t emitBankConflictXe(
@@ -325,12 +309,16 @@ public:
     void dump() const;  // used in debugger
     void dumpDefUse(std::ostream& os = std::cerr) const;
 
+    void emitBbInfo(std::ostream& os) const;
+
     // reset this BB's instruction's local id so they are [0,..#BBInst-1]
     void resetLocalId();
 
     void removeIntrinsics(Intrinsic intrinId);
 
     void addSamplerFlushBeforeEOT();
+
+    bool dominates(G4_BB* other);
 }; // class G4_BB
 } // vISA::
 

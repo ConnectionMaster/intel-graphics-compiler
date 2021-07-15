@@ -20,11 +20,7 @@ See LICENSE.TXT for details.
 #include "llvm/IR/Verifier.h"
 #include "llvm/MC/MCDwarf.h"
 #include "llvm/MC/MCSymbol.h"
-#if LLVM_VERSION_MAJOR == 4
-#include "llvm/Support/ELF.h"
-#elif LLVM_VERSION_MAJOR >= 7
 #include "llvm/BinaryFormat/ELF.h"
-#endif
 #include "common/LLVMWarningsPop.hpp"
 
 #include "DebugInfoUtils.hpp"
@@ -69,7 +65,6 @@ void DebugEmitter::Reset()
 
     m_pStreamEmitter.reset();
     m_pDwarfDebug.reset();
-    toFree.clear();
 
     m_initialized = false;
 }
@@ -111,33 +106,6 @@ void DebugEmitter::processCurrentFunction(bool finalize, DbgDecoder* decodedDbg)
             m_pStreamEmitter->EmitLabel(instLabel);
         }
     };
-
-    if (!m_pVISAModule->isDirectElfInput) {
-        // Legacy path
-        unsigned int prevOffset = 0;
-        for (const Instruction *pInst : *m_pVISAModule)
-        {
-            unsigned int currOffset = m_pVISAModule->GetVisaOffset(pInst);
-
-            int currSize = (int)m_pVISAModule->GetVisaSize(pInst);
-            bool recordSrcLine = (currSize == 0) ? false : true;
-
-            // Emit bytes up to the current instruction
-            for (; prevOffset < currOffset; prevOffset++)
-            {
-                m_pStreamEmitter->EmitInt8(0);
-            }
-            m_pDwarfDebug->beginInstruction(pInst, recordSrcLine);
-            // Emit bytes of the current instruction
-            for (int i = 0; i < currSize; i++)
-            {
-                m_pStreamEmitter->EmitInt8(0);
-            }
-            m_pDwarfDebug->endInstruction(pInst);
-            prevOffset += currSize;
-        }
-        return;
-    }
 
     m_pVISAModule->buildDirectElfMaps(*decodedDbg);
     auto co = m_pVISAModule->getCompileUnit(*decodedDbg);
@@ -296,10 +264,7 @@ std::vector<char> DebugEmitter::Finalize(bool finalize, DbgDecoder* decodedDbg,
     }
 
     IGC_ASSERT_MESSAGE(m_pVISAModule, "active visa object must be selected before finalization");
-    if (m_pVISAModule->isDirectElfInput)
-    {
-        m_pDwarfDebug->setDecodedDbg(decodedDbg);
-    }
+    m_pDwarfDebug->setDecodedDbg(decodedDbg);
 
     if (!doneOnce)
     {
@@ -337,14 +302,14 @@ std::vector<char> DebugEmitter::Finalize(bool finalize, DbgDecoder* decodedDbg,
         phtSize = sizeof(llvm::ELF::Elf64_Phdr);
 
     unsigned int kernelNameSizeWithDot = 0;
-    if (m_pStreamEmitter->GetEmitterSettings().EnableElf2ZEBinary)
+    if (m_pStreamEmitter->GetEmitterSettings().ZeBinCompatible)
     {
         kernelNameSizeWithDot = sizeof('.') + pFunc->getName().size();
     }
     size_t elfWithProgramHeaderSize = m_str.size() + phtSize + kernelNameSizeWithDot;
     std::vector<char> Result(elfWithProgramHeaderSize);
 
-    if (!m_pStreamEmitter->GetEmitterSettings().EnableElf2ZEBinary)
+    if (!m_pStreamEmitter->GetEmitterSettings().ZeBinCompatible)
     {
         // Text section remains with its standard name .text
         std::copy(m_str.begin(), m_str.end(), Result.begin());
@@ -371,9 +336,7 @@ std::vector<char> DebugEmitter::Finalize(bool finalize, DbgDecoder* decodedDbg,
     }
 
     writeProgramHeaderTable(is64Bit, Result.data(), m_str.size() + kernelNameSizeWithDot);
-
-    if (m_pVISAModule->isDirectElfInput)
-        setElfType(is64Bit, Result.data());
+    setElfType(is64Bit, Result.data());
 
     // Reset all members and prepare for next beginModule() call.
     Reset();
@@ -415,7 +378,6 @@ void DebugEmitter::prepareElfForZeBinary(bool is64Bit, char* pElfBuffer, size_t 
 
         // Using the offset found above get a header of the String Table section
         SElf64SectionHeader* pNamesSectionHeader = (SElf64SectionHeader*)((char*)pElf64Header + nameSectionHeaderOffset);
-
         SElf64SectionHeader* pSectionHeader = NULL;
         size_t indexedSectionHeaderOffset = 0;
         Elf64_Word textSectionHeaderName = 0;
@@ -442,8 +404,8 @@ void DebugEmitter::prepareElfForZeBinary(bool is64Bit, char* pElfBuffer, size_t 
             {
                 textSectionHeaderName = pSectionHeader->Name;   // Remember for the next loop over sections.
                 textSectionNameOffset = sectionNameOffset;      // Remember for the next loop over sections.
+                pNamesSectionHeader->DataSize += kernelNameWithDotSize; //.strtab size increases not .text section
 
-                pSectionHeader->DataSize += kernelNameWithDotSize;
                 // Return an offset (from the beginning of ELF binary) to the first character after '.text'
                 *pEndOfDotTextNameInStrtab = sectionNameOffset + sizeof(".text") - 1;
                 break; // Text section found, its location saved.

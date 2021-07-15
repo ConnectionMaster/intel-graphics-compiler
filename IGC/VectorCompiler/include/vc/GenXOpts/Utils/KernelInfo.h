@@ -1,24 +1,8 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (c) 2000-2021 Intel Corporation
+Copyright (C) 2017-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"),
-to deal in the Software without restriction, including without limitation
-the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom
-the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-IN THE SOFTWARE.
+SPDX-License-Identifier: MIT
 
 ============================= end_copyright_notice ===========================*/
 
@@ -40,6 +24,25 @@ namespace genx {
 
 enum { VISA_MAJOR_VERSION = 3, VISA_MINOR_VERSION = 6 };
 
+// Utility function to tell if a Function needs to be called using
+// vISA stack call ABI.
+inline bool requiresStackCall(const Function *F) {
+  IGC_ASSERT(F);
+  return F->hasFnAttribute(genx::FunctionMD::CMStackCall);
+}
+
+// Utility function to tell if a Function referenced indirectly.
+inline bool isReferencedIndirectly(const Function *F) {
+  IGC_ASSERT(F);
+  bool HasIndirectReference =
+      F->hasFnAttribute(genx::FunctionMD::ReferencedIndirectly);
+  // Note: currently, all indirectly-referenced functions are expected to
+  // have FunctionMD::CMStackCall.
+  // The assert should be removed if this property becomes obsolete.
+  IGC_ASSERT(!HasIndirectReference ||
+             F->hasFnAttribute(genx::FunctionMD::CMStackCall));
+  return HasIndirectReference;
+}
 
 // Utility function to tell whether a Function is a vISA kernel.
 inline bool isKernel(const Function *F) {
@@ -65,6 +68,11 @@ using LinearizedArgInfo = std::vector<ImplicitLinearizationInfo>;
 using ArgToImplicitLinearization =
     std::unordered_map<Argument *, LinearizedArgInfo>;
 
+inline bool isDescBufferType(StringRef TypeDesc) {
+  return (TypeDesc.find_lower("buffer_t") != StringRef::npos &&
+          TypeDesc.find_lower("image1d_buffer_t") == StringRef::npos);
+}
+
 /// KernelMetadata : class to parse and update kernel metadata
 class KernelMetadata {
 public:
@@ -89,13 +97,7 @@ private:
   SmallVector<StringRef, 4> ArgTypeDescs;
   SmallVector<unsigned, 4> ArgIndexes;
   SmallVector<unsigned, 4> OffsetInArgs;
-  // Assign a BTI value to a surface or sampler, OCL path only.
-  // Given buffer x,                       --> UAV
-  //       read_only image                 --> SRV
-  //       write_only or read_write image  --> UAV
-  //
-  // First assign SRV then UAV resources.
-  SmallVector<int32_t, 4> BTIs;
+  std::vector<int> BTIs;
   ArgToImplicitLinearization Linearization;
 
 public:
@@ -111,7 +113,8 @@ public:
   KernelMetadata(const Function *F);
 
 private:
-  void updateArgsMD(const SmallVectorImpl<unsigned> &Values, MDNode *Node,
+  template <typename InputIt>
+  void updateArgsMD(InputIt Begin, InputIt End, MDNode *Node,
                     unsigned NodeOpNo) const;
 
 public:
@@ -120,6 +123,7 @@ public:
   void updateArgIndexesMD(SmallVectorImpl<unsigned> &&Indexes);
   void updateOffsetInArgsMD(SmallVectorImpl<unsigned> &&Offsets);
   void updateLinearizationMD(ArgToImplicitLinearization &&Lin);
+  void updateBTIndicesMD(std::vector<int> &&BTIs);
 
   bool hasArgLinearization(Argument *Arg) const {
     return Linearization.count(Arg);
@@ -148,6 +152,7 @@ public:
   unsigned getSLMSize() const { return SLMSize; }
   ArrayRef<unsigned> getArgKinds() const { return ArgKinds; }
   ArrayRef<ArgIOKind> getArgIOKinds() const { return ArgIOKinds; }
+  ArrayRef<StringRef> getArgTypeDescs() const { return ArgTypeDescs; }
   unsigned getNumArgs() const { return ArgKinds.size(); }
   unsigned getArgKind(unsigned Idx) const { return ArgKinds[Idx]; }
   StringRef getArgTypeDesc(unsigned Idx) const {
@@ -172,94 +177,12 @@ public:
 
   // check if an argument is annotated with attribute "buffer_t".
   bool isBufferType(unsigned Idx) const {
-    return (getArgTypeDesc(Idx).find_lower("buffer_t") != StringRef::npos &&
-      getArgTypeDesc(Idx).find_lower("image1d_buffer_t") == StringRef::npos);
+    return isDescBufferType(getArgTypeDesc(Idx));
   }
 
-  // check if an argument is annotated with attribute "image{1,2,3}d_t".
-  bool isImageType(unsigned Idx) const {
-    return getArgTypeDesc(Idx).find_lower("image1d_t") != StringRef::npos ||
-           getArgTypeDesc(Idx).find_lower("image2d_t") != StringRef::npos ||
-           getArgTypeDesc(Idx).find_lower("image3d_t") != StringRef::npos ||
-           getArgTypeDesc(Idx).find_lower("image1d_buffer_t") != StringRef::npos;
-  }
-
-  int32_t getBTI(unsigned Index) {
-    if (BTIs.empty())
-      computeBTIs();
+  int32_t getBTI(unsigned Index) const {
     IGC_ASSERT(Index < BTIs.size());
     return BTIs[Index];
-  }
-
-  enum {
-    // Reserved surface indices start from 253, see GenXCodeGen/GenXVisa.h
-    // TODO: consider adding a dependency from GenXCodeGen and extract
-    // "252" from there
-    K_MaxAvailableBtiIndex = 252
-  };
-  // Assign BTIs lazily.
-  void computeBTIs() {
-    unsigned SurfaceID = 0;
-    unsigned SamplerID = 0;
-
-    IGC_ASSERT_MESSAGE(F, "BTI assignment requires a function to process");
-    const Module* M = F->getParent();
-    // If module does have Debuggable Kernels, then BTI=0 is reserved
-    if (M->getNamedMetadata(DebugMD::DebuggableKernels))
-      SurfaceID = SamplerID = 1;
-
-    auto Desc = ArgTypeDescs.begin();
-    // Assign SRV and samplers.
-    for (auto Kind = ArgKinds.begin(); Kind != ArgKinds.end(); ++Kind) {
-      BTIs.push_back(-1);
-      if (*Kind == AK_SAMPLER)
-        BTIs.back() = SamplerID++;
-      else if (*Kind == AK_SURFACE) {
-        StringRef DescStr = *Desc;
-        // By default, an unannotated surface is read_write.
-        if (DescStr.find_lower("read_only") != StringRef::npos) {
-          BTIs.back() = SurfaceID++;
-          if (SurfaceID > K_MaxAvailableBtiIndex) {
-            llvm::report_fatal_error("not enough BTI indeces", false);
-          }
-        }
-      }
-      ++Desc;
-    }
-    // Scan again and assign BTI to UAV resources.
-    Desc = ArgTypeDescs.begin();
-    size_t Idx = 0;
-    for (auto Kind = ArgKinds.begin(); Kind != ArgKinds.end(); ++Kind) {
-      IGC_ASSERT(Idx < BTIs.size());
-      if (*Kind == AK_SURFACE && BTIs[Idx] == -1) {
-        BTIs[Idx] = SurfaceID++;
-      }
-      // SVM arguments are also assigned an BTI, which is not necessary, but OCL
-      // runtime requires it.
-      if (*Kind == AK_NORMAL) {
-        IGC_ASSERT(Desc != ArgTypeDescs.end());
-        StringRef DescStr = *Desc;
-        if (DescStr.find_lower("svmptr_t") != StringRef::npos) {
-          IGC_ASSERT(Idx < BTIs.size());
-          BTIs[Idx] = SurfaceID++;
-          if (SurfaceID > K_MaxAvailableBtiIndex) {
-            llvm::report_fatal_error("not enough BTI indeces", false);
-          }
-        }
-      }
-      // print buffer is also assigned with BTI, which is not necessary, but OCL
-      // runtime requires it.
-      if (*Kind & KernelMetadata::IMP_OCL_PRINTF_BUFFER) {
-        IGC_ASSERT(Idx < BTIs.size());
-        BTIs[Idx] = SurfaceID++;
-      }
-
-      if (*Kind & KernelMetadata::IMP_OCL_PRIVATE_BASE) {
-        IGC_ASSERT(Idx < BTIs.size());
-        BTIs[Idx] = SurfaceID++;
-      }
-      ++Desc, ++Idx;
-    }
   }
 
   // All the Kinds defined

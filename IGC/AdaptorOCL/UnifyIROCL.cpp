@@ -31,6 +31,7 @@ SPDX-License-Identifier: MIT
 #include "AdaptorCommon/AddImplicitArgs.hpp"
 #include "AdaptorCommon/ProcessFuncAttributes.h"
 #include "AdaptorCommon/LegalizeFunctionSignatures.h"
+#include "AdaptorCommon/TypesLegalizationPass.hpp"
 #include "common/LLVMUtils.h"
 
 #include "Compiler/CISACodeGen/ShaderCodeGen.hpp"
@@ -97,6 +98,7 @@ SPDX-License-Identifier: MIT
 #include "Compiler/MetaDataApi/SpirMetaDataApi.h"
 #include "Compiler/Optimizer/FixFastMathFlags.hpp"
 #include "MoveStaticAllocas.h"
+#include "PreprocessSPVIR.h"
 #include "Compiler/Optimizer/IGCInstCombiner/IGCInstructionCombining.hpp"
 
 #include "common/debug/Debug.hpp"
@@ -241,6 +243,9 @@ static void CommonOCLBasedPasses(
     CompilerOpts.UseBindlessMode =
         pContext->m_InternalOptions.UseBindlessMode;
 
+    CompilerOpts.UseLegacyBindlessMode =
+        pContext->m_InternalOptions.UseBindlessLegacyMode;
+
     CompilerOpts.PreferBindlessImages =
         pContext->m_InternalOptions.PreferBindlessImages ||
         pContext->m_InternalOptions.UseBindlessMode;
@@ -259,6 +264,11 @@ static void CommonOCLBasedPasses(
         pContext->m_InternalOptions.EnableZEBinary;
 
     IGCPassManager mpmSPIR(pContext, "Unify");
+#ifdef IGC_SCALAR_USE_KHRONOS_SPIRV_TRANSLATOR
+    mpmSPIR.add(new PreprocessSPVIR());
+#endif // IGC_SCALAR_USE_KHRONOS_SPIRV_TRANSLATOR
+    mpmSPIR.add(new TypesLegalizationPass());
+    mpmSPIR.add(createDeadCodeEliminationPass());
     mpmSPIR.add(new MetaDataUtilsWrapper(pMdUtils, pContext->getModuleMetaData()));
     mpmSPIR.add(new CodeGenContextWrapper(pContext));
     mpmSPIR.add(new SPIRMetaDataTranslation());
@@ -324,7 +334,6 @@ static void CommonOCLBasedPasses(
     mpm.add(createTimeStatsCounterPass(pContext, TIME_Unify_BuiltinImport, STATS_COUNTER_START));
     mpm.add(createBuiltInImportPass(std::move(BuiltinGenericModule), std::move(BuiltinSizeModule)));
     mpm.add(createTimeStatsCounterPass(pContext, TIME_Unify_BuiltinImport, STATS_COUNTER_END));
-    mpm.add(new UndefinedReferencesPass());
 
     if (IGC_GET_FLAG_VALUE(AllowMem2Reg))
     {
@@ -339,6 +348,13 @@ static void CommonOCLBasedPasses(
         // Estimate maximal function size in the module and disable subroutine if not profitable.
         mpm.add(createEstimateFunctionSizePass());
         mpm.add(createProcessFuncAttributesPass());
+        FastMathFlags Mask;
+        Mask.setFast();
+        Mask.setNoSignedZeros(false);
+        mpm.add(new SetFastMathFlags(Mask));
+
+        // Report undef references after setting func attribs for import linking
+        mpm.add(new UndefinedReferencesPass());
 
         if (IGC_GET_FLAG_VALUE(FunctionControl) != FLAG_FCALL_FORCE_INLINE)
         {
@@ -501,10 +517,9 @@ static void CommonOCLBasedPasses(
     // Only needed if function pointers, externally linked functions, or relocatable global variables are present
     mpm.add(createInsertDummyKernelForSymbolTablePass());
 
-    // Add SetFastMathFalgs pass at the end so that we don't need to worry about previous passes that
-    // forget setting math flags. We expect the generic llvm optimizations after the unification
-    // (optimizeIR()) will fully take advantage of the flags.
-    mpm.add(new SetFastMathFlags());
+    FastMathFlags Mask;
+    Mask.setNoSignedZeros(true);
+    mpm.add(new SetFastMathFlags(Mask));
     mpm.add(new FixResourcePtr());
 
     if(isOptDisabled)

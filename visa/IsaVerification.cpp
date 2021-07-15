@@ -1,28 +1,10 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2017-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
+============================= end_copyright_notice ===========================*/
 
 #ifndef IS_RELEASE_DLL
 
@@ -848,6 +830,11 @@ void vISAVerifier::verifyOperand(
     const CISA_INST* inst,
     unsigned i)
 {
+    if (inst->opcode == ISA_DPAS || inst->opcode == ISA_DPASW)
+    {
+        // skip, as dpas is verified in verifyInstructionMisc().
+        return;
+    }
     MUST_BE_TRUE(header, "Argument Exception: argument header is NULL.");
     MUST_BE_TRUE(inst  , "Argument Exception: argument inst   is NULL.");
     MUST_BE_TRUE(inst->opnd_count > i, "No such operand, i, for instruction inst.");
@@ -938,6 +925,48 @@ void vISAVerifier::verifyInstructionMove(
                                "Source0 operand of CISA MOVS instruction only "
                                "supports general, indirect, and immediate operands.");
             break;
+        }
+        case ISA_BF_CVT:
+        {
+            REPORT_INSTRUCTION(options, getGenxPlatform() >= XeHP_SDV,
+                "BF_CVT is only supported on this platform");
+            REPORT_INSTRUCTION(options, operand_class_dst == OPERAND_GENERAL,
+                "Destination operand of BF_CVT instruction only "
+                "supports general and operands.");
+
+            REPORT_INSTRUCTION(options, operand_class_src0 == OPERAND_GENERAL,
+                "Source0 operand of BF_CVT instruction only "
+                "supports general,  operands.");
+
+            VISA_Type     dstType = getVectorOperandType(header, dst);
+            VISA_Type     src0Type = getVectorOperandType(header, src0);
+
+            // toBeDeletedSoon: checking ISA_TYPE_HF tool
+            if (dstType == ISA_TYPE_UW || dstType == ISA_TYPE_HF)
+            {
+                REPORT_INSTRUCTION(options, src0Type == ISA_TYPE_F,
+                    "BF_CVT with UW(actually BF) dst must have F src");
+            }
+            else if (src0Type == ISA_TYPE_UW || src0Type == ISA_TYPE_HF)
+            {
+                REPORT_INSTRUCTION(options, dstType == ISA_TYPE_F,
+                    "BF_CVT with UW(actually BF) src must have F dst");
+            }
+            else
+            {
+                REPORT_INSTRUCTION(options, false,
+                    "BF_CVT must have either UW(actually BF) dst or src");
+            }
+
+            VISA_Modifier dstModifier = dst.getOperandModifier();
+            REPORT_INSTRUCTION(options, dstModifier == MODIFIER_NONE,
+                "destination modifier not supported for BF conversion");
+
+            VISA_Modifier srcModifier = src0.getOperandModifier();
+            REPORT_INSTRUCTION(options, srcModifier == MODIFIER_NONE,
+                "source modifier not supported for BF conversion");
+            break;
+
         }
         case ISA_SETP:
         {
@@ -1248,7 +1277,52 @@ void vISAVerifier::verifyInstructionMisc(
 
             REPORT_INSTRUCTION(options,!(numOut < 1 || numOut > 8) , "Valid range for num_out parameter of URB write is [1,8]");
             REPORT_INSTRUCTION(options,globalOff <= 2047, "Valid range for global_offset parameter of URB write is [0,2047]");
-            REPORT_INSTRUCTION(options, inst->getExecSize() == EXEC_SIZE_8, "Only execution size of 8 is supported for URB write");
+            REPORT_INSTRUCTION(options, inst->getExecSize() == EXEC_SIZE_1 || inst->getExecSize() == EXEC_SIZE_8,
+                "Only execution size of 1 or 8 is supported for URB write");
+
+            break;
+        }
+        case ISA_DPAS:
+        case ISA_DPASW:
+        {
+            auto FNIsInt = [](VISA_Type Ty) -> bool {
+                return (Ty == ISA_TYPE_UD || Ty == ISA_TYPE_D);
+            };
+            auto FNIsIntOrFloat = [](VISA_Type Ty) -> bool {
+                bool isHFOrBF = false;
+                return (Ty == ISA_TYPE_UD || Ty == ISA_TYPE_D || Ty == ISA_TYPE_F || isHFOrBF);
+            };
+
+            // No predicate
+            REPORT_INSTRUCTION(options, inst->pred.isNullPred(), "%s inst does not support predicate", ISA_Inst_Table[opcode].str);
+
+            {
+                REPORT_INSTRUCTION(options, inst->getExecSize() == EXEC_SIZE_8,
+                    "Only execution size of 8 is supported for %s on platform %s",
+                    ISA_Inst_Table[opcode].str, getGenxPlatformString(getGenxPlatform()));
+            }
+
+            // dst
+            verifyRawOperand(inst, i);
+            const raw_opnd&  dst = getRawOperand(inst, i);
+            verifyRawOperandType(inst, dst, FNIsIntOrFloat);
+
+            // src0
+            verifyRawOperand(inst, ++i);
+            const raw_opnd&  src0 = getRawOperand(inst, i);
+            verifyRawOperandType(inst, src0, FNIsIntOrFloat);
+
+            // src1
+            verifyRawOperand(inst, ++i);
+            const raw_opnd&  src1 = getRawOperand(inst, i);
+            verifyRawOperandType(inst, src1, FNIsInt);
+
+            // src2
+            const vector_opnd&  src2 = getVectorOperand(inst, ++i);
+            VISA_Type  src2Ty = getVectorOperandType(header, src2);
+            VISA_Modifier src2Mod = src2.getOperandModifier();
+            REPORT_INSTRUCTION(options, src2Mod == MODIFIER_NONE,  "Modifier not allowed for %s", ISA_Inst_Table[opcode].str);
+            REPORT_INSTRUCTION(options, FNIsInt(src2Ty), "Only U/UD allowed for %s", ISA_Inst_Table[opcode].str);
 
             break;
         }
@@ -1389,6 +1463,7 @@ void vISAVerifier::verifyInstructionArith(
         case ISA_LZD:
         case ISA_MOD:
         case ISA_MULH:
+        case ISA_MADW:
             REPORT_INSTRUCTION(options, false,
                 "%s does not support saturation",
                 ISA_Inst_Table[opcode].str);
@@ -1412,6 +1487,10 @@ void vISAVerifier::verifyInstructionArith(
         }
     }
 
+    if ((opcode == ISA_DIV && IsIntType(dstType)) || opcode == ISA_MOD)
+    {
+        REPORT_INSTRUCTION(options, platform < XeHP_SDV, "int divide/remainder is not supported for this platform");
+    }
 
     /// check dst type is supported by the instruction
     switch (opcode)
@@ -1461,6 +1540,7 @@ void vISAVerifier::verifyInstructionArith(
         break;
     case ISA_MULH:
     case ISA_DP4A:
+    case ISA_MADW:
         /// U or UD only
         REPORT_INSTRUCTION(options, dstType == ISA_TYPE_D || dstType == ISA_TYPE_UD,
             "%s only support D/UD dst type", ISA_Inst_Table[opcode].str);
@@ -1474,6 +1554,11 @@ void vISAVerifier::verifyInstructionArith(
     case ISA_ADDC:
     case ISA_SUBB:
         REPORT_INSTRUCTION(options, dstType == ISA_TYPE_UD, "%s only supports single UD type", ISA_Inst_Table[opcode].str);
+        break;
+    case ISA_ADD3:
+        REPORT_INSTRUCTION(options, dstType == ISA_TYPE_UD || dstType == ISA_TYPE_D ||
+            dstType == ISA_TYPE_UW || dstType == ISA_TYPE_W,
+            "%s only supports interger D/W type", ISA_Inst_Table[opcode].str);
         break;
     default:
         REPORT_INSTRUCTION(options, dstType == ISA_TYPE_F || dstType == ISA_TYPE_DF || dstType == ISA_TYPE_HF || IsIntType(dstType), "%s has illegal dst type", ISA_Inst_Table[opcode].str);
@@ -1576,6 +1661,12 @@ void vISAVerifier::verifyInstructionArith(
                 "%s src0 and src1 only supports single UD type",
                 ISA_Inst_Table[opcode].str);
             break;
+        case ISA_ADD3:
+            REPORT_INSTRUCTION(options,
+                srcType == ISA_TYPE_D || srcType == ISA_TYPE_UD ||
+                srcType == ISA_TYPE_W || srcType == ISA_TYPE_UW,
+                "%s src operand only supports integer D/W type", ISA_Inst_Table[opcode].str);
+            break;
         default:
             break; // Prevent gcc warning
         }
@@ -1603,6 +1694,15 @@ void vISAVerifier::verifyInstructionLogic(
 
     bool pred_logic = false;
     unsigned opend_count = inst->opnd_count;
+    if (opcode == ISA_BFN)
+    {
+        // check opnd type of the last opend, which is BooleanFuncCtrl
+        REPORT_INSTRUCTION(options,
+            getOperandType(inst, opend_count - 1) == CISA_OPND_OTHER,
+            "last opnd should be CISA_OPND_OTHER type");
+        // skip below type check for booleanFuncCtrl
+        --opend_count;
+    }
     for (unsigned i = 0; i < opend_count; i++)
     {
         const vector_opnd& opnd = getVectorOperand(inst, i);
@@ -2758,6 +2858,8 @@ void vISAVerifier::verifyInstructionDataport(
             case ATOMIC_FMAX:
             case ATOMIC_FMIN:
             case ATOMIC_FCMPWR:
+            case ATOMIC_FADD:
+            case ATOMIC_FSUB:
                 break;
             }
             surface = getPrimitiveOperand<uint8_t>(inst, i++);
@@ -2785,6 +2887,8 @@ void vISAVerifier::verifyInstructionDataport(
             case ATOMIC_FMAX:
             case ATOMIC_FMIN:
             case ATOMIC_FCMPWR:
+            case ATOMIC_FADD:
+            case ATOMIC_FSUB:
                 typeFn = isFType;
                 break;
             }
@@ -2832,6 +2936,8 @@ void vISAVerifier::verifyInstructionDataport(
         }
         case ISA_3D_TYPED_ATOMIC:
         case ISA_3D_RT_WRITE:
+        case ISA_QW_GATHER:
+        case ISA_QW_SCATTER:
         {
             // no verification for now
             break;

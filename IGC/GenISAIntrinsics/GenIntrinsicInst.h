@@ -217,6 +217,20 @@ public:
 
 class SamplerGatherIntrinsic : public GenIntrinsicInst {
 public:
+    bool hasRef() const
+    {
+        switch (getIntrinsicID())
+        {
+        case GenISAIntrinsic::GenISA_gather4Cptr:
+        case GenISAIntrinsic::GenISA_gather4POCptr:
+            return true;
+        default:
+            break;
+        }
+        return false;
+    }
+
+
     inline unsigned int getTextureIndex() const { return getNumOperands() - 7; }
     inline unsigned int getSamplerIndex() const { return getNumOperands() - 6; }
     inline Value* getTextureValue() const { return getOperand(getTextureIndex()); }
@@ -345,6 +359,46 @@ public:
 
 class SampleIntrinsic : public GenIntrinsicInst {
 public:
+    bool hasRef() const
+    {
+        switch (getIntrinsicID())
+        {
+        case GenISAIntrinsic::GenISA_sampleCptr:
+        case GenISAIntrinsic::GenISA_sampleDCptr:
+        case GenISAIntrinsic::GenISA_sampleLCptr:
+        case GenISAIntrinsic::GenISA_sampleBCptr:
+            return true;
+        default:
+            break;
+        }
+        return false;
+    }
+
+    bool hasBias() const
+    {
+        switch (getIntrinsicID())
+        {
+        case GenISAIntrinsic::GenISA_sampleBptr:
+        case GenISAIntrinsic::GenISA_sampleBCptr:
+            return true;
+        default:
+            break;
+        }
+        return false;
+    }
+    bool hasLod() const
+    {
+        switch (getIntrinsicID())
+        {
+        case GenISAIntrinsic::GenISA_sampleLptr:
+        case GenISAIntrinsic::GenISA_sampleLCptr:
+            return true;
+        default:
+            break;
+        }
+        return false;
+    }
+
     inline Value* getSamplerValue() const
     {
         unsigned int index = getSamplerIndex();
@@ -377,7 +431,6 @@ public:
         }
         return index;
     }
-
 
     inline bool IsLODInst() const
     {
@@ -518,6 +571,9 @@ public:
     }
     inline Value* getResourceValue() const {
         return getOperand(0);
+    }
+    inline Value* getStoreValue() const {
+        return getOperand(2);
     }
     inline unsigned int getAlignment() const {
         IGC_ASSERT(isa<ConstantInt>(getAlignmentValue()));

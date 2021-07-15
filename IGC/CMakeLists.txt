@@ -66,6 +66,7 @@ include(igc_llvm_utils)
 # ======================================================================================================
 
 
+
 # ======================================================================================================
 # ==================================== BUILD CONFIGURATIONS (part 1) ===================================
 # ======================================================================================================
@@ -258,9 +259,11 @@ unset(_allowBifLink)
 # Second one is taken as prebuilt shared library called SPIRVDLL
 # These translators will be replaced with vanilla Khronos translator.
 # The following cmake code perfoms search for the such translator.
-# But, until the transition is not completed, this code is under IGC_OPTION__USE_KHRONOS_SPIRV_TRANSLATOR condition
+# But, until the transition is not completed, this code is under IGC_OPTION__LINK_KHRONOS_SPIRV_TRANSLATOR condition
 # Remove this condition after transition period is over
-option(IGC_OPTION__USE_KHRONOS_SPIRV_TRANSLATOR "[Experimental] Enable link against Khronos SPIRV-LLVM-Translator, instead of legacy versions" OFF)
+option(IGC_OPTION__LINK_KHRONOS_SPIRV_TRANSLATOR "[Experimental] Enable link against Khronos SPIRV-LLVM-Translator, instead of legacy versions" OFF)
+option(IGC_OPTION__USE_KHRONOS_SPIRV_TRANSLATOR_IN_VC "[Experimental] Enable usage of Khronos SPIRV-LLVM-Translator in Vector Compiler" OFF)
+option(IGC_OPTION__USE_KHRONOS_SPIRV_TRANSLATOR_IN_SC "[Experimental] Enable usage of Khronos SPIRV-LLVM-Translator in Scalar Compiler" OFF)
 
 option(IGC_OPTION__ENABLE_LIT_TESTS "Enable lit testing for IGC compiler. May require additional tools like llvm lit and opt" OFF)
 
@@ -1256,7 +1259,7 @@ include_directories("${CMAKE_CURRENT_SOURCE_DIR}/WrapperLLVM/include")
 
 # ==================================== SPIRV-LLVM-Translator package ===================================
 
-if(IGC_OPTION__USE_KHRONOS_SPIRV_TRANSLATOR)
+if(IGC_OPTION__LINK_KHRONOS_SPIRV_TRANSLATOR)
   include(igc_spirv)
 endif()
 
@@ -1524,6 +1527,9 @@ if(IGC_OPTION__INCLUDE_IGC_COMPILER_TOOLS)
       ${IGC_BUILD__SRC__IGC__igc_lib}
       ${IGC_BUILD__HDR__IGC__igc_lib}
     )
+  if(IGC_OPTION__LINK_KHRONOS_SPIRV_TRANSLATOR)
+    target_link_libraries("${IGC_BUILD__PROJ__igc_lib}" PRIVATE LLVMSPIRVLib)
+  endif()
   if(MSVC)
     bs_set_wdk(${IGC_BUILD__PROJ__igc_lib})
     windows_libs_props_universal(${IGC_BUILD__PROJ__igc_lib})
@@ -1675,6 +1681,11 @@ list(APPEND _targetLinkLineCommon zebinlib)
       ${IGC_BUILD__LLVM_LIBS_TO_LINK}
       "${IGC_BUILD__END_GROUP}"
     )
+  if(UNIX)
+    list(APPEND _targetLinkLineCommon
+      pthread
+    )
+  endif()
 
   if(_targetIsStatic)
     # Link line for projects that use IGC as static library (allows to resolve multi-circular dependencies between libraries).
@@ -1806,9 +1817,6 @@ if(TARGET "check-igc")
 endif()
 
 
-
-# ======================================================================================================
-# ======================================================================================================
 # ======================================================================================================
 
 # Workaround for MSVS10 to avoid the "Dialog Hell"
@@ -1837,6 +1845,7 @@ if(UNIX)
   install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/AdaptorOCL/ocl_igc_shared DESTINATION ${CMAKE_INSTALL_FULL_INCLUDEDIR}/igc COMPONENT igc-opencl-devel)
   install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/AdaptorOCL/ocl_igc_interface DESTINATION ${CMAKE_INSTALL_FULL_INCLUDEDIR}/igc COMPONENT igc-opencl-devel)
   install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/AdaptorOCL/cif DESTINATION ${CMAKE_INSTALL_FULL_INCLUDEDIR}/igc COMPONENT igc-opencl-devel)
+  install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/common/StateSaveAreaHeader.h DESTINATION ${CMAKE_INSTALL_FULL_INCLUDEDIR}/igc/common COMPONENT igc-opencl-devel)
 
   if(IGC_BUILD__LLVM_SOURCES AND IGC_OPTION__LLVM_LLD)
     # For now lld could be included only via building from LLVM sources

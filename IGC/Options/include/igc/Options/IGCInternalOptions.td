@@ -1,30 +1,12 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (c) 2021-2021 Intel Corporation
+Copyright (C) 2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"),
-to deal in the Software without restriction, including without limitation
-the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom
-the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-IN THE SOFTWARE.
+SPDX-License-Identifier: MIT
 
 ============================= end_copyright_notice ===========================*/
 
 // This file defines internal options accepted by scalar compiler.
-//
-//===----------------------------------------------------------------------===//
 
 // IGC internal options {{
 let Flags = [IGCInternalOption] in {
@@ -71,7 +53,14 @@ defm intel_gtpin_rera : CommonFlag<"intel-gtpin-rera">;
 
 defm intel_enable_prera_scheduling : CommonFlag<"intel-no-prera-scheduling">;
 
-defm intel_use_bindless_buffers : CommonFlag<"intel-use-bindless-buffers">;
+defm intel_128_grf_per_thread : CommonFlag<"intel-128-GRF-per-thread">;
+
+defm opt_large_register_file : CommonFlag<"opt-large-register-file">;
+defm : CommonFlag<"intel-256-GRF-per-thread">,
+  Alias<opt_large_register_file_ze>;
+
+defm intel_num_thread_per_eu : CommonSeparate<"intel-num-thread-per-eu">;
+
 
 defm intel_use_bindless_images : CommonFlag<"intel-use-bindless-images">;
 

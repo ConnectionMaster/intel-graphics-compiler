@@ -198,7 +198,7 @@ namespace IGC
         return nullptr;
     }
 
-    CShader* RetryManager::PickCSEntryByRegKey(SIMDMode& simdMode)
+    CShader* RetryManager::PickCSEntryByRegKey(SIMDMode& simdMode, ComputeShaderContext* cgCtx)
     {
         if (IGC_IS_FLAG_ENABLED(ForceCSSIMD32))
         {
@@ -212,7 +212,8 @@ namespace IGC
                 return m_simdEntries[1];
             }
             else
-                if (IGC_IS_FLAG_ENABLED(ForceCSLeastSIMD))
+                if (IGC_IS_FLAG_ENABLED(ForceCSLeastSIMD)
+                    )
                 {
                     if (m_simdEntries[0])
                     {
@@ -362,7 +363,7 @@ namespace IGC
         if (!shader)
         {
             shader = static_cast<CComputeShader*>(
-                PickCSEntryByRegKey(simdMode));
+                PickCSEntryByRegKey(simdMode, cgCtx));
         }
         if (!shader)
         {
@@ -523,22 +524,52 @@ namespace IGC
 
     uint32_t OpenCLProgramContext::getNumThreadsPerEU() const
     {
+        if (m_Options.IntelRequiredEUThreadCount)
+        {
+            return m_Options.requiredEUThreadCount;
+        }
+        if (m_InternalOptions.IntelNumThreadPerEU || m_InternalOptions.Intel256GRFPerThread)
+        {
+            return m_InternalOptions.numThreadsPerEU;
+        }
+
         return 0;
     }
 
     uint32_t OpenCLProgramContext::getNumGRFPerThread() const
     {
+        if (platform.supportsStaticRegSharing())
+        {
+            if (m_InternalOptions.Intel128GRFPerThread)
+            {
+                return 128;
+            }
+            else if (m_InternalOptions.Intel256GRFPerThread)
+            {
+                return 256;
+            }
+        }
         return CodeGenContext::getNumGRFPerThread();
     }
 
     bool OpenCLProgramContext::forceGlobalMemoryAllocation() const
     {
-        return m_InternalOptions.IntelForceGlobalMemoryAllocation;
+        return m_Options.ForceGlobalMemoryAllocation;
+    }
+
+    bool OpenCLProgramContext::allocatePrivateAsGlobalBuffer() const
+    {
+        return forceGlobalMemoryAllocation() || (m_instrTypes.hasDynamicGenericLoadStore && platform.canForcePrivateToGlobal());
     }
 
     bool OpenCLProgramContext::hasNoLocalToGenericCast() const
     {
-        return m_InternalOptions.hasNoLocalToGeneric || getModuleMetaData()->hasNoLocalToGenericCast;
+        return m_Options.HasNoLocalToGeneric || getModuleMetaData()->hasNoLocalToGenericCast;
+    }
+
+    bool OpenCLProgramContext::hasNoPrivateToGenericCast() const
+    {
+        return getModuleMetaData()->hasNoPrivateToGenericCast;
     }
 
     int16_t OpenCLProgramContext::getVectorCoalescingControl() const
@@ -563,7 +594,7 @@ namespace IGC
         return llvmCtxWrapper;
     }
 
-    IGC::IGCMD::MetaDataUtils* CodeGenContext::getMetaDataUtils()
+    IGC::IGCMD::MetaDataUtils* CodeGenContext::getMetaDataUtils() const
     {
         IGC_ASSERT_MESSAGE(nullptr != m_pMdUtils, "Metadata Utils is not initialized");
         return m_pMdUtils;
@@ -760,9 +791,45 @@ namespace IGC
         }
     }
 
-    // TODO: remove this wrapper once we move to LLVM 11
-    static std::string demangle_wrapper(const std::string &name) {
-#if LLVM_VERSION_MAJOR >= 11
+    static bool handleOpenMPDemangling(const std::string &name, std::string *strippedName) {
+        // OpenMP mangled names have following structure:
+        //
+        // __omp_offloading_DD_FFFF_PP_lBB
+        //
+        // where DD_FFFF is an ID unique to the file (device and file IDs), PP is the
+        // mangled name of the function that encloses the target region and BB is the
+        // line number of the target region.
+        if (name.rfind("__omp_offloading_", 0) != 0) {
+            return false;
+        }
+        size_t offset = sizeof "__omp_offloading_";
+        offset = name.find('_', offset + 1); // Find end of DD.
+        if (offset == std::string::npos)
+            return false;
+        offset = name.find('_', offset + 1); // Find end of FFFF.
+        if (offset == std::string::npos)
+            return false;
+
+        const size_t start = offset + 1;
+        const size_t end = name.rfind('_'); // Find beginning of lBB.
+        if (end == std::string::npos)
+            return false;
+
+        *strippedName = name.substr(start, end - start);
+        return true;
+    }
+
+
+    static std::string demangleFuncName(const std::string &rawName) {
+        // OpenMP adds additional prefix and suffix to the mangling scheme,
+        // remove it if present.
+        std::string name;
+        if (!handleOpenMPDemangling(rawName, &name)) {
+            // If OpenMP demangling didn't succeed just proceed with received
+            // symbol name
+            name = rawName;
+        }
+#if LLVM_VERSION_MAJOR >= 10
         return llvm::demangle(name);
 #else
         char *demangled = nullptr;
@@ -797,7 +864,7 @@ namespace IGC
         if (const llvm::Function *F = getRelatedFunction(context)) {
             // If the function is a kernel just print the kernel name.
             if (isEntryPoint(this, F)) {
-                OS << "\nin kernel: '" << demangle_wrapper(std::string(F->getName())) << "'";
+                OS << "\nin kernel: '" << demangleFuncName(std::string(F->getName())) << "'";
             // If the function is not a kernel try to print all kernels that
             // might be using this function.
             } else {
@@ -805,16 +872,16 @@ namespace IGC
                 findCallingKernels(this, F, kernels);
 
                 const size_t kernelsCount = kernels.size();
-                OS << "\nin function: '" << demangle_wrapper(std::string(F->getName())) << "' ";
+                OS << "\nin function: '" << demangleFuncName(std::string(F->getName())) << "' ";
                 if (kernelsCount == 0) {
                     OS << "called indirectly by at least one of the kernels.\n";
                 } else if (kernelsCount == 1) {
                     const llvm::Function *kernel = *kernels.begin();
-                    OS << "called by kernel: '" << demangle_wrapper(std::string(kernel->getName())) << "'\n";
+                    OS << "called by kernel: '" << demangleFuncName(std::string(kernel->getName())) << "'\n";
                 } else {
                     OS << "called by kernels:\n";
                     for (const llvm::Function *kernel : kernels) {
-                        OS << "  - '" << demangle_wrapper(std::string(kernel->getName())) << "'\n";
+                        OS << "  - '" << demangleFuncName(std::string(kernel->getName())) << "'\n";
                     }
                 }
             }
@@ -867,7 +934,17 @@ namespace IGC
         return false;
     }
 
+    bool CodeGenContext::allocatePrivateAsGlobalBuffer() const
+    {
+        return false;
+    }
+
     bool CodeGenContext::hasNoLocalToGenericCast() const
+    {
+        return false;
+    }
+
+    bool CodeGenContext::hasNoPrivateToGenericCast() const
     {
         return false;
     }

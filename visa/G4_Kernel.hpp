@@ -1,28 +1,11 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
+============================= end_copyright_notice ===========================*/
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
 #ifndef G4_KERNEL_HPP
 #define G4_KERNEL_HPP
 
@@ -165,6 +148,7 @@ private:
     G4_ExecSize simdSize {0u}; // must start as 0
     bool channelSliced = true;
     bool hasAddrTaken;
+    bool regSharingHeuristics;
     Options *m_options;
     const Attributes* m_kernelAttrs;
 
@@ -197,6 +181,9 @@ private:
     std::string            lastG4Asm;
     int                    nextDumpIndex = 0;
 
+    bool sharedDebugInfo = false;
+    bool sharedGTPinInfo = false;
+
 public:
     FlowGraph              fg;
     DECLARE_LIST           Declares;
@@ -213,6 +200,11 @@ public:
 
     void setBuilder(IR_Builder *pBuilder) {fg.setBuilder(pBuilder);}
 
+    bool useRegSharingHeuristics() const {
+        // Register sharing not enabled in presence of stack calls
+        return regSharingHeuristics && !m_hasIndirectCall &&
+            !fg.getIsStackCallFunc() && !fg.getHasStackCalls();
+    }
 
     void     setNumThreads(int nThreads) { numThreads = nThreads; }
     uint32_t getNumThreads() const { return numThreads; }
@@ -258,9 +250,11 @@ public:
     void setRAType(RA_Type type) { RAType = type; }
     RA_Type getRAType() { return RAType; }
 
-    void setKernelDebugInfo(KernelDebugInfo* k) { kernelDbgInfo = k; }
+    bool hasKernelDebugInfo() {return kernelDbgInfo;}
+    void setKernelDebugInfo(KernelDebugInfo* k);
     KernelDebugInfo* getKernelDebugInfo();
 
+    void setGTPinData(gtPinData* p);
     bool hasGTPinInit() const {return gtPinInfo && gtPinInfo->getGTPinInit();}
     gtPinData* getGTPinData() {
         if (!gtPinInfo)
@@ -332,7 +326,8 @@ public:
     // dumps .dot files (if enabled) and .g4 (if enabled)
     void dumpToFile(const std::string &suffix);
 
-    void emitGenAsm(std::ostream& output, const void * binary, uint32_t binarySize);
+    void emitDeviceAsm(std::ostream& output, const void * binary, uint32_t binarySize);
+
     void emitRegInfo();
     void emitRegInfoKernel(std::ostream& output);
 
@@ -342,6 +337,11 @@ private:
     void dumpDotFileInternal(const std::string &baseName);
     void dumpG4Internal(const std::string &baseName);
     void dumpG4InternalTo(std::ostream &os);
+
+    // stuff pertaining to emitDeviceAsm
+    void emitDeviceAsmHeaderComment(std::ostream& os);
+    void emitDeviceAsmInstructionsIga(std::ostream& os, const void * binary, uint32_t binarySize);
+    void emitDeviceAsmInstructionsOldAsm(std::ostream& os);
 
 }; // G4_Kernel
 }

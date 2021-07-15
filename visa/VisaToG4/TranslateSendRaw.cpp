@@ -1,28 +1,10 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2020-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
+============================= end_copyright_notice ===========================*/
 
 #include "BuildIR.h"
 #include "../Timer.h"
@@ -50,9 +32,9 @@ int IR_Builder::translateVISARawSendInst(
     if (msgDescOpnd->isSrcRegRegion())
     {
         // mov (1) a0.0<1>:ud src<0;1,0>:ud {NoMask}
-        G4_DstRegRegion *dstOpnd = Create_Dst_Opnd_From_Dcl(builtinA0, 1);
+        G4_DstRegRegion *dstOpnd = createDstRegRegion(builtinA0, 1);
         createMov(g4::SIMD1, dstOpnd, msgDescOpnd, InstOpt_WriteEnable, true);
-        msgDescOpnd = Create_Src_Opnd_From_Dcl(builtinA0, getRegionScalar());
+        msgDescOpnd = createSrcRegRegion(builtinA0, getRegionScalar());
     }
 
     uint32_t desc = 0;
@@ -108,9 +90,9 @@ int IR_Builder::translateVISARawSendsInst(
     if (msgDescOpnd->isSrcRegRegion())
     {
         // mov (1) a0.0<1>:ud src<0;1,0>:ud {NoMask}
-        G4_DstRegRegion* dstOpnd = Create_Dst_Opnd_From_Dcl(builtinA0, 1);
+        G4_DstRegRegion* dstOpnd = createDstRegRegion(builtinA0, 1);
         createMov(g4::SIMD1, dstOpnd, msgDescOpnd, InstOpt_WriteEnable, true);
-        msgDescOpnd = Create_Src_Opnd_From_Dcl(builtinA0, getRegionScalar());
+        msgDescOpnd = createSrcRegRegion(builtinA0, getRegionScalar());
     }
 
     uint32_t exDescVal = 0;
@@ -126,9 +108,9 @@ int IR_Builder::translateVISARawSendsInst(
     {
         // mov (1) a0.2<1>:ud src<0;1,0>:ud {NoMask}
         // to hold the dynamic ext msg descriptor
-        G4_DstRegRegion* exDescDst = Create_Dst_Opnd_From_Dcl(getBuiltinA0Dot2(), 1);
+        G4_DstRegRegion* exDescDst = createDstRegRegion(getBuiltinA0Dot2(), 1);
         createMov(g4::SIMD1, exDescDst, ex, InstOpt_WriteEnable, true);
-        temp_exdesc_src = Create_Src_Opnd_From_Dcl(getBuiltinA0Dot2(), getRegionScalar());
+        temp_exdesc_src = createSrcRegRegion(getBuiltinA0Dot2(), getRegionScalar());
 
         if (exDescVal == 0)
         {

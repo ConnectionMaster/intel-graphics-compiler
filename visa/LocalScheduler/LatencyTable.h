@@ -1,3 +1,11 @@
+/*========================== begin_copyright_notice ============================
+
+Copyright (C) 2017-2021 Intel Corporation
+
+SPDX-License-Identifier: MIT
+
+============================= end_copyright_notice ===========================*/
+
 #ifndef __LATENCY_TABLE_H
 #define __LATENCY_TABLE_H
 
@@ -56,6 +64,9 @@ namespace vISA
         DELTA                   = 1,    // Extra cycles for wider SIMD sizes, compute only.
         DELTA_MATH              = 4,
         ARF                     = 16,   // latency for ARF dependencies (flag, address, etc.)
+        // Latency for dpas 8x1
+        // Latency for dpas 8x8 is 21 + 7 = 28
+        DPAS = 21,
 
         //
         // Message latencies

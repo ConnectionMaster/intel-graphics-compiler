@@ -1,24 +1,8 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (c) 2000-2021 Intel Corporation
+Copyright (C) 2017-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"),
-to deal in the Software without restriction, including without limitation
-the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom
-the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-IN THE SOFTWARE.
+SPDX-License-Identifier: MIT
 
 ============================= end_copyright_notice ===========================*/
 
@@ -36,6 +20,8 @@ IN THE SOFTWARE.
 #include "GenX.h"
 #include "GenXSubtarget.h"
 #include "GenXTargetMachine.h"
+
+#include "vc/GenXOpts/Utils/KernelInfo.h"
 
 #include "llvm/CodeGen/TargetPassConfig.h"
 #include "llvm/GenXIntrinsics/GenXMetadata.h"
@@ -127,7 +113,7 @@ bool GenXModule::runOnModule(Module &M) {
         }
         // recursive funcs must use stack
         if (Inst->getFunction() == &F) {
-          const bool UsesStack = F.hasFnAttribute(genx::FunctionMD::CMStackCall);
+          const bool UsesStack = genx::requiresStackCall(&F);
           IGC_ASSERT_MESSAGE(UsesStack, "Found recursive function without CMStackCall attribute");
           (void) UsesStack;
         }
@@ -147,20 +133,27 @@ bool GenXModule::runOnModule(Module &M) {
 
   return ModuleModified;
 }
-void GenXModule::updateVisaMapping(const Function *F, const Instruction *Inst,
+void GenXModule::updateVisaMapping(const Function *K, const Instruction *Inst,
                                    unsigned VisaIndex, StringRef Reason) {
-  auto &Mapping = VisaMapping[F];
-  LLVM_DEBUG(dbgs() << "visaCounter update: {" << Mapping.visaCounter << "->"
-                    << VisaIndex << "}, src: ");
-  if (Inst)
-    LLVM_DEBUG(dbgs() << *Inst << "\n");
-  else
-    LLVM_DEBUG(dbgs() << Reason << "\n");
+  // NOTE: K stands for "kernel function". That is the function that is
+  // for the currently generated vISA object
+  IGC_ASSERT(K);
 
-  Mapping.visaCounter = VisaIndex;
-
-  if (!Inst)
+  auto &CurrentCounter = VisaCounter[K];
+  auto PrevCounter = CurrentCounter;
+  CurrentCounter = VisaIndex;
+  if (!Inst) {
+    LLVM_DEBUG(dbgs() << "visaCounter update <" << K->getName() << ">:{"
+                      << PrevCounter << "->" << CurrentCounter
+                      << "}, src: " << Reason << "\n");
     return;
+  }
+
+  const auto *F = Inst->getFunction();
+  LLVM_DEBUG(dbgs() << "visaCounter update <" << K->getName() << "/"
+                    << ((F == K) ? StringRef(".") : F->getName()) << ">: {"
+                    << PrevCounter << "->" << CurrentCounter
+                    << "}, inst: " << *Inst << "\n");
 
   // Unfortunately, our CISA builder routines are not very consistent with
   // respect to the interfaces used to emit vISA.
@@ -170,11 +163,12 @@ void GenXModule::updateVisaMapping(const Function *F, const Instruction *Inst,
   // This check is a workaround for a problem when we may emit an auxiliary
   // visa instruction using the interface which requires us to update the
   // "current instruction" without actually doing so.
+  auto &Mapping = VisaMapping[F];
   const Instruction *LastInst =
       Mapping.V2I.empty() ? nullptr : Mapping.V2I.rbegin()->Inst;
   using MappingT = genx::di::VisaMapping::Mapping;
   if (LastInst != Inst)
-    Mapping.V2I.emplace_back(MappingT{Mapping.visaCounter, Inst});
+    Mapping.V2I.emplace_back(MappingT{CurrentCounter, Inst});
 }
 
 const genx::di::VisaMapping *

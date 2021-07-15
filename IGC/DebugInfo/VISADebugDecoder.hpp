@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2017-2021 Intel Corporation
+Copyright (C) 2020-2021 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -242,7 +242,6 @@ namespace IGC
             std::vector<std::pair<unsigned int, unsigned int>> CISAIndexMap;
             std::vector<VarInfo> Vars;
 
-            uint16_t numSubRoutines = 0;
             std::vector<SubroutineInfo> subs;
             CallFrameInfo cfi;
 

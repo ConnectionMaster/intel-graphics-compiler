@@ -74,8 +74,7 @@ namespace {
         typedef DenseMap<unsigned int, SmallVector<unsigned, 4> > ProfitVectorLengthsMap;
         ProfitVectorLengthsMap ProfitVectorLengths;
 
-        // A list of memory references (within a BB) with the distance to a
-        // previous memory reference in this list.
+        // A list of memory references (within a BB) with the distance to the begining of the BB.
         typedef std::vector<std::pair<Instruction*, unsigned> > MemRefListTy;
         typedef std::vector<Instruction*> TrivialMemRefListTy;
 
@@ -239,7 +238,8 @@ namespace {
                     else
                         accessSize = int64_t(DL->getTypeSizeInBits(acessInst->getOperand(0)->getType())) / 8;
                     mergedSize = cur_offset - firstOffset + accessSize;
-                    if (mergedSize > 4)
+                    // limit the size of merge when alignment < 4
+                    if (mergedSize > 8)
                         AccessIntrs.pop_back();
                     else
                         break;
@@ -447,16 +447,12 @@ bool MemOpt::runOnFunction(Function& F) {
         MemRefListTy MemRefs;
         TrivialMemRefListTy MemRefsToOptimize;
         unsigned Distance = 0;
-        bool FirstMemRef = true;
-        for (auto BI = BB->begin(), BE = BB->end(); BI != BE; ++BI) {
+        for (auto BI = BB->begin(), BE = BB->end(); BI != BE; ++BI, ++Distance) {
             Instruction* I = &(*BI);
-            Distance += FirstMemRef ? 0 : 1;
             // Skip irrelevant instructions.
             if (shouldSkip(I))
                 continue;
             MemRefs.push_back(std::make_pair(I, Distance));
-            Distance = 0;
-            FirstMemRef = false;
         }
 
         // Skip BB with no more than 2 loads/stores.
@@ -495,8 +491,11 @@ bool MemOpt::runOnFunction(Function& F) {
 }
 
 bool MemOpt::mergeLoad(LoadInst* LeadingLoad,
-    MemRefListTy::iterator MI, MemRefListTy& MemRefs,
-    TrivialMemRefListTy& ToOpt) {
+    MemRefListTy::iterator aMI, MemRefListTy& MemRefs,
+    TrivialMemRefListTy& ToOpt)
+{
+    MemRefListTy::iterator MI = aMI;
+
     // Push the leading load into the list to be optimized (after
     // canonicalization.) It will be swapped with the new one if it's merged.
     ToOpt.push_back(LeadingLoad);
@@ -515,8 +514,6 @@ bool MemOpt::mergeLoad(LoadInst* LeadingLoad,
             return false;
         }
     }
-
-    unsigned NumElts = 0;
 
     Type* LeadingLoadType = LeadingLoad->getType();
     Type* LeadingLoadScalarType = LeadingLoadType->getScalarType();
@@ -542,7 +539,9 @@ bool MemOpt::mergeLoad(LoadInst* LeadingLoad,
 
     unsigned LdSize = unsigned(DL->getTypeStoreSize(LeadingLoadType));
     unsigned LdScalarSize = unsigned(DL->getTypeStoreSize(LeadingLoadScalarType));
-    NumElts += getNumElements(LeadingLoadType);
+
+    // NumElts: num of elts if all candidates are actually merged.
+    unsigned NumElts = getNumElements(LeadingLoadType);
     if (NumElts > profitVec[0])
         return false;
 
@@ -579,15 +578,13 @@ bool MemOpt::mergeLoad(LoadInst* LeadingLoad,
     // List of instructions need dependency check.
     SmallVector<Instruction*, 8> CheckList;
 
-    unsigned Limit = IGC_GET_FLAG_VALUE(MemOptWindowSize);
+    const unsigned Limit = IGC_GET_FLAG_VALUE(MemOptWindowSize);
+    // Given the Start position of the Window is MI->second,
+    // the End postion of the Window is "limit + Windows' start".
+    const unsigned windowEnd = Limit + MI->second;
     auto ME = MemRefs.end();
-    for (++MI; Limit != 0 && MI != ME; Limit -= MI->second, ++MI) {
-        // Bail out if the limit is reached.
-        if (Limit < MI->second)
-            break;
-
+    for (++MI; MI != ME && MI->second <= windowEnd; ++MI) {
         Instruction* NextMemRef = MI->first;
-
         // Skip already merged one.
         if (!NextMemRef)
             continue;
@@ -781,17 +778,18 @@ bool MemOpt::mergeLoad(LoadInst* LeadingLoad,
         LoadsToMerge.push_back(std::make_tuple(NextLoad, Off, MI, LeadInt2PtrOffset));
     }
 
-    if (LoadsToMerge.size() < 2)
+    unsigned s = LoadsToMerge.size();
+    if (s < 2)
         return false;
 
     IRBuilder<> Builder(LeadingLoad);
 
     // Start to merge loads.
-
     IGC_ASSERT_MESSAGE(1 < NumElts, "It's expected to merge into at least 2-element vector!");
 
-    // Try to find the profitable vector length first.
-    unsigned s = LoadsToMerge.size();
+    // Sort loads based on their offsets (to the leading load) from the smallest to the largest.
+    // And then try to find the profitable vector length first.
+    std::sort(LoadsToMerge.begin(), LoadsToMerge.end(), less_tuple<1>());
     unsigned MaxElts = profitVec[0];
     for (unsigned k = 1, e = profitVec.size();
         NumElts != MaxElts && k != e && s != 1;) {
@@ -813,10 +811,6 @@ bool MemOpt::mergeLoad(LoadInst* LeadingLoad,
 
     if (NumElts != MaxElts || s < 2)
         return false;
-
-    // Sort loads based on their offsets to the leading load and resize them to
-    // be merged to the profitable length.
-    std::sort(LoadsToMerge.begin(), LoadsToMerge.end(), less_tuple<1>());
     LoadsToMerge.resize(s);
 
     // Loads to be merged will be merged into the leading load. However, the
@@ -972,11 +966,13 @@ bool MemOpt::mergeLoad(LoadInst* LeadingLoad,
         }
         RecursivelyDeleteTriviallyDeadInstructions(Ptr);
         // Mark it as already merged.
+        // Also, skip updating distance as the Window size is just a heuristic.
         std::get<2>(I)->first = nullptr;
-        // Checking zero distance is intentionally omitted here due to the first
-        // memory access won't be able to be checked again.
-        std::get<2>(I)->second -= 1;
     }
+
+    // Add merged load into the leading load position in MemRefListTy
+    // so that MemRefList is still valid and can be reused.
+    aMI->first = NewOne;
 
     return true;
 }
@@ -1050,15 +1046,13 @@ bool MemOpt::mergeStore(StoreInst* LeadingStore,
     // List of instructions need dependency check.
     SmallVector<Instruction*, 8> CheckList;
 
-    unsigned Limit = IGC_GET_FLAG_VALUE(MemOptWindowSize);
+    const unsigned Limit = IGC_GET_FLAG_VALUE(MemOptWindowSize);
+    // Given the Start position of the Window is MI->second,
+    // the End postion of the Window is "limit + Windows' start".
+    const unsigned windowEnd = Limit + MI->second;
     auto ME = MemRefs.end();
-    for (++MI; Limit != 0 && MI != ME; Limit -= MI->second, ++MI) {
-        // Bail out if the limit is reached.
-        if (Limit < MI->second)
-            break;
-
+    for (++MI; MI != ME && MI->second <= windowEnd; ++MI) {
         Instruction* NextMemRef = MI->first;
-
         // Skip already merged one.
         if (!NextMemRef)
             continue;
@@ -1218,7 +1212,8 @@ bool MemOpt::mergeStore(StoreInst* LeadingStore,
             break;
     }
 
-    if (StoresToMerge.size() < 2)
+    unsigned s = StoresToMerge.size();
+    if (s < 2)
         return false;
 
     // Tailing store is always the last one in the program order.
@@ -1235,7 +1230,6 @@ bool MemOpt::mergeStore(StoreInst* LeadingStore,
     IGC_ASSERT_MESSAGE(1 < NumElts, "It's expected to merge into at least 2-element vector!");
 
     // Try to find the profitable vector length first.
-    unsigned s = StoresToMerge.size();
     unsigned MaxElts = profitVec[0];
     for (unsigned k = 1, e = profitVec.size();
         NumElts != MaxElts && k != e && s != 1;) {
@@ -1380,6 +1374,7 @@ bool MemOpt::mergeStore(StoreInst* LeadingStore,
         ST->eraseFromParent();
         RecursivelyDeleteTriviallyDeadInstructions(Ptr);
 
+        // Also, skip updating distance as the Window size is just a heuristic.
         if (std::get<2>(I)->first == TailingStore)
             // Writing NewStore to MemRefs for correct isSafeToMergeLoad working.
             // For example if MemRefs contains this sequence: S1, S2, S3, L5, L6, L7, S4, L4
@@ -1391,9 +1386,6 @@ bool MemOpt::mergeStore(StoreInst* LeadingStore,
         else {
             // Mark it as already merged.
             std::get<2>(I)->first = nullptr;
-            // Checking zero distance is intentionally omitted here due to the first
-            // memory access won't be able to be checked again.
-            std::get<2>(I)->second -= 1;
         }
 
     }

@@ -105,7 +105,6 @@ static inline void CloneFuncMetadata(IGCMD::MetaDataUtils* pM,
     }
 
     pM->setFunctionsInfoItem(ClonedF, Info);
-    pM->save(F->getContext());
 }
 
 Function* GenXCodeGenModule::cloneFunc(Function* F)
@@ -118,45 +117,6 @@ Function* GenXCodeGenModule::cloneFunc(Function* F)
         F->getParent()->getFunctionList().push_back(ClonedFunc);
     CloneFuncMetadata(pMdUtils, ClonedFunc, F);
 
-    // record function is cloned in debug-info
-    {
-        IF_DEBUG_INFO(bool full;)
-            IF_DEBUG_INFO(bool lineOnly;)
-            IF_DEBUG_INFO(CodeGenContext * ctx = getAnalysis<CodeGenContextWrapper>().getCodeGenContext();)
-            bool anyDebugInfo;
-        anyDebugInfo = false;
-        IF_DEBUG_INFO(anyDebugInfo = DebugMetadataInfo::hasAnyDebugInfo(ctx, full, lineOnly);)
-
-
-            if (anyDebugInfo)
-            {
-                auto modMD = getAnalysis<MetaDataUtilsWrapper>().getModuleMetaData();
-                if (modMD)
-                {
-                    auto funcIt = modMD->FuncMD.find(ClonedFunc);
-                    if (funcIt != modMD->FuncMD.end())
-                    {
-                        funcIt->second.isCloned = true;
-                    }
-                    else
-                    {
-                        // copy metadata from original function.
-                        auto orgFuncMetadataIt = modMD->FuncMD.find(F);
-                        if (orgFuncMetadataIt != modMD->FuncMD.end()) {
-                            IGC::FunctionMetaData fMD = orgFuncMetadataIt->second;
-                            fMD.isCloned = true;
-                            modMD->FuncMD.insert(std::make_pair(ClonedFunc, fMD));
-                        }
-                        else
-                        {
-                            // If this assertion is failing, it probably means that ProcessBuiltinMetaData pass
-                            // needs to be changed to recognize duplicate functions and run before DebugInfo pass.
-                            IGC_ASSERT_MESSAGE(false, "Couldn't find metadata for cloned function!");
-                        }
-                    }
-                }
-            }
-    }
     return ClonedFunc;
 }
 
@@ -188,6 +148,25 @@ void GenXCodeGenModule::processFunction(Function& F)
     }
 
     IGC_ASSERT(CallerFGs.size() >= 1);
+
+    // Get the cloning threshold. If the number of function groups a function belongs to
+    // exceeds the threshold, instead of cloning the function N times, make it an indirect call
+    // and use relocation instead. The function will only be compiled once and runtime must relocate
+    // its address for each caller. This greatly saves on compile time when there are many function
+    // groups that all call the same function.
+    auto cloneTheshold = IGC_GET_FLAG_VALUE(FunctionCloningThreshold);
+    if (F.hasFnAttribute("visaStackCall") &&
+        cloneTheshold > 0 && CallerFGs.size() > cloneTheshold)
+    {
+        auto pCtx = getAnalysis<CodeGenContextWrapper>().getCodeGenContext();
+        auto IFG = FGA->getIndirectCallGroup();
+        IGC_ASSERT(IFG);
+        F.addFnAttr("referenced-indirectly");
+        pCtx->m_enableFunctionPointer = true;
+        FGA->addToFunctionGroup(&F, IFG, &F);
+        return;
+    }
+
     bool FirstPair = true;
     for (auto FGPair : CallerFGs)
     {
@@ -248,6 +227,25 @@ void GenXCodeGenModule::processSCC(std::vector<llvm::CallGraphNode*>* SCCNodes)
         }
     }
     IGC_ASSERT(CallerFGs.size() >= 1);
+
+    // Use the same cloning threshold for single function SCCs, but making every stack function
+    // in the SCC indirect calls to prevent cloning the entire SCC N times.
+    auto cloneTheshold = IGC_GET_FLAG_VALUE(FunctionCloningThreshold);
+    if (cloneTheshold > 0 && CallerFGs.size() > cloneTheshold)
+    {
+        auto pCtx = getAnalysis<CodeGenContextWrapper>().getCodeGenContext();
+        for (CallGraphNode* Node : (*SCCNodes))
+        {
+            Function* F = Node->getFunction();
+            auto IFG = FGA->getIndirectCallGroup();
+            IGC_ASSERT(IFG && F->hasFnAttribute("visaStackCall"));
+            F->addFnAttr("referenced-indirectly");
+            pCtx->m_enableFunctionPointer = true;
+            FGA->addToFunctionGroup(F, IFG, F);
+        }
+        return;
+    }
+
     bool FirstPair = true;
     for (auto FG : CallerFGs)
     {
@@ -423,6 +421,8 @@ bool GenXCodeGenModule::runOnModule(Module& M)
         }
         delete SCCNodes;
     }
+
+    this->pMdUtils->save(M.getContext());
 
     // Check and set stack call flag for each group
     FGA->setGroupStackCall();
@@ -641,8 +641,7 @@ void GenXFunctionGroupAnalysis::addIndirectFuncsToKernelGroup(llvm::Module* pMod
         Function* F = &(*I);
         if (F->isDeclaration() || isEntryFunc(pMdUtils, F)) continue;
 
-        // Add non-used function to default group
-        if (F->hasFnAttribute("referenced-indirectly") || F->getNumUses() == 0)
+        if (F->hasFnAttribute("referenced-indirectly") || F->use_empty())
         {
             IGC_ASSERT(getGroup(F) == nullptr);
             addToFunctionGroup(F, IndirectCallGroup, F);
@@ -732,7 +731,7 @@ void GenXFunctionGroupAnalysis::replaceEntryFunc(Function* OF, Function* NF)
         SubGroupMap.erase(SGIter);
         SubGroupMap.insert(std::make_pair(NF, NF));
     }
-    DenseMap<Function*, Function*>::iterator SGII, SGIE;
+    DenseMap<const Function*, Function*>::iterator SGII, SGIE;
     for (SGII = SubGroupMap.begin(), SGIE = SubGroupMap.end();
         SGII != SGIE; ++SGII)
     {
@@ -755,7 +754,7 @@ void GenXFunctionGroupAnalysis::clear()
     M = nullptr;
 }
 
-FunctionGroup* GenXFunctionGroupAnalysis::getGroup(Function* F)
+FunctionGroup* GenXFunctionGroupAnalysis::getGroup(const Function* F)
 {
     auto I = GroupMap.find(F);
     if (I == GroupMap.end())
@@ -763,13 +762,11 @@ FunctionGroup* GenXFunctionGroupAnalysis::getGroup(Function* F)
     return I->second;
 }
 
-FunctionGroup* GenXFunctionGroupAnalysis::getGroupForHead(Function* F)
+FunctionGroup* GenXFunctionGroupAnalysis::getGroupForHead(const Function* F)
 {
     auto FG = getGroup(F);
     if (FG->getHead() == F)
-    {
         return FG;
-    }
     return nullptr;
 }
 

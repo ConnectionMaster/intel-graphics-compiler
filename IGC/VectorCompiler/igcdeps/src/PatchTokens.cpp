@@ -1,49 +1,156 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (c) 2000-2021 Intel Corporation
+Copyright (C) 2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"),
-to deal in the Software without restriction, including without limitation
-the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom
-the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-IN THE SOFTWARE.
+SPDX-License-Identifier: MIT
 
 ============================= end_copyright_notice ===========================*/
 
+#include "vc/Support/Status.h"
 #include "vc/igcdeps/cmc.h"
 
 #include "AdaptorOCL/OCL/sp/sp_g8.h"
+#include "lldWrapper/Common/Driver.h"
+
+#include <llvm/Support/Debug.h>
+#include <llvm/Support/FileUtilities.h>
+#include <llvm/Support/ToolOutputFile.h>
 
 using namespace vc;
+
+using ToolOutputHolder = std::unique_ptr<llvm::ToolOutputFile>;
+using TmpFilesStorage = std::map<std::string, ToolOutputHolder>;
+
+struct DebugInfo {
+  llvm::StringRef KernelName;
+  llvm::StringRef DebugData;
+};
+
+static TmpFilesStorage
+CreateTemporaryFileStorage(const std::vector<DebugInfo> &DebugInfoData,
+                           llvm::raw_ostream &ErrStream) {
+  TmpFilesStorage Result;
+  for (const auto &DebugInfo : DebugInfoData) {
+    llvm::SmallString<128> TmpPath;
+    int FD = -1;
+    auto EC = llvm::sys::fs::createTemporaryFile(DebugInfo.KernelName, "elf",
+                                                 FD, TmpPath);
+    if (EC) {
+      ErrStream << "could not create temporary file: " << EC.message() << "\n";
+      return {};
+    }
+
+    auto Out = std::make_unique<llvm::ToolOutputFile>(TmpPath, FD);
+    Out->os() << DebugInfo.DebugData;
+    Out->os().flush();
+
+    auto Emplaced = Result.emplace(TmpPath.str(), std::move(Out));
+    IGC_ASSERT_MESSAGE(Emplaced.second,
+                       "could not create unique temporary storage");
+  }
+  IGC_ASSERT(DebugInfoData.size() == Result.size());
+  return Result;
+}
+
+static TmpFilesStorage
+extractRawDebugInfo(const CGen8CMProgram::CMKernelsStorage &Kernels,
+                    llvm::raw_ostream &ErrStream) {
+  std::vector<DebugInfo> DebugInfoData;
+  std::transform(
+      Kernels.begin(), Kernels.end(), std::back_inserter(DebugInfoData),
+      [](const auto &Kernel) {
+        llvm::StringRef KernelName = Kernel->m_kernelInfo.m_kernelName;
+        const auto &KO = Kernel->getProgramOutput();
+        if (!KO.m_debugData)
+          return DebugInfo{KernelName, llvm::StringRef{}};
+        const auto *RawData =
+            reinterpret_cast<const char *>(KO.m_debugData);
+        return DebugInfo{KernelName,
+                         llvm::StringRef{RawData, KO.m_debugDataSize}};
+      });
+  IGC_ASSERT(DebugInfoData.size() == Kernels.size());
+  return CreateTemporaryFileStorage(DebugInfoData, ErrStream);
+}
+
+static std::unique_ptr<llvm::MemoryBuffer>
+buildZeDebugInfo(const CGen8CMProgram::CMKernelsStorage &Kernels,
+                 llvm::raw_ostream &ErrStream) {
+  auto TmpFiles = extractRawDebugInfo(Kernels, ErrStream);
+  if (TmpFiles.empty()) {
+    ErrStream << "could not initialize linking of the debug information\n";
+    return {};
+  }
+
+  llvm::SmallString<128> OutputPath;
+  auto Errc =
+      llvm::sys::fs::createTemporaryFile("final_dbginfo", "elf", OutputPath);
+  if (Errc) {
+    ErrStream << "could not create output file for the linked debug info: "
+              << Errc.message() << "\n";
+    return {};
+  }
+
+  std::vector<const char *> LldArgs;
+  std::transform(TmpFiles.begin(), TmpFiles.end(), std::back_inserter(LldArgs),
+                 [](const auto &TmpFile) { return TmpFile.first.c_str(); });
+  LldArgs.push_back("--relocatable");
+  LldArgs.push_back("-o");
+  LldArgs.push_back(OutputPath.c_str());
+
+  if (IGC_IS_FLAG_ENABLED(VCEnableExtraDebugLogging)) {
+    llvm::errs() << "lld ";
+    for (const auto *Arg : LldArgs)
+      llvm::errs() << " " << Arg;
+    llvm::errs() << "\n";
+  }
+
+  // Currently, DummyOutput/OutStream are not used outside of debugging purposes
+  // (we don't have facilities to emit extra logs from binary building routines)
+  std::string DummyOutput;
+  llvm::raw_string_ostream OutStream(DummyOutput);
+  constexpr bool CanExitEarly = false;
+  if (!IGCLLD::elf::link(LldArgs, CanExitEarly, OutStream, ErrStream)) {
+    ErrStream << "could not link debug infomation file\n";
+    return {};
+  }
+  llvm::FileRemover Remover{OutputPath};
+
+  if (IGC_IS_FLAG_ENABLED(VCEnableExtraDebugLogging)) {
+    if (!OutStream.str().empty())
+      llvm::errs() << "lld stdout:\n" << DummyOutput << "\n";
+    else
+      llvm::errs() << "lld has nothing on stdout (ok)\n";
+  }
+
+  auto Res = llvm::MemoryBuffer::getFile(OutputPath);
+  if (!Res) {
+    ErrStream << "could not read linked debug information file\n";
+    return {};
+  }
+  if (Res.get()->getBufferSize() == 0) {
+    ErrStream << "file with the linked debug information is empty\n";
+    return {};
+  }
+
+  return std::move(Res.get());
+}
+
+llvm::Error CGen8CMProgram::GetError() const {
+  IGC_ASSERT(HasErrors());
+  return llvm::make_error<vc::OutputBinaryCreationError>(m_ErrorLog);
+}
 
 // Implementation of CGen8CMProgram.
 CGen8CMProgram::CGen8CMProgram(PLATFORM platform, const WA_TABLE& WATable)
     : CGen8OpenCLProgramBase(platform, m_ContextProvider, WATable),
       m_programInfo(new IGC::SOpenCLProgramInfo) {}
 
-CGen8CMProgram::~CGen8CMProgram() {
-  for (auto kernel : m_kernels)
-    delete kernel;
-}
-
 void CGen8CMProgram::CreateKernelBinaries() {
   CreateProgramScopePatchStream(*m_programInfo);
-  for (auto *kernel : m_kernels) {
+  for (const auto &kernel : m_kernels) {
     // Create the kernel binary streams.
     iOpenCL::KernelData data;
-    data.kernelBinary = new Util::BinaryStream;
+    data.kernelBinary = std::make_unique<Util::BinaryStream>();
 
     m_StateProcessor.CreateKernelBinary(
         reinterpret_cast<const char *>(kernel->getProgramOutput().m_programBin),
@@ -52,32 +159,42 @@ void CGen8CMProgram::CreateKernelBinaries() {
         m_pSystemThreadKernelOutput,
         kernel->getProgramOutput().m_unpaddedProgramSize);
 
-    if (kernel->getProgramOutput().m_debugDataVISASize) {
-      data.kernelDebugData = new Util::BinaryStream();
+    if (kernel->getProgramOutput().m_debugDataSize) {
+      data.vcKernelDebugData = std::make_unique<Util::BinaryStream>();
       m_StateProcessor.CreateKernelDebugData(
           reinterpret_cast<const char *>(
-              kernel->getProgramOutput().m_debugDataVISA),
-          kernel->getProgramOutput().m_debugDataVISASize,
+              kernel->getProgramOutput().m_debugData),
+          kernel->getProgramOutput().m_debugDataSize,
           reinterpret_cast<const char *>(
               kernel->getProgramOutput().m_debugDataGenISA),
           kernel->getProgramOutput().m_debugDataGenISASize,
-          kernel->m_kernelInfo.m_kernelName, *(data.kernelDebugData));
+          kernel->m_kernelInfo.m_kernelName, *data.vcKernelDebugData);
     }
-    m_KernelBinaries.push_back(data);
+    m_KernelBinaries.push_back(std::move(data));
   }
 }
 
 void CGen8CMProgram::GetZEBinary(llvm::raw_pwrite_stream &programBinary,
                                  unsigned pointerSizeInBytes) {
+  llvm::raw_string_ostream ErrLog{m_ErrorLog};
   iOpenCL::ZEBinaryBuilder zebuilder{m_Platform, pointerSizeInBytes == 8,
                                      *m_programInfo, nullptr, 0};
   zebuilder.setGfxCoreFamilyToELFMachine(m_Platform.eRenderCoreFamily);
 
-  for (auto *kernel : m_kernels) {
+  for (const auto &kernel : m_kernels) {
     zebuilder.createKernel(
         reinterpret_cast<const char *>(kernel->getProgramOutput().m_programBin),
         kernel->getProgramOutput().m_programSize, kernel->m_kernelInfo,
         kernel->m_GRFSizeInBytes);
+  }
+  if (m_ContextProvider.isProgramDebuggable()) {
+    auto Buff = buildZeDebugInfo(m_kernels, ErrLog);
+    if (Buff) {
+      // Unfortunately, we do need const_cast here, since API requires void*
+      void *BufferStart = const_cast<void *>(
+          reinterpret_cast<const void *>(Buff->getBufferStart()));
+      zebuilder.addElfSections(BufferStart, Buff->getBufferSize());
+    }
   }
   zebuilder.getBinaryObject(programBinary);
 }

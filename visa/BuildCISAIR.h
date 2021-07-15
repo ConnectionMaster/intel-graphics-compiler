@@ -1,28 +1,10 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2017-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
+============================= end_copyright_notice ===========================*/
 
 #ifndef _BUILDCISAIR_H_
 #define _BUILDCISAIR_H_
@@ -837,6 +819,49 @@ public:
     VISA_BUILDER_OPTION getBuilderOption() const { return mBuildOption; }
     vISABuilderMode getBuilderMode() const { return m_builderMode; }
 
+    bool CISA_create_dpas_instruction(
+        ISA_Opcode opcode,
+        VISA_EMask_Ctrl emask,
+        unsigned exec_size,
+        VISA_opnd * dst_cisa,
+        VISA_opnd * src0_cisa,
+        VISA_opnd * src1_cisa,
+        VISA_opnd * src2_cisa,
+        GenPrecision A,
+        GenPrecision W,
+        uint8_t D,
+        uint8_t C,
+        int lineNum);
+
+    bool CISA_create_bfn_instruction(
+        VISA_opnd * pred,
+        uint8_t func_ctrl,
+        bool sat,
+        VISA_EMask_Ctrl emask,
+        unsigned exec_size,
+        VISA_opnd * dst_cisa,
+        VISA_opnd * src0_cisa,
+        VISA_opnd * src1_cisa,
+        VISA_opnd * src2_cisa,
+        int lineNum);
+
+    bool CISA_create_qword_scatter_instruction(
+        ISA_Opcode opcode,
+        VISA_opnd *pred,
+        VISA_EMask_Ctrl eMask,
+        unsigned execSize,
+        unsigned numBlocks,
+        const char* surfaceName,
+        VISA_opnd *offsets,
+        VISA_opnd *dstSrc,
+        int lineNum);
+
+    bool CISA_create_bf_cvt_instruction(
+        VISA_EMask_Ctrl emask,
+        unsigned exec_size,
+        VISA_opnd *dst,
+        VISA_opnd *src0,
+        int lineNum);
 
 
 
@@ -857,6 +882,33 @@ private:
     // we need to keep a mapping of kernels to names
     // to make GetVISAKernel() work
     std::map<std::string, VISAKernelImpl *> m_nameToKernel;
+
+    std::map<std::string, vISA::G4_Kernel*> functionsNameMap;
+    vISA::G4_Kernel* GetCallerKernel(vISA::G4_INST*);
+    vISA::G4_Kernel* GetCalleeKernel(vISA::G4_INST*);
+
+    // To collect call related info for LinkTimeOptimization
+    void CollectCallSites(
+            std::list<VISAKernelImpl *>& functions,
+            std::unordered_map<vISA::G4_Kernel*, std::list<std::list<vISA::G4_INST*>::iterator>>& callSites);
+
+    // Sanity check to see if sg.invoke list is properly added from front-end
+    // We don't support:
+    //   1. sg.invoke callsite is a indirect call
+    //   2. sg.invoke callsite is inside a recursion
+    void CheckHazardFeatures(
+            std::list<std::list<vISA::G4_INST*>::iterator>& sgInvokeList,
+            std::unordered_map<vISA::G4_Kernel*, std::list<std::list<vISA::G4_INST*>::iterator>>& callSites);
+
+    // Remove sgInvoke functions out of function list to avoid redundant compilation
+    void RemoveOptimizingFunction(
+            std::list<VISAKernelImpl *>& functions,
+            std::list<std::list<vISA::G4_INST*>::iterator>& sgInvokeList);
+
+    // Perform LinkTimeOptimization for call related transformations
+    void LinkTimeOptimization(
+            std::list<std::list<vISA::G4_INST*>::iterator>& sgInvokeList,
+            bool call2jump);
 
     void emitFCPatchFile();
 

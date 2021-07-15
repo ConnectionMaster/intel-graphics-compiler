@@ -1,28 +1,10 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2017-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
+============================= end_copyright_notice ===========================*/
 
 #ifndef _G4_OPCODE_H_
 #define _G4_OPCODE_H_
@@ -52,7 +34,7 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #define IS_INT(x) (IS_SIGNED_INT(x) || IS_UNSIGNED_INT(x))
 #define IS_TYPE_INT(type)        (IS_SIGNED_INT(type) || IS_UNSIGNED_INT(type))
 #define IS_TYPE_F32_F64(type)         (type == Type_F ||type == Type_DF || type == Type_NF)
-#define IS_TYPE_FLOAT_ALL(type)     (type == Type_F ||type == Type_DF || type == Type_HF || type == Type_NF)
+#define IS_TYPE_FLOAT_ALL(type)     (type == Type_F ||type == Type_DF || type == Type_HF || type == Type_NF || type == Type_BF)
 #define IS_TYPE_LONG(type)            (type == Type_DF || type == Type_UQ || type == Type_Q)
 #define IS_TYPE_INTEGER(type)         (type == Type_UW ||type == Type_W ||type == Type_B ||type == Type_UB ||type == Type_V ||type == Type_UV ||type == Type_UD ||type == Type_D)
 
@@ -224,6 +206,7 @@ enum G4_Type
     Type_UQ,    // 64-bit unsigned integer
     Type_HF,    // half float
     Type_NF,    // native float (only used by plane macro)
+    Type_BF,    // bfloat16 (used in mov only)
     Type_UNDEF
 };
 
@@ -253,6 +236,7 @@ constexpr G4_Type_Info G4_Type_Table[Type_UNDEF + 1] {
     {Type_UQ,  64, 8, 0xFF, "uq"},
     {Type_HF,  16, 2, 0x03, "hf"},
     {Type_NF,  64, 8, 0xFF, "nf"},
+    {Type_BF,  16, 2, 0x03, "bf"},
     {Type_UNDEF, 0, 0, 0x0, "???"}
 };
 static inline constexpr G4_Type_Info TypeInfo(G4_Type t) {
@@ -370,7 +354,7 @@ typedef struct _G4_InstOptInfo
 
 enum G4_opcode
 {
-#include "G4Instruction.def"
+#include "G4Instruction.h"
     G4_NUM_OPCODE
 };
 
@@ -473,7 +457,7 @@ uint8_t roundDownPow2(uint8_t n);
 // G4_type related global functions
 inline bool isLowPrecisionFloatTy(G4_Type ty)
 {
-    return ty == Type_HF;
+    return ty == Type_HF || ty == Type_BF;
 }
 
 inline G4_Type floatToSameWidthIntType(G4_Type floatTy)

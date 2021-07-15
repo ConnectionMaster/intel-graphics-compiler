@@ -62,7 +62,7 @@ void ZEBinaryBuilder::createKernel(
 {
     ZEELFObjectBuilder::SectionID textID =
         addKernelBinary(annotations.m_kernelName, rawIsaBinary, rawIsaBinarySize);
-    addSymbols(textID, annotations);
+    addKernelSymbols(textID, annotations);
     addKernelRelocations(textID, annotations);
 
     zeInfoKernel& zeKernel = mZEInfoBuilder.createKernel(annotations.m_kernelName);
@@ -115,6 +115,8 @@ void ZEBinaryBuilder::addProgramScopeInfo(const IGC::SOpenCLProgramInfo& program
 {
     addGlobalConstants(programInfo);
     addGlobals(programInfo);
+    addProgramSymbols(programInfo);
+    addProgramRelocations(programInfo);
 }
 
 void ZEBinaryBuilder::addGlobalConstants(const IGC::SOpenCLProgramInfo& annotations)
@@ -298,7 +300,7 @@ void ZEBinaryBuilder::addMemoryBuffer(
     }
 }
 
-uint8_t ZEBinaryBuilder::getSymbolElfType(vISA::ZESymEntry& sym)
+uint8_t ZEBinaryBuilder::getSymbolElfType(const vISA::ZESymEntry& sym)
 {
     switch (sym.s_type) {
     case vISA::GenSymType::S_NOTYPE:
@@ -321,7 +323,7 @@ uint8_t ZEBinaryBuilder::getSymbolElfType(vISA::ZESymEntry& sym)
     return llvm::ELF::STT_NOTYPE;
 }
 
-uint8_t ZEBinaryBuilder::getSymbolElfBinding(vISA::ZESymEntry& sym)
+uint8_t ZEBinaryBuilder::getSymbolElfBinding(const vISA::ZESymEntry& sym)
 {
     // all symbols we have now that could be exposed must have
     // global binding
@@ -343,7 +345,35 @@ uint8_t ZEBinaryBuilder::getSymbolElfBinding(vISA::ZESymEntry& sym)
     return llvm::ELF::STB_GLOBAL;
 }
 
-void ZEBinaryBuilder::addSymbols(
+void ZEBinaryBuilder::addSymbol(const vISA::ZESymEntry& sym, ZEELFObjectBuilder::SectionID targetSect)
+{
+    mBuilder.addSymbol(sym.s_name, sym.s_offset, sym.s_size,
+        getSymbolElfBinding(sym), getSymbolElfType(sym),
+        (sym.s_type == vISA::GenSymType::S_UNDEF) ? -1 : targetSect);
+}
+
+void ZEBinaryBuilder::addProgramSymbols(const IGC::SOpenCLProgramInfo& annotations)
+{
+    const IGC::SOpenCLProgramInfo::ZEBinProgramSymbolTable& symbols = annotations.m_zebinSymbolTable;
+
+    // add symbols defined in global constant section
+    IGC_ASSERT(symbols.globalConst.empty() || mGlobalConstSectID != -1);
+    for (auto sym : symbols.globalConst)
+        addSymbol(sym, mGlobalConstSectID);
+
+    // add symbols defined in global string constant section
+    IGC_ASSERT(symbols.globalStringConst.empty() || mConstStringSectID != -1);
+    for (auto sym : symbols.globalStringConst)
+        addSymbol(sym, mConstStringSectID);
+
+    // add symbols defined in global section
+    IGC_ASSERT(symbols.global.empty() || mGlobalSectID != -1);
+    for (auto sym : symbols.global)
+        addSymbol(sym, mGlobalSectID);
+
+}
+
+void ZEBinaryBuilder::addKernelSymbols(
     ZEELFObjectBuilder::SectionID kernelSectId,
     const IGC::SOpenCLKernelInfo& annotations)
 {
@@ -363,37 +393,30 @@ void ZEBinaryBuilder::addSymbols(
     // add local symbols of this kernel binary
     for (auto sym : symbols.local) {
         IGC_ASSERT(sym.s_type != vISA::GenSymType::S_UNDEF);
-        mBuilder.addSymbol(sym.s_name, sym.s_offset, sym.s_size,
-            getSymbolElfBinding(sym), getSymbolElfType(sym), kernelSectId);
+        addSymbol(sym, kernelSectId);
     }
 
-    // If the symbol has UNDEF type, set its sectionId to -1
     // add function symbols defined in kernel text
     for (auto sym : symbols.function)
-        mBuilder.addSymbol(sym.s_name, sym.s_offset, sym.s_size,
-            getSymbolElfBinding(sym), getSymbolElfType(sym),
-            (sym.s_type == vISA::GenSymType::S_UNDEF) ? -1 : kernelSectId);
-
-    // add symbols defined in global constant section
-    for (auto sym : symbols.globalConst)
-        mBuilder.addSymbol(sym.s_name, sym.s_offset, sym.s_size,
-            getSymbolElfBinding(sym), getSymbolElfType(sym),
-            (sym.s_type == vISA::GenSymType::S_UNDEF) ? -1 : mGlobalConstSectID);
-
-    // add symbols defined in global string constant section
-    for (auto sym : symbols.globalStringConst)
-        mBuilder.addSymbol(sym.s_name, sym.s_offset, sym.s_size,
-            getSymbolElfBinding(sym), getSymbolElfType(sym),
-            (sym.s_type == vISA::GenSymType::S_UNDEF) ? -1 : mConstStringSectID);
-
-    // add symbols defined in global section
-    for (auto sym : symbols.global)
-        mBuilder.addSymbol(sym.s_name, sym.s_offset, sym.s_size,
-            getSymbolElfBinding(sym), getSymbolElfType(sym),
-            (sym.s_type == vISA::GenSymType::S_UNDEF) ? -1 : mGlobalSectID);
+        addSymbol(sym, kernelSectId);
 
     // we do not support sampler symbols now
     IGC_ASSERT(symbols.sampler.empty());
+}
+
+void ZEBinaryBuilder::addProgramRelocations(const IGC::SOpenCLProgramInfo& annotations)
+{
+    const IGC::SOpenCLProgramInfo::ZEBinRelocTable& relocs = annotations.m_GlobalPointerAddressRelocAnnotation;
+
+    // FIXME: For r_type, zebin::R_TYPE_ZEBIN should have the same enum value as visa::GenRelocType.
+    // Take the value directly
+    IGC_ASSERT(relocs.globalConstReloc.empty() || mGlobalConstSectID != -1);
+    for (auto reloc : relocs.globalConstReloc)
+        mBuilder.addRelRelocation(reloc.r_offset, reloc.r_symbol, static_cast<zebin::R_TYPE_ZEBIN>(reloc.r_type), mGlobalConstSectID);
+
+    IGC_ASSERT(relocs.globalReloc.empty() || mGlobalSectID != -1);
+    for (auto reloc : relocs.globalReloc)
+        mBuilder.addRelRelocation(reloc.r_offset, reloc.r_symbol, static_cast<zebin::R_TYPE_ZEBIN>(reloc.r_type), mGlobalSectID);
 }
 
 void ZEBinaryBuilder::addKernelRelocations(
@@ -559,6 +582,8 @@ void ZEBinaryBuilder::getElfSymbol(CElfReader* elfReader, const unsigned int sym
     char* strtabData = NULL;
     size_t strtabDataSize = 0;
     elfReader->GetSectionData(".strtab", strtabData, strtabDataSize);
+    if (strtabDataSize <= 1)
+        elfReader->GetSectionData(".shstrtab", strtabData, strtabDataSize);
 
     if (!symtabData || !strtabData)
     {
@@ -611,9 +636,13 @@ void ZEBinaryBuilder::addElfSections(void* elfBin, size_t elfSize)
         return;
     }
 
-    // Find .strtab and .symtab sections in ELF binary.
-    const SElf64SectionHeader* strtabSectionHeader = elfReader->GetSectionHeader(".strtab");
+    // Find .symtab and .strtab (or shstrtab) sections in ELF binary.
     const SElf64SectionHeader* symtabSectionHeader = elfReader->GetSectionHeader(".symtab");
+    const SElf64SectionHeader* strtabSectionHeader = elfReader->GetSectionHeader(".strtab");
+    if (strtabSectionHeader->DataSize <= 1)
+    {
+        strtabSectionHeader = elfReader->GetSectionHeader(".shstrtab");
+    }
 
     if (!strtabSectionHeader || !symtabSectionHeader)
     {
@@ -625,11 +654,12 @@ void ZEBinaryBuilder::addElfSections(void* elfBin, size_t elfSize)
 
     char* secData = NULL;
     size_t secDataSize = 0;
+    std::vector<std::string> zeBinSymbols;      // ELF symbols added to zeBinary; to avoid duplicated symbols.
 
     // ELF binary scanning sections with copying whole sections one by one to zeBinary, except:
     // - empty sections
     // - Text section
-    // = relocation sections
+    // - relocation sections
     // Also adjusting relocations found in relocation (.rela) sections.
     // Note:
     // - 64-bit ELF supported only
@@ -688,10 +718,29 @@ void ZEBinaryBuilder::addElfSections(void* elfBin, size_t elfSize)
                                 // If .rela.foo is being processed then find zeBinary section ID of previously added .foo section
                                 ZEELFObjectBuilder::SectionID nonRelaSectionID =
                                     mBuilder.getSectionIDBySectionName(elfReader->GetSectionName(elfSectionIdx) + sizeof(".rela") - 1);
+                                // Avoid symbol duplications - check whether a current symbol has been previously added.
+                                bool isSymbolAdded = false;
+                                for (auto zeBinSym : zeBinSymbols)
+                                {
+                                    if (!zeBinSym.compare(zeSym.s_name))
+                                    {
+                                        isSymbolAdded = true;  // A current symbol has been previously added.
+                                        break;
+                                    }
+                                }
 
-                                mBuilder.addSymbol(zeSym.s_name, zeSym.s_offset, zeSym.s_size, getSymbolElfBinding(zeSym),
-                                    getSymbolElfType(zeSym), nonRelaSectionID);
-                                mBuilder.addRelRelocation(relocEntry.r_offset, zeSym.s_name, R_TYPE_ZEBIN::R_ZE_SYM_ADDR, nonRelaSectionID);
+                                // Add either a non-global symbol, or a global symbol which is not duplicated.
+                                if (!isSymbolAdded)
+                                {
+                                    // A current symbol has not been previously added so do it now.
+                                    // Note: All symbols in ELF are local.
+                                    mBuilder.addSymbol(
+                                        zeSym.s_name, zeSym.s_offset, zeSym.s_size, ELF::STB_LOCAL, getSymbolElfType(zeSym), nonRelaSectionID);
+                                    zeBinSymbols.push_back(zeSym.s_name);
+                                }
+
+                                mBuilder.addRelaRelocation(
+                                    relocEntry.r_offset, zeSym.s_name, (R_TYPE_ZEBIN)(relocEntry.r_info & 0xF), relocEntry.r_addend, nonRelaSectionID);
                             }
                         }
                     }
@@ -702,7 +751,7 @@ void ZEBinaryBuilder::addElfSections(void* elfBin, size_t elfSize)
                 }
                 else if (const char* sectionName = elfReader->GetSectionName(elfSectionIdx))
                 {
-                    if (memcmp(sectionName, ".text", sizeof(".text") - 1))
+                    if (!memcmp(sectionName, ".debug", sizeof(".debug") - 1))
                     {
                         // Non-empty, non-relocation and non-text debug section to be copied from ELF to zeBinary.
                         zeBinSectionID = mBuilder.addSectionDebug(sectionName, (uint8_t*)secData, secDataSize); // no padding, no alignment

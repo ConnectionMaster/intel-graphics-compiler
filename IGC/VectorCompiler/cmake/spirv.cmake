@@ -1,24 +1,8 @@
 #=========================== begin_copyright_notice ============================
 #
-# Copyright (c) 2020-2021 Intel Corporation
+# Copyright (C) 2020-2021 Intel Corporation
 #
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"),
-# to deal in the Software without restriction, including without limitation
-# the rights to use, copy, modify, merge, publish, distribute, sublicense,
-# and/or sell copies of the Software, and to permit persons to whom
-# the Software is furnished to do so, subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be included
-# in all copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-# IN THE SOFTWARE.
+# SPDX-License-Identifier: MIT
 #
 #============================ end_copyright_notice =============================
 
@@ -157,17 +141,17 @@ else()
     message(FATAL_ERROR "[VC] Cannot find LLVM version (LLVM_VERSION_MAJOR)")
   elseif(${LLVM_VERSION_MAJOR} EQUAL 9)
     message(STATUS "[VC] Found LLVM version 9")
-    set(SPIRV_REV_PATCH 4aafd4768e4fea7b6e7481d07bc31aefc1c7bacc)
+    set(SPIRV_REV_PATCH 4e73735ea83f2c0597b57dcf4b2d7c6f4d78211b)
     set(SPRIV_PATCHES ${CMAKE_CURRENT_SOURCE_DIR}/spirv-patches-9/)
     set(SPRIV_BRANCH_PATCH spirvdll_90)
   elseif(${LLVM_VERSION_MAJOR} EQUAL 10)
     message(STATUS "[VC] Found LLVM version 10")
-    set(SPIRV_REV_PATCH 4f1a3270f2431aa98f1bff30d1a32c9d8f4729bf)
+    set(SPIRV_REV_PATCH 5569f6cac015f8fd99f7c570c1ca609048e61c00)
     set(SPRIV_PATCHES ${CMAKE_CURRENT_SOURCE_DIR}/spirv-patches-10/)
     set(SPRIV_BRANCH_PATCH spirvdll_100)
   elseif(${LLVM_VERSION_MAJOR} EQUAL 11)
     message(STATUS "[VC] Found LLVM version 11")
-    set(SPIRV_REV_PATCH 73dfc6d450ad0438558bee20505c426319f7624b)
+    set(SPIRV_REV_PATCH f9d9902e4bcbfb207d6d41fe9f7327ee64cfcb1b)
     set(SPRIV_PATCHES ${CMAKE_CURRENT_SOURCE_DIR}/spirv-patches-11/)
     set(SPRIV_BRANCH_PATCH spirvdll_110)
   else()

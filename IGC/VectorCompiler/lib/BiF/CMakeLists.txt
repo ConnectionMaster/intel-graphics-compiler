@@ -1,24 +1,8 @@
 #=========================== begin_copyright_notice ============================
 #
-# Copyright (c) 2021 Intel Corporation
+# Copyright (C) 2021 Intel Corporation
 #
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"),
-# to deal in the Software without restriction, including without limitation
-# the rights to use, copy, modify, merge, publish, distribute, sublicense,
-# and/or sell copies of the Software, and to permit persons to whom
-# the Software is furnished to do so, subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be included
-# in all copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-# IN THE SOFTWARE.
+# SPDX-License-Identifier: MIT
 #
 #============================ end_copyright_notice =============================
 
@@ -120,11 +104,19 @@ if (IGC_OPTION__VC_DISABLE_BIF)
   add_custom_target(VCBiFPreparation)
 else()
 
+  set(PRINTF_NOT_CM_COMMON_H_PATH ${CMAKE_CURRENT_SOURCE_DIR}/printf_not_cm_common.h)
   set(PRINTF_OCL_SRC_PATH ${CMAKE_CURRENT_SOURCE_DIR}/printf_ocl_genx.cpp)
+  set(PRINTF_ZE_SRC_PATH ${CMAKE_CURRENT_SOURCE_DIR}/printf_ze_genx.cpp)
   set(EMU_DIVREM_SRC_PATH ${CMAKE_CURRENT_SOURCE_DIR}/emulation_divrem.cpp)
 
-  vc_embed_bif(PRINTF_OCL_32_CPP_PATH ${PRINTF_OCL_SRC_PATH} VCBiFPrintfOCL 32)
-  vc_embed_bif(PRINTF_OCL_64_CPP_PATH ${PRINTF_OCL_SRC_PATH} VCBiFPrintfOCL 64)
+  vc_embed_bif(PRINTF_OCL_32_CPP_PATH ${PRINTF_OCL_SRC_PATH} VCBiFPrintfOCL 32
+               DEPENDS ${PRINTF_NOT_CM_COMMON_H_PATH})
+  vc_embed_bif(PRINTF_OCL_64_CPP_PATH ${PRINTF_OCL_SRC_PATH} VCBiFPrintfOCL 64
+               DEPENDS ${PRINTF_NOT_CM_COMMON_H_PATH})
+  vc_embed_bif(PRINTF_ZE_32_CPP_PATH ${PRINTF_ZE_SRC_PATH} VCBiFPrintfZE 32
+               DEPENDS ${PRINTF_NOT_CM_COMMON_H_PATH})
+  vc_embed_bif(PRINTF_ZE_64_CPP_PATH ${PRINTF_ZE_SRC_PATH} VCBiFPrintfZE 64
+               DEPENDS ${PRINTF_NOT_CM_COMMON_H_PATH})
 
   get_target_property(DIVREM_EXTRA_SOURCES VCEmuDivremBoilerplate SOURCES)
   vc_embed_bif(EMU_DIVREM_CPP_PATH ${EMU_DIVREM_SRC_PATH} VCEmulation 64
@@ -133,13 +125,17 @@ else()
   add_custom_target(VCBiFPreparation
     DEPENDS ${PRINTF_OCL_32_CPP_PATH}
             ${PRINTF_OCL_64_CPP_PATH}
+            ${PRINTF_ZE_32_CPP_PATH}
+            ${PRINTF_ZE_64_CPP_PATH}
             ${EMU_DIVREM_CPP_PATH}
     SOURCES ${PRINTF_OCL_SRC_PATH}
             ${EMU_DIVREM_SRC_PATH})
 
-  add_library(VCEmbeddedBiF STATIC
+  add_library(VCEmbeddedBiF
     ${PRINTF_OCL_32_CPP_PATH}
     ${PRINTF_OCL_64_CPP_PATH}
+    ${PRINTF_ZE_32_CPP_PATH}
+    ${PRINTF_ZE_64_CPP_PATH}
     ${EMU_DIVREM_CPP_PATH})
 
   add_dependencies(VCBiFPreparation VCBifUtils)

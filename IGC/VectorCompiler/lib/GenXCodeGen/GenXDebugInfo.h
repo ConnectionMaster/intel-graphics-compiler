@@ -1,24 +1,8 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (c) 2000-2021 Intel Corporation
+Copyright (C) 2020-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"),
-to deal in the Software without restriction, including without limitation
-the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom
-the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-IN THE SOFTWARE.
+SPDX-License-Identifier: MIT
 
 ============================= end_copyright_notice ===========================*/
 
@@ -38,6 +22,11 @@ IN THE SOFTWARE.
 
 class VISAKernel;
 class VISABuilder;
+class ModuleToVisaTransformInfo;
+
+namespace IGC {
+  struct DebugEmitterOpts;
+} // namespace IGC
 
 namespace llvm {
 
@@ -50,8 +39,6 @@ namespace genx {
 namespace di {
 
 struct VisaMapping {
-  unsigned visaCounter = 0;
-
   struct Mapping {
     unsigned VisaIdx = 0;
     const Instruction *Inst = nullptr;
@@ -75,9 +62,10 @@ class GenXDebugInfo : public ModulePass {
     struct FunctionInfo {
       const genx::di::VisaMapping &VisaMapping;
       VISAKernel &CompiledKernel;
-      Function &F;
+      const Function &F;
     };
 
+    const ModuleToVisaTransformInfo &MVTI;
     std::vector<FunctionInfo> FIs;
   };
 
@@ -88,9 +76,11 @@ class GenXDebugInfo : public ModulePass {
   DbgInfoStorage ElfOutputs;
 
   void cleanup();
-  void processKernel(const ProgramInfo &PD);
-  void processFunctionGroup(GenXModule &GM, VISABuilder &VB,
-                            const FunctionGroup &FG);
+  void processKernel(const IGC::DebugEmitterOpts &Opts, const ProgramInfo &PD);
+  void processPrimaryFunction(const IGC::DebugEmitterOpts &Opts,
+                              const ModuleToVisaTransformInfo &MVTI,
+                              const GenXModule &GM, VISABuilder &VB,
+                              const Function &PF);
 
 public:
   static char ID;

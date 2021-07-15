@@ -1,24 +1,8 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (c) 2000-2021 Intel Corporation
+Copyright (C) 2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"),
-to deal in the Software without restriction, including without limitation
-the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom
-the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-IN THE SOFTWARE.
+SPDX-License-Identifier: MIT
 
 ============================= end_copyright_notice ===========================*/
 
@@ -58,6 +42,7 @@ IN THE SOFTWARE.
 #include "llvm/IR/InstVisitor.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Pass.h"
+#include "llvm/Support/MathExtras.h"
 
 #include "Probe/Assertion.h"
 #include "llvmWrapper/IR/DerivedTypes.h"
@@ -237,10 +222,10 @@ bool GenXPrologEpilogInsertion::runOnFunction(Function &F) {
   UseGlobalMem =
       F.getParent()->getModuleFlag(ModuleMD::UseSVMStack) != nullptr;
   visit(F);
-  if (isKernel(&F)) {
+  if (genx::isKernel(&F)) {
     generateKernelProlog(F);
     // no epilog is required for kernels
-  } else if (F.hasFnAttribute(genx::FunctionMD::CMStackCall)) {
+  } else if (genx::requiresStackCall(&F)) {
     generateFunctionProlog(F);
     // function epilog is generated when RetInst is met
   }
@@ -252,8 +237,8 @@ void GenXPrologEpilogInsertion::visitCallInst(CallInst &I) {
   if (I.isInlineAsm())
     return;
   bool IsIndirectCall = IGCLLVM::isIndirectCall(I);
-  bool IsStackCall = IsIndirectCall || I.getCalledFunction()->hasFnAttribute(
-                                           genx::FunctionMD::CMStackCall);
+  bool IsStackCall =
+      IsIndirectCall || genx::requiresStackCall(I.getCalledFunction());
   if (IsStackCall)
     generateStackCall(&I);
   if (!IsIndirectCall) {
@@ -269,7 +254,7 @@ void GenXPrologEpilogInsertion::visitCallInst(CallInst &I) {
 }
 
 void GenXPrologEpilogInsertion::visitReturnInst(ReturnInst &I) {
-  if (I.getFunction()->hasFnAttribute(genx::FunctionMD::CMStackCall))
+  if (genx::requiresStackCall(I.getFunction()))
     generateFunctionEpilog(*I.getFunction(), I);
 }
 
@@ -309,8 +294,6 @@ void GenXPrologEpilogInsertion::generateFunctionProlog(Function &F) {
   Value *Sp = buildReadPredefReg(PreDefined_Vars::PREDEFINED_FE_SP, IRB,
                                  IRB.getInt64Ty(), true);
   for (auto &Arg : F.args()) {
-    if (Arg.use_empty())
-      continue;
     auto *ArgScalarType = Arg.getType()->getScalarType();
     auto NumElements = 1;
     bool AllowScalar = true;
@@ -436,8 +419,8 @@ void GenXPrologEpilogInsertion::generateFunctionEpilog(Function &F,
   }
   F.setMetadata(InstMD::FuncRetSize,
                 MDNode::get(F.getContext(),
-                            ConstantAsMetadata::get(
-                                IRB.getInt32(RetSize / ST->getGRFWidth()))));
+                            ConstantAsMetadata::get(IRB.getInt32(
+                                divideCeil(RetSize, ST->getGRFWidth())))));
 }
 
 void GenXPrologEpilogInsertion::generateStackCall(CallInst *CI) {
@@ -491,11 +474,11 @@ void GenXPrologEpilogInsertion::generateStackCall(CallInst *CI) {
   CI->setMetadata(
       InstMD::FuncRetSize,
       MDNode::get(CI->getContext(),
-                  ConstantAsMetadata::get(IRB.getInt32(
+                  ConstantAsMetadata::get(IRB.getInt32(divideCeil(
                       (isVoidCall ? 0
                                   : (DL->getTypeSizeInBits(CI->getType())) /
-                                        genx::ByteBits) /
-                      ST->getGRFWidth()))));
+                                        genx::ByteBits),
+                      ST->getGRFWidth())))));
   if (isVoidCall)
     return;
   IRB.SetInsertPoint(CI->getNextNode());

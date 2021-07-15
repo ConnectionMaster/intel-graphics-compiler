@@ -313,7 +313,7 @@ static bool CreateSymbolTable(void* buffer, uint32_t size, uint32_t entries, Uti
         return false;
     free(buffer);
 
-#if defined(_DEBUG) || defined(_INTERNAL) || defined(_RELEASE_INTERNAL)
+#if defined(_DEBUG) || defined(_INTERNAL) || defined(_RELEASE_INTERNAL)  || defined(ICBE_LINUX) || defined(_LINUX) || defined(LINUX)
     DebugPatchList(membuf.GetLinearPointer() + tokenStart, patch.Size, debugOut);
 #endif
     (void)debugOut;
@@ -499,7 +499,7 @@ void CGen8OpenCLStateProcessor::CreateKernelDebugData(
 
     if (rawDebugDataVISA)
     {
-        kernelDebugDataHeader.dbgInfoBuffer = (uint8_t*)rawDebugDataVISA;
+        kernelDebugDataHeader.dbgInfoBuffer = (const uint8_t*)rawDebugDataVISA;
         kernelDebugDataHeader.dbgInfoBufferSize = rawDebugDataVISASize;
         kernelDebugDataHeader.extraAlignBytes = (sizeof(DWORD) - rawDebugDataVISASize % sizeof(DWORD)) % sizeof(DWORD);
         rawDebugDataVISASize += kernelDebugDataHeader.extraAlignBytes;
@@ -1510,7 +1510,15 @@ RETVAL CGen8OpenCLStateProcessor::CreatePatchList(
                     patch.Token = iOpenCL::PATCH_TOKEN_STATELESS_GLOBAL_MEMORY_OBJECT_KERNEL_ARGUMENT;
                     patch.Size = sizeof( patch );
                     patch.ArgumentNumber = ptrArg->ArgumentNumber;
-                    patch.SurfaceStateHeapOffset = context.Surface.SurfaceOffset[ bti ];
+                    if (m_Context.useBindlessMode() && !m_Context.useBindlessLegacyMode())
+                    {
+                        IGC_ASSERT(ptrArg->BindingTableIndex != bti);
+                        patch.SurfaceStateHeapOffset = ptrArg->BindingTableIndex;
+                    }
+                    else
+                    {
+                       patch.SurfaceStateHeapOffset = context.Surface.SurfaceOffset[bti];
+                    }
                     patch.DataParamOffset = ptrArg->PayloadPosition;
                     patch.DataParamSize = ptrArg->PayloadSizeInBytes;
                     patch.LocationIndex = ptrArg->LocationIndex;
@@ -1983,6 +1991,7 @@ RETVAL CGen8OpenCLStateProcessor::CreatePatchList(
 
         patch.HasGlobalAtomics = annotations.m_executionEnivronment.HasGlobalAtomics;
 
+        patch.HasDPAS = annotations.m_executionEnivronment.HasDPAS;
 
         patch.UseBindlessMode = annotations.m_executionEnivronment.UseBindlessMode;
         patch.SIMDInfo = annotations.m_executionEnivronment.SIMDInfo;
@@ -2038,7 +2047,7 @@ RETVAL CGen8OpenCLStateProcessor::CreatePatchList(
             patch.Size += alignedStringSize;
             membuf.WriteAt( patch, tokenStart );
 
-#if ( defined( _DEBUG ) || defined( _INTERNAL ) || defined( _RELEASE_INTERNAL ) )
+#if ( defined( _DEBUG ) || defined( _INTERNAL ) || defined( _RELEASE_INTERNAL )  || defined(ICBE_LINUX) || defined(_LINUX) || defined(LINUX) )
             DebugPatchList(membuf.GetLinearPointer() + tokenStart, patch.Size, m_oclStateDebugMessagePrintOut);
 #endif
         }
@@ -2190,7 +2199,7 @@ RETVAL CGen8OpenCLStateProcessor::CreatePatchList(
             }
             freeBlock(buffer);
 
-#if defined(_DEBUG) || defined(_INTERNAL) || defined(_RELEASE_INTERNAL)
+#if defined(_DEBUG) || defined(_INTERNAL) || defined(_RELEASE_INTERNAL)   || defined(ICBE_LINUX) || defined(_LINUX) || defined(LINUX)
             DebugPatchList(membuf.GetLinearPointer() + tokenStart, patch.Size, m_oclStateDebugMessagePrintOut);
 #endif
         }
@@ -2289,7 +2298,7 @@ RETVAL CGen8OpenCLStateProcessor::AddKernelAttributePatchItems(
         return retValue;
     }
 
-#if ( defined( _DEBUG ) || defined( _INTERNAL ) || defined( _RELEASE_INTERNAL ) )
+#if ( defined( _DEBUG ) || defined( _INTERNAL ) || defined( _RELEASE_INTERNAL )  || defined(ICBE_LINUX) || defined(_LINUX) || defined(LINUX) )
     DebugPatchList(membuf.GetLinearPointer() + tokenStart, patch.Size, m_oclStateDebugMessagePrintOut);
 #endif
 
@@ -2381,7 +2390,7 @@ RETVAL CGen8OpenCLStateProcessor::AddKernelArgumentPatchItems(
             return retValue;
         }
 
-#if ( defined( _DEBUG ) || defined( _INTERNAL ) || defined( _RELEASE_INTERNAL ) )
+#if ( defined( _DEBUG ) || defined( _INTERNAL ) || defined( _RELEASE_INTERNAL )  || defined(ICBE_LINUX) || defined(_LINUX) || defined(LINUX) )
         DebugPatchList(membuf.GetLinearPointer() + tokenStart, patch.Size, m_oclStateDebugMessagePrintOut);
 #endif
          index++;

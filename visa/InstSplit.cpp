@@ -1,28 +1,10 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2020-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
+============================= end_copyright_notice ===========================*/
 
 #include "InstSplit.h"
 
@@ -40,6 +22,7 @@ InstSplitPass::InstSplitPass(IR_Builder* builder) : m_builder(builder)
 //      - Send messages
 //      - Plane
 //      - Control flow, labels and return
+//      - Dpas
 //      - Instructions with indirect addressing other than 1x1 indirect region
 void InstSplitPass::run()
 {
@@ -55,6 +38,10 @@ void InstSplitPass::run()
         if (inst->isSend() || inst->opcode() == G4_label ||
             inst->opcode() == G4_pln || inst->opcode() == G4_return ||
             inst->isFlowControl() || inst->isPseudoLogic())
+        {
+            continue;
+        }
+        if (inst->isDpas())
         {
             continue;
         }
@@ -77,6 +64,10 @@ void InstSplitPass::runOnBB(G4_BB* bb)
         if (inst->isSend() || inst->opcode() == G4_label ||
             inst->opcode() == G4_pln || inst->opcode() == G4_return ||
             inst->isFlowControl() || inst->isPseudoLogic())
+        {
+            continue;
+        }
+        if (inst->isDpas())
         {
             continue;
         }
@@ -126,6 +117,18 @@ INST_LIST_ITER InstSplitPass::splitInstruction(INST_LIST_ITER it, INST_LIST& ins
         {
             doSplit = true;
             break;
+        }
+        if (m_builder->getPlatform() >= XeHP_SDV)
+        {
+            // Instructions whose operands are 64b and have 2D regioning need to be split
+            // up front to help fixUnalignedRegions(..) covering 2D cases.
+            G4_SrcRegRegion* src = inst->getSrc(i)->asSrcRegRegion();
+            if ((src->getType() == Type_DF || IS_QTYPE(src->getType())) &&
+                !src->getRegion()->isSingleStride(execSize))
+            {
+                doSplit = true;
+                break;
+            }
         }
     }
 
@@ -195,7 +198,7 @@ INST_LIST_ITER InstSplitPass::splitInstruction(INST_LIST_ITER it, INST_LIST& ins
                 G4_SrcModifier modifier = origSrc->getModifier();
                 origSrc->setModifier(Mod_src_undef);
 
-                G4_INST* movInst = m_builder->createMov(execSize, m_builder->Create_Dst_Opnd_From_Dcl(dcl, 1),
+                G4_INST* movInst = m_builder->createMov(execSize, m_builder->createDstRegRegion(dcl, 1),
                     origSrc, InstOpt_WriteEnable, false);
                 movInst->inheritDIFrom(inst);
 

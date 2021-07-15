@@ -9,6 +9,7 @@ SPDX-License-Identifier: MIT
 #pragma once
 
 #include <vector>
+#include <memory>
 
 #include "../Platform/cmd_media_caps_g8.h"
 #include "../../inc/common/igfxfmid.h"
@@ -51,20 +52,24 @@ public:
     class DbgInfoBuffer
     {
     public:
-        Util::BinaryStream* header = nullptr;
-        uint8_t* dbgInfoBuffer = nullptr;
+        std::unique_ptr<Util::BinaryStream> header;
+        const uint8_t* dbgInfoBuffer = nullptr;
         uint32_t dbgInfoBufferSize = 0;
         uint8_t extraAlignBytes = 0;
     };
 
-    Util::BinaryStream* kernelBinary = nullptr;
+    std::unique_ptr<Util::BinaryStream> kernelBinary;
     // DbgInfo is stored in pieces as header, dbg buffer, alignment padding
     // instead of storing it in a single BinaryStream. This is because
     // BinaryStream approach requires unnecessary copies.
     DbgInfoBuffer dbgInfo;
 
+    // TODO: VC should switch to DbgInfoBuffer
     // kernelDebugData instance below is used only for VC
-    Util::BinaryStream* kernelDebugData = nullptr;
+    std::unique_ptr<Util::BinaryStream> vcKernelDebugData;
+
+    KernelData(KernelData &&Other) = default;
+    KernelData() = default;
 };
 
 struct RETVAL
@@ -97,6 +102,8 @@ public:
       virtual bool needsSystemKernel() const  = 0;
       virtual bool isProgramDebuggable() const = 0;
       virtual bool hasProgrammableBorderColor() const = 0;
+      virtual bool useBindlessMode() const = 0;
+      virtual bool useBindlessLegacyMode() const = 0;
 
       virtual ~IProgramContext () {}
     };
@@ -199,7 +206,7 @@ private:
             retValue.Success = false;
         }
 
-#if defined(_DEBUG) || defined(_INTERNAL) || defined(_RELEASE_INTERNAL)
+#if defined(_DEBUG) || defined(_INTERNAL) || defined(_RELEASE_INTERNAL)  || defined(ICBE_LINUX) || defined(_LINUX) || defined(LINUX)
         DebugPatchList(&patch, patch.Size, m_oclStateDebugMessagePrintOut);
 #endif
 

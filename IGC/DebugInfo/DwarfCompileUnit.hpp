@@ -209,9 +209,6 @@ namespace IGC
         void addSourceLine(DIE* Die, llvm::DIVariable* V);
         void addSourceLine(DIE* Die, llvm::DISubprogram* SP);
         void addSourceLine(DIE* Die, llvm::DIType* Ty);
-#if LLVM_VERSION_MAJOR == 4
-        void addSourceLine(DIE * Die, llvm::DINamespace * NS);
-#endif
 
         /// addConstantValue - Add constant value entry in variable DIE.
         void addConstantValue(DIE* Die, const llvm::ConstantInt* CI, bool Unsigned);
@@ -269,6 +266,9 @@ namespace IGC
         // addBindlessSamplerLocation - add a sequence of attributes to calculate bindless sampler location of variable
         void addBindlessSamplerLocation(DIEBlock* Block, const VISAVariableLocation* Loc);
 
+        // addBindlessScratchSpaceLocation - add a sequence of attributes to calculate bindless scratch space
+        // location of variable
+        void addBindlessScratchSpaceLocation(DIEBlock* Block, const VISAVariableLocation* Loc);
 
         // addBE_FP - emits operations to add contents of BE_FP to current top of dwarf stack
         void addBE_FP(IGC::DIEBlock* Block);
@@ -289,6 +289,11 @@ namespace IGC
         // addSimdLaneScalar - add a sequence of attributes to calculate location of scalar variable
         // e.g. a GRF subregister.
         void addSimdLaneScalar(DIEBlock* Block, DbgVariable& DV, const VISAVariableLocation* Loc, DbgDecoder::LiveIntervalsVISA* lr, uint16_t subRegInBytes);
+
+        bool emitBitPiecesForRegVal(IGC::DIEBlock* Block, const VISAModule& VM,
+                                    DbgVariable& DV,
+                                    const DbgDecoder::LiveIntervalsVISA& lr,
+                                    uint64_t varSizeInBits, uint64_t offsetInBits);
 
         /// getOrCreateNameSpace - Create a DIE for DINameSpace.
         DIE* getOrCreateNameSpace(llvm::DINamespace* NS);
@@ -399,17 +404,10 @@ namespace IGC
 
         /// resolve - Look in the DwarfDebug map for the llvm::MDNode that
         /// corresponds to the reference.
-#if LLVM_VERSION_MAJOR <= 8
-        template <typename T> T * resolve(llvm::TypedDINodeRef<T> Ref) const
-        {
-            return DD->resolve(Ref);
-        }
-#else
         template <typename T> inline T* resolve(T* Ref) const
         {
             return DD->resolve(Ref);
         }
-#endif
 
      public:
         // Added for 1-step elf

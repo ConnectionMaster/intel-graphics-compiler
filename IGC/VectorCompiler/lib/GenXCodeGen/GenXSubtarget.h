@@ -1,24 +1,8 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (c) 2000-2021 Intel Corporation
+Copyright (C) 2017-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"),
-to deal in the Software without restriction, including without limitation
-the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom
-the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-IN THE SOFTWARE.
+SPDX-License-Identifier: MIT
 
 ============================= end_copyright_notice ===========================*/
 
@@ -79,6 +63,7 @@ protected:
     GENX_ICLLP,
     GENX_TGLLP,
     GENX_DG1,
+    XE_HP_SDV,
   };
 
   // GenXVariant - GenX Tag identifying the variant to compile for
@@ -93,6 +78,9 @@ private:
 
   // HasLongLong - True if subtarget supports long long type
   bool HasLongLong;
+
+  // HasFP64 - True if subtarget supports double type
+  bool HasFP64;
 
   // DisableJmpi - True if jmpi is disabled.
   bool DisableJmpi;
@@ -119,6 +107,10 @@ private:
 
   // True if subtarget supports switchjmp visa instruction
   bool HasSwitchjmp;
+
+  // True if subtarget requires WA for nomask instructions under divergent
+  // control flow
+  bool WaNoMaskFusedEU;
 
   // True if subtarget supports 32-bit integer division
   bool HasIntDivRem32;
@@ -186,6 +178,18 @@ public:
   bool isTGLLP() const { return GenXVariant == GENX_TGLLP; }
   /// * isDG1 - true if target is DG1
   bool isDG1() const { return GenXVariant == GENX_DG1; }
+  /// * isXEHP - true if target is XEHP
+  bool isXEHP() const {
+    return GenXVariant == XE_HP_SDV;
+  }
+  /// * translateMediaWalker - true if translate media walker APIs
+  bool translateMediaWalker() const { return GenXVariant >= XE_HP_SDV; }
+  // TODO: consider implementing 2 different getters
+  /// * has add3 and bfn instructions
+  bool hasAdd3Bfn() const { return GenXVariant >= XE_HP_SDV; }
+  int dpasWidth() const {
+    return 8;
+  }
 
   /// * emulateLongLong - true if i64 emulation is requested
   bool emulateLongLong() const { return EmulateLongLong; }
@@ -195,6 +199,9 @@ public:
 
   /// * hasLongLong - true if target supports long long
   bool hasLongLong() const { return HasLongLong; }
+
+  /// * hasFP64 - true if target supports double fp
+  bool hasFP64() const { return HasFP64; }
 
   /// * hasAdd64 - true if target supports native 64-bit add/sub
   bool hasAdd64() const { return HasAdd64; }
@@ -218,6 +225,9 @@ public:
   /// * has switchjmp instruction
   bool hasSwitchjmp() const { return HasSwitchjmp; }
 
+  /// * needsWANoMaskFusedEU() - true if we need to apply WA for NoMask ops
+  bool needsWANoMaskFusedEU() const { return WaNoMaskFusedEU; }
+
   /// * has integer div/rem instruction
   bool hasIntDivRem32() const { return HasIntDivRem32; }
 
@@ -231,10 +241,14 @@ public:
 
   /// * getMaxSlmSize - returns maximum allowed SLM size (in KB)
   unsigned getMaxSlmSize() const {
+    if (isXEHP())
+      return 128;
     return 64;
   }
 
   bool hasThreadPayloadInMemory() const {
+    if (isXEHP())
+      return true;
     return false;
   }
 
@@ -244,6 +258,8 @@ public:
       return false;
     if (isDG1())
       return false;
+    if (isXEHP())
+      return false;
     return true;
   }
 
@@ -252,6 +268,8 @@ public:
   bool needsArgPatching() const {
     if (isOCLRuntime())
       return false;
+    if (isXEHP())
+      return true;
     return false;
   }
 
@@ -299,6 +317,8 @@ public:
       return TARGET_PLATFORM::GENX_TGLLP;
     case GENX_DG1:
       return TARGET_PLATFORM::GENX_TGLLP;
+    case XE_HP_SDV:
+      return TARGET_PLATFORM::XeHP_SDV;
     case GENX_KBL:
       return TARGET_PLATFORM::GENX_SKL;
     case GENX_GLK:

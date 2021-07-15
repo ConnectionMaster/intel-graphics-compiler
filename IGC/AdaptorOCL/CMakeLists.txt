@@ -18,6 +18,7 @@ include_directories("${CMAKE_CURRENT_SOURCE_DIR}")
 set(IGC_BUILD__SRC__AdaptorOCL
     "${CMAKE_CURRENT_SOURCE_DIR}/UnifyIROCL.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/MoveStaticAllocas.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/PreprocessSPVIR.cpp"
   )
 
 if(IGC_BUILD__SPIRV_ENABLED)
@@ -34,6 +35,7 @@ if(IGC_BUILD__SPIRV_ENABLED)
       SPIRV/libSPIRV/SPIRVExtInst.h
       SPIRV/libSPIRV/SPIRVFunction.h
       SPIRV/libSPIRV/SPIRVInstruction.h
+      SPIRV/libSPIRV/SPIRVMemAliasingINTEL.h
       SPIRV/libSPIRV/SPIRVModule.h
       SPIRV/libSPIRV/SPIRVOpCode.h
       SPIRV/libSPIRV/SPIRVOpCodeEnum.h
@@ -115,6 +117,7 @@ set(IGC_BUILD__HDR__AdaptorOCL
     "${CMAKE_CURRENT_SOURCE_DIR}/DriverInfoOCL.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/UnifyIROCL.hpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/MoveStaticAllocas.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/PreprocessSPVIR.h"
 
     #"${IGC_BUILD__COMMON_COMPILER_DIR}/adapters/d3d10/API/USC_d3d10.h"
     #"${IGC_BUILD__COMMON_COMPILER_DIR}/adapters/d3d10/usc_d3d10_umd.h"

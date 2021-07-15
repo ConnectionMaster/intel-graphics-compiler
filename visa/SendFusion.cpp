@@ -1,28 +1,10 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2017-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
+============================= end_copyright_notice ===========================*/
 
 #include "SendFusion.h"
 #include "BuildIR.h"
@@ -201,6 +183,8 @@ uint32_t SendFusion::getFuncCtrlWithSimd16(const G4_SendDescRaw * Desc)
             break;
         case DC1_UNTYPED_ATOMIC:
         case DC1_UNTYPED_FLOAT_ATOMIC:
+        case DC1_UNTYPED_HALF_FLOAT_ATOMIC:
+        case DC1_UNTYPED_HALF_INTEGER_ATOMIC:
             // bit12: SM2R
             FC = ((FC & ~0x1000) | (MDC_SM2R_SIMD16 << 12));
             break;
@@ -252,6 +236,22 @@ bool SendFusion::isAtomicCandidate(const G4_SendDescRaw* msgDesc)
     case DC1_UNTYPED_FLOAT_ATOMIC:
         intAtomic = false;
         break;
+    case DC1_UNTYPED_HALF_INTEGER_ATOMIC:
+        break;
+    case DC1_UNTYPED_HALF_FLOAT_ATOMIC:
+        intAtomic = false;
+        break;
+    case DC1_A64_ATOMIC:
+    case DC1_A64_UNTYPED_HALF_INTEGER_ATOMIC:
+        if (Builder->getPlatform() != XeHP_SDV)
+            return false;
+        break;
+    case DC1_A64_UNTYPED_FLOAT_ATOMIC:
+    case DC1_A64_UNTYPED_HALF_FLOAT_ATOMIC:
+        if (Builder->getPlatform() != XeHP_SDV)
+            return false;
+        intAtomic = false;
+        break;
     }
 
     // Had right atomic type, now check AtomicOp
@@ -286,6 +286,8 @@ bool SendFusion::isAtomicCandidate(const G4_SendDescRaw* msgDesc)
             return false;
         case GEN_ATOMIC_FMAX:
         case GEN_ATOMIC_FMIN:
+        case GEN_ATOMIC_FADD:
+        case GEN_ATOMIC_FSUB:
             break;
         }
     }
@@ -579,7 +581,8 @@ void SendFusion::simplifyMsg(INST_LIST_ITER SendIter)
         desc->getExtendedDesc(),
         desc->extMessageLength(),
         desc->getAccess(),
-        desc->getBti());
+        desc->getBti(),
+        desc->getExecSize());
     Send->setMsgDesc(newDesc);
 
     // If addI or movI is dead, remove them.
@@ -1421,7 +1424,7 @@ void SendFusion::doFusion(
             DstTy = Type_UD;
         }
         DstD = Builder->createTempVar(newRspLen * 8, DstTy, Any, "dst");
-        Dst = Builder->Create_Dst_Opnd_From_Dcl(DstD, 1);
+        Dst = Builder->createDstRegRegion(DstD, 1);
     }
     else
     {
@@ -1531,7 +1534,7 @@ void SendFusion::doFusion(
         P0Ty = Type_UD;
     }
     G4_Declare* P0 = Builder->createTempVar(newMsgLen * 8, P0Ty, Any, "payload0");
-    G4_SrcRegRegion* Src0 = Builder->Create_Src_Opnd_From_Dcl(P0, region);
+    G4_SrcRegRegion* Src0 = Builder->createSrcRegRegion(P0, region);
 
     G4_Declare* P1 = nullptr;
     G4_INST* sendInst = nullptr;
@@ -1543,7 +1546,7 @@ void SendFusion::doFusion(
             P1Ty = Type_UD;
         }
         P1 = Builder->createTempVar(newExtMsgLen * 8, P1Ty, Any, "payload1");
-        G4_SrcRegRegion* Src1 = Builder->Create_Src_Opnd_From_Dcl(P1, region);
+        G4_SrcRegRegion* Src1 = Builder->createSrcRegRegion(P1, region);
         sendInst = Builder->createSplitSendInst(
             Pred, G4_sends, G4_ExecSize(execSize*2), Dst, Src0, Src1,
             Builder->createImm(newDesc->getDesc(), Type_UD),

@@ -54,8 +54,8 @@ THE SOFTWARE.
 #include "llvmWrapper/Support/TypeSize.h"
 
 #include <llvm/Support/ScaledNumber.h>
-#include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/IntrinsicInst.h>
+#include <llvm/Analysis/CFG.h>
 #include "libSPIRV/SPIRVDebugInfoExt.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "common/LLVMWarningsPop.hpp"
@@ -65,10 +65,11 @@ THE SOFTWARE.
 #include "libSPIRV/SPIRVFunction.h"
 #include "libSPIRV/SPIRVInstruction.h"
 #include "libSPIRV/SPIRVModule.h"
+#include "libSPIRV/SPIRVMemAliasingINTEL.h"
 #include "SPIRVInternal.h"
 #include "common/MDFrameWork.h"
-#include "../../AdaptorCommon/TypesLegalizationPass.hpp"
 #include <llvm/Transforms/Scalar.h>
+#include <llvm/IR/MDBuilder.h>
 
 #include <iostream>
 #include <fstream>
@@ -1088,6 +1089,35 @@ public:
       return addMDNode(inst, createLocation(line, 0, scope, iat));
   }
 
+  DIModule* createModuleINTEL(SPIRVExtInst* inst)
+  {
+      if (auto n = getExistingNode<DIModule*>(inst))
+          return n;
+
+      OpDebugModuleINTEL moduleINTEL(inst);
+
+      auto scope = createScope(BM->get<SPIRVExtInst>(moduleINTEL.getParent()));
+      auto& name = BM->get<SPIRVString>(moduleINTEL.getName())->getStr();
+      auto cfgMacros = BM->get<SPIRVString>(moduleINTEL.getConfigurationMacros())->getStr();
+      auto inclPath = BM->get<SPIRVString>(moduleINTEL.getIncludePath())->getStr();
+
+      ///ModuleINTELIDToDISP[funcSPIRVId] = diSP;
+#if LLVM_VERSION_MAJOR <= 10
+      llvm::StringRef iSysRoot = StringRef();  // Empty string
+      return Builder.createModule(scope, name, cfgMacros, inclPath, iSysRoot);
+#else  // LLVM_VERSION_MAJOR >= 11
+      auto file = getDIFile(BM->get<SPIRVExtInst>(moduleINTEL.getSource()));
+      auto line = moduleINTEL.getLine();
+      auto apiNotesFile = BM->get<SPIRVString>(moduleINTEL.getAPINotesFile())->getStr();
+#if LLVM_VERSION_MAJOR == 11
+      return Builder.createModule(scope, name, cfgMacros, inclPath, apiNotesFile, file, line);
+#elif LLVM_VERSION_MAJOR >= 12
+      bool isDecl = moduleINTEL.getIsDecl() ? true : false;
+      return Builder.createModule(scope, name, cfgMacros, inclPath, apiNotesFile, file, line, isDecl);
+#endif
+#endif  // LLVM_VERSION_MAJOR >= 11
+  }
+
   DIScope* createScope(SPIRVExtInst* inst)
   {
       if (!inst)
@@ -1127,6 +1157,10 @@ public:
           inst->getExtOp() == OCLExtOpDbgKind::TypeTemplate)
       {
           return createType(inst);
+      }
+      else if (inst->getExtOp() == OCLExtOpDbgKind::ModuleINTEL)
+      {
+          return createModuleINTEL(inst);
       }
       else
       {
@@ -1244,6 +1278,12 @@ public:
       {
           (void)createGlobalVar(gvar);
       }
+
+      auto moduleINTELInstructions = BM->getModuleINTELInstructions();
+      for (auto& moduleInstruction : moduleINTELInstructions)
+      {
+          (void)createModuleINTEL(moduleInstruction);
+      }
   }
 
   void transDbgInfo(SPIRVValue *SV, Value *V);
@@ -1346,6 +1386,10 @@ public:
   bool transFPContractMetadata();
   bool transKernelMetadata();
   bool transNonTemporalMetadata(Instruction* I);
+  template <typename SPIRVInstType>
+  void transAliasingMemAccess(SPIRVInstType* BI, Instruction* I);
+  void addMemAliasMetadata(Instruction* I, SPIRVId AliasListId,
+      uint32_t AliasMDKind);
   void transSourceLanguage();
   bool transSourceExtension();
   /*InlineAsm*/ Value *transAsmINTEL(SPIRVAsmINTEL *BA, Function *F,
@@ -1383,11 +1427,15 @@ public:
   typedef DenseMap<SPIRVValue *, Value *> SPIRVToLLVMValueMap;
   typedef DenseMap<SPIRVFunction *, Function *> SPIRVToLLVMFunctionMap;
   typedef DenseMap<GlobalVariable *, SPIRVBuiltinVariableKind> BuiltinVarMap;
+  typedef std::unordered_map<SPIRVId, MDNode*> SPIRVToLLVMMDAliasInstMap;
 
   // A SPIRV value may be translated to a load instruction of a placeholder
   // global variable. This map records load instruction of these placeholders
   // which are supposed to be replaced by the real values later.
   typedef std::map<SPIRVValue *, LoadInst*> SPIRVToLLVMPlaceholderMap;
+
+  typedef std::map<const BasicBlock*, const SPIRVValue*>
+      SPIRVToLLVMLoopMetadataMap;
 
   Value *getTranslatedValue(SPIRVValue *BV);
 
@@ -1404,6 +1452,17 @@ private:
   GlobalVariable *m_NamedBarrierVar;
   GlobalVariable *m_named_barrier_id;
   DICompileUnit* compileUnit = nullptr;
+
+  // These storages are used to prevent duplication of alias.scope/noalias
+  // metadata
+  SPIRVToLLVMMDAliasInstMap MDAliasDomainMap;
+  SPIRVToLLVMMDAliasInstMap MDAliasScopeMap;
+  SPIRVToLLVMMDAliasInstMap MDAliasListMap;
+
+  // Loops metadata is translated in the end of a function translation.
+  // This storage contains pairs of translated loop header basic block and loop
+  // metadata SPIR-V instruction in SPIR-V representation of this basic block.
+  SPIRVToLLVMLoopMetadataMap FuncLoopMetadataMap;
 
   Type *mapType(SPIRVType *BT, Type *T) {
     TypeMap[BT] = T;
@@ -1484,7 +1543,8 @@ private:
   bool foreachFuncCtlMask(Source, Func);
 
   template <typename LoopInstType>
-  void setLLVMLoopMetadata(LoopInstType* LM, BranchInst* BI);
+  void setLLVMLoopMetadata(const LoopInstType* LM, Instruction* BI);
+  void transLLVMLoopMetadata(const Function* F);
   inline llvm::Metadata *getMetadataFromName(std::string Name);
   inline std::vector<llvm::Metadata *>
     getMetadataFromNameAndParameter(std::string Name, SPIRVWord Parameter);
@@ -1492,6 +1552,8 @@ private:
   Value *promoteBool(Value *pVal, BasicBlock *BB);
   Value *truncBool(Value *pVal, BasicBlock *BB);
   Type  *truncBoolType(SPIRVType *SPVType, Type *LLType);
+
+  void transMemAliasingINTELDecorations(SPIRVValue* BV, Value* V);
 };
 
 DIGlobalVariableExpression* SPIRVToLLVMDbgTran::createGlobalVar(SPIRVExtInst* inst)
@@ -1606,6 +1668,34 @@ SPIRVToLLVM::setAttrByCalledFunc(CallInst *Call) {
   }
   Call->setCallingConv(F->getCallingConv());
   Call->setAttributes(F->getAttributes());
+}
+
+// Translate aliasing decorations applied to instructions. These decorations
+// are mapped on alias.scope and noalias metadata in LLVM. Translation of
+// optional string operand isn't yet supported in the translator.
+void SPIRVToLLVM::transMemAliasingINTELDecorations(SPIRVValue* BV, Value* V) {
+    if (!BV->isInst())
+        return;
+    Instruction* Inst = dyn_cast<Instruction>(V);
+    if (!Inst)
+        return;
+    std::vector<SPIRVId> AliasListIds;
+    uint32_t AliasMDKind;
+    if (BV->hasDecorateId(DecorationAliasScopeINTEL)) {
+        AliasMDKind = LLVMContext::MD_alias_scope;
+        AliasListIds =
+            BV->getDecorationIdLiterals(DecorationAliasScopeINTEL);
+    }
+    else if (BV->hasDecorateId(DecorationNoAliasINTEL)) {
+        AliasMDKind = LLVMContext::MD_noalias;
+        AliasListIds =
+            BV->getDecorationIdLiterals(DecorationNoAliasINTEL);
+    }
+    else
+        return;
+    assert(AliasListIds.size() == 1 &&
+        "Memory aliasing decorations must have one argument");
+    addMemAliasMetadata(Inst, AliasListIds[0], AliasMDKind);
 }
 
 SPIRAddressSpace
@@ -1743,9 +1833,12 @@ SPIRVToLLVM::getMetadataFromNameAndParameter(std::string Name,
 
 
 template <typename LoopInstType>
-void SPIRVToLLVM::setLLVMLoopMetadata(LoopInstType* LM, BranchInst* BI) {
+void SPIRVToLLVM::setLLVMLoopMetadata(const LoopInstType* LM, Instruction* BI) {
   if (!LM)
     return;
+
+  IGC_ASSERT(BI && isa<BranchInst>(BI));
+
   auto Temp = MDNode::getTemporary(*Context, None);
   auto Self = MDNode::get(*Context, Temp.get());
   Self->replaceOperandWith(0, Self);
@@ -1818,6 +1911,40 @@ void SPIRVToLLVM::setLLVMLoopMetadata(LoopInstType* LM, BranchInst* BI) {
   BI->setMetadata("llvm.loop", Node);
 }
 
+void SPIRVToLLVM::transLLVMLoopMetadata(const Function *F) {
+  assert(F);
+
+  if (!FuncLoopMetadataMap.empty()) {
+    // In SPIRV loop metadata is linked to a header basic block of a loop
+    // whilst in LLVM IR it is linked to a latch basic block (the one
+    // whose back edge goes to a header basic block) of the loop.
+
+    using Edge = std::pair<const BasicBlock *, const BasicBlock *>;
+    SmallVector<Edge, 32> Edges;
+    FindFunctionBackedges(*F, Edges);
+
+    for (const auto &BkEdge : Edges) {
+      // Check that loop header BB contains loop metadata.
+      const auto LMDItr = FuncLoopMetadataMap.find(BkEdge.second);
+      if (LMDItr == FuncLoopMetadataMap.end())
+        continue;
+
+      auto *BI = const_cast<Instruction *>(BkEdge.first->getTerminator());
+      const auto *LMD = LMDItr->second;
+      if (LMD->getOpCode() == OpLoopMerge) {
+        const auto *LM = static_cast<const SPIRVLoopMerge *>(LMD);
+        setLLVMLoopMetadata<SPIRVLoopMerge>(LM, BI);
+      } else if (LMD->getOpCode() == OpLoopControlINTEL) {
+        const auto *LCI = static_cast<const SPIRVLoopControlINTEL *>(LMD);
+        setLLVMLoopMetadata<SPIRVLoopControlINTEL>(LCI, BI);
+      }
+    }
+
+    // Loop metadata map should be re-filled during each function translation.
+    FuncLoopMetadataMap.clear();
+  }
+}
+
 GlobalValue::LinkageTypes
 SPIRVToLLVM::transLinkageType(const SPIRVValue* V) {
   if (V->getLinkageType() == LinkageTypeInternal) {
@@ -1869,6 +1996,8 @@ SPIRVToLLVM::transType(SPIRVType *T) {
   case OpTypeArray:
     return mapType(T, ArrayType::get(transType(T->getArrayElementType()),
         T->getArrayLength()));
+  case OpTypeTokenINTEL:
+    return mapType(T, Type::getTokenTy(*Context));
   case OpTypePointer:
     return mapType(T, PointerType::get(transType(T->getPointerElementType()),
       SPIRSPIRVAddrSpaceMap::rmap(T->getPointerStorageClass())));
@@ -2504,6 +2633,58 @@ Type *SPIRVToLLVM::truncBoolType(SPIRVType *SPVType, Type *LLType)
         Type::getInt1Ty(LLType->getContext());
 }
 
+// Translate aliasing memory access masks for SPIRVLoad and SPIRVStore
+// instructions. These masks are mapped on alias.scope and noalias
+// metadata in LLVM. Translation of optional string operand isn't yet supported
+// in the translator.
+template <typename SPIRVInstType>
+void SPIRVToLLVM::transAliasingMemAccess(SPIRVInstType* BI, Instruction* I) {
+    static_assert(std::is_same<SPIRVInstType, SPIRVStore>::value ||
+        std::is_same<SPIRVInstType, SPIRVLoad>::value,
+        "Only stores and loads can be aliased by memory access mask");
+    bool IsAliasScope = BI->SPIRVMemoryAccess::isAliasScope();
+    bool IsNoAlias = BI->SPIRVMemoryAccess::isNoAlias();
+    if (!(IsAliasScope || IsNoAlias))
+        return;
+    uint32_t AliasMDKind = IsAliasScope ? LLVMContext::MD_alias_scope
+        : LLVMContext::MD_noalias;
+    SPIRVId AliasListId = BI->SPIRVMemoryAccess::getAliasing();
+    addMemAliasMetadata(I, AliasListId, AliasMDKind);
+}
+
+// Create and apply alias.scope/noalias metadata
+void SPIRVToLLVM::addMemAliasMetadata(Instruction* I, SPIRVId AliasListId,
+    uint32_t AliasMDKind) {
+    SPIRVAliasScopeListDeclINTEL* AliasList =
+        BM->get<SPIRVAliasScopeListDeclINTEL>(AliasListId);
+    std::vector<SPIRVId> AliasScopeIds = AliasList->getArguments();
+    MDBuilder MDB(*Context);
+    SmallVector<Metadata*, 4> MDScopes;
+    for (const auto ScopeId : AliasScopeIds) {
+        SPIRVAliasScopeDeclINTEL* AliasScope =
+            BM->get<SPIRVAliasScopeDeclINTEL>(ScopeId);
+        std::vector<SPIRVId> AliasDomainIds = AliasScope->getArguments();
+        // Currently we expect exactly one argument for aliasing scope
+        // instruction.
+        // TODO: add translation of string scope and domain operand.
+        assert(AliasDomainIds.size() == 1 &&
+            "AliasScopeDeclINTEL must have exactly one argument");
+        SPIRVId AliasDomainId = AliasDomainIds[0];
+        // Create and store unique domain and scope metadata
+        MDAliasDomainMap.emplace(AliasDomainId,
+            MDB.createAnonymousAliasScopeDomain());
+        MDAliasScopeMap.emplace(ScopeId, MDB.createAnonymousAliasScope(
+            MDAliasDomainMap[AliasDomainId]));
+        MDScopes.emplace_back(MDAliasScopeMap[ScopeId]);
+    }
+    // Create and store unique alias.scope/noalias metadata
+    MDAliasListMap.emplace(
+        AliasListId,
+        MDNode::concatenate(I->getMetadata(LLVMContext::MD_alias_scope),
+            MDNode::get(*Context, MDScopes)));
+    I->setMetadata(AliasMDKind, MDAliasListMap[AliasListId]);
+}
+
 /// For instructions, this function assumes they are created in order
 /// and appended to the given basic block. An instruction may use a
 /// instruction from another BB which has not been translated. Such
@@ -2517,7 +2698,6 @@ Type *SPIRVToLLVM::truncBoolType(SPIRVType *SPVType, Type *LLType)
 Value *
 SPIRVToLLVM::transValueWithoutDecoration(SPIRVValue *BV, Function *F,
     BasicBlock *BB, bool CreatePlaceHolder){
-
   auto OC = BV->getOpCode();
   IntBoolOpMap::rfind(OC, &OC);
 
@@ -2864,46 +3044,22 @@ SPIRVToLLVM::transValueWithoutDecoration(SPIRVValue *BV, Function *F,
   // Translation of instructions
   switch (BV->getOpCode()) {
   case OpBranch: {
-    auto BR = static_cast<SPIRVBranch *>(BV);
-    IGC_ASSERT_MESSAGE(BB, "Invalid BB");
-
-    auto BI = BranchInst::Create(
-      dyn_cast<BasicBlock>(transValue(BR->getTargetLabel(), F, BB)), BB);
-
-    SPIRVInstruction *Prev = BR->getPrevious();
-    if(Prev && Prev->getOpCode() == OpLoopMerge) {
-      auto LM = static_cast<SPIRVLoopMerge*>(Prev);
-      setLLVMLoopMetadata<SPIRVLoopMerge>(LM, BI);
-    }
-    else if (Prev && Prev->getOpCode() == OpLoopControlINTEL) {
-      auto LCI = static_cast<SPIRVLoopControlINTEL*>(Prev);
-      setLLVMLoopMetadata<SPIRVLoopControlINTEL>(LCI, BI);
-    }
-
+    auto *BR = static_cast<SPIRVBranch *>(BV);
+    auto *BI = BranchInst::Create(
+        cast<BasicBlock>(transValue(BR->getTargetLabel(), F, BB)), BB);
+    // Loop metadata will be translated in the end of function translation.
     return mapValue(BV, BI);
     }
     break;
 
   case OpBranchConditional: {
-    auto BR = static_cast<SPIRVBranchConditional *>(BV);
-    IGC_ASSERT_MESSAGE(BB, "Invalid BB");
-    auto BC = BranchInst::Create(
-      dyn_cast<BasicBlock>(transValue(BR->getTrueLabel(), F, BB)),
-      dyn_cast<BasicBlock>(transValue(BR->getFalseLabel(), F, BB)),
-      // cond must be an i1, truncate bool to i1 if it was an i8.
-      transValue(BR->getCondition(), F, BB, true, BoolAction::Truncate),
-      BB);
-
-    SPIRVInstruction *Prev = BR->getPrevious();
-    if (Prev && Prev->getOpCode() == OpLoopMerge) {
-      if (auto LM = static_cast<SPIRVLoopMerge *>(Prev))
-        setLLVMLoopMetadata<SPIRVLoopMerge>(LM, BC);
-    }
-    else if (Prev && Prev->getOpCode() == OpLoopControlINTEL) {
-      if (auto LCI = static_cast<SPIRVLoopControlINTEL *>(Prev))
-        setLLVMLoopMetadata<SPIRVLoopControlINTEL>(LCI, BC);
-    }
-
+    auto *BR = static_cast<SPIRVBranchConditional *>(BV);
+    auto *BC = BranchInst::Create(
+        cast<BasicBlock>(transValue(BR->getTrueLabel(), F, BB)),
+        cast<BasicBlock>(transValue(BR->getFalseLabel(), F, BB)),
+        // cond must be an i1, truncate bool to i1 if it was an i8.
+        transValue(BR->getCondition(), F, BB, true, BoolAction::Truncate), BB);
+    // Loop metadata will be translated in the end of function translation.
     return mapValue(BV, BC);
     }
     break;
@@ -3001,6 +3157,7 @@ SPIRVToLLVM::transValueWithoutDecoration(SPIRVValue *BV, Function *F,
       BB);
     if(BS->SPIRVMemoryAccess::isNonTemporal())
       transNonTemporalMetadata(SI);
+    transAliasingMemAccess<SPIRVStore>(BS, SI);
     return mapValue(BV, SI);
   }
   break;
@@ -3020,6 +3177,7 @@ SPIRVToLLVM::transValueWithoutDecoration(SPIRVValue *BV, Function *F,
       BB);
     if(BL->SPIRVMemoryAccess::isNonTemporal())
       transNonTemporalMetadata(LI);
+    transAliasingMemAccess<SPIRVLoad>(BL, LI);
     return mapValue(BV, LI);
     }
     break;
@@ -3082,11 +3240,10 @@ SPIRVToLLVM::transValueWithoutDecoration(SPIRVValue *BV, Function *F,
       BV->getName(), BB));
     }
     break;
-  // OpenCL Compiler does not use this instruction
-  // Should be translated at OpBranch or OpBranchConditional cases
-  case OpLoopMerge:
-  case OpLoopControlINTEL:
+  case OpLoopMerge:          // Will be translated after all other function's
+  case OpLoopControlINTEL:   // instructions are translated.
     {
+    FuncLoopMetadataMap[BB] = BV;
     return nullptr;
     }
     break;
@@ -3414,6 +3571,13 @@ SPIRVToLLVM::transValueWithoutDecoration(SPIRVValue *BV, Function *F,
 
       return mapValue(BV, sel);
   }
+  case OpArithmeticFenceINTEL:
+  {
+    // Translate arithmetic fence to it's operand to avoid crash on unknown opcode.
+    // It is planned to be translated into @llvm.arithmetic.fence.f64 in the future.
+    auto* BC = static_cast<SPIRVUnary*>(BV);
+    return mapValue(BV, transValue(BC->getOperand(0), F, BB));
+  }
   default: {
     auto OC = BV->getOpCode();
     if (isSPIRVCmpInstTransToLLVMInst(static_cast<SPIRVInstruction*>(BV))) {
@@ -3513,6 +3677,9 @@ SPIRVToLLVM::transFunction(SPIRVFunction *BF) {
       transValue(BInst, F, BB, false, BoolAction::Noop);
     }
   }
+
+  transLLVMLoopMetadata(F);
+
   return F;
 }
 
@@ -3883,6 +4050,7 @@ bool
 SPIRVToLLVM::transDecoration(SPIRVValue *BV, Value *V) {
   if (!transAlign(BV, V))
     return false;
+  transMemAliasingINTELDecorations(BV, V);
   DbgTran.transDbgInfo(BV, V);
   return true;
 }
@@ -4224,7 +4392,6 @@ SPIRVToLLVM::transOCLVectorLoadStore(std::string& UnmangledName,
     } else {
       UnmangledName.erase(UnmangledName.find("n"), 1);
     }
-    BArgs.pop_back();
   } else if (UnmangledName.find("vstore") == 0) {
     if (UnmangledName.find("n") != std::string::npos) {
       auto T = BM->getValueType(BArgs[0]);
@@ -4236,12 +4403,6 @@ SPIRVToLLVM::transOCLVectorLoadStore(std::string& UnmangledName,
       } else {
         UnmangledName.erase(UnmangledName.find("n"), 1);
       }
-    }
-    if (UnmangledName.find("_r") != std::string::npos) {
-      UnmangledName.replace(UnmangledName.find("_r"), 2, std::string("_") +
-          SPIRSPIRVFPRoundingModeMap::rmap(static_cast<SPIRVFPRoundingModeKind>(
-              BArgs.back())));
-      BArgs.pop_back();
     }
    }
 }
@@ -4440,11 +4601,6 @@ bool ReadSPIRV(LLVMContext &C, std::istream &IS, Module *&M,
       BM->getError(ErrMsg);
       Succeed = false;
     }
-
-    llvm::legacy::PassManager PM;
-    PM.add(new TypesLegalizationPass());
-    PM.add(createDeadCodeEliminationPass());
-    PM.run(*M);
 
 #if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
     if (DbgSaveTmpLLVM)

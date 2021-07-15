@@ -13,6 +13,7 @@ SPDX-License-Identifier: MIT
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvmWrapper/IR/DerivedTypes.h"
 #include "common/LLVMWarningsPop.hpp"
 #include "Probe/Assertion.h"
 
@@ -61,14 +62,14 @@ bool InstPromoter::visitSelectInst(SelectInst& I) {
 
     ValueSeq* Ops0, * Ops1;
     std::tie(Ops0, std::ignore) = TL->getLegalizedValues(I.getOperand(1), true);
-    IGC_ASSERT(Ops0->size() == 1);
+    IGC_ASSERT(Ops0 != nullptr && Ops0->size() == 1);
     // we should get value from Ops0 here, as next getLegalizedValues call may grow ValueMap object
     // when inserting new pair with ValueMap.insert(e.g.when ValueMap.NumBuckets grows from 64 to 128)
     // and previously received ValueSeq objects will become invalid.
     Value* LHS = Ops0->front();
 
     std::tie(Ops1, std::ignore) = TL->getLegalizedValues(I.getOperand(2), true);
-    IGC_ASSERT(Ops1->size() == 1);
+    IGC_ASSERT(Ops1 != nullptr && Ops1->size() == 1);
     Value* RHS = Ops1->front();
 
     Promoted = IRB->CreateSelect(I.getOperand(0), LHS, RHS,
@@ -83,14 +84,14 @@ bool InstPromoter::visitICmpInst(ICmpInst& I)
 
     ValueSeq* Ops0, * Ops1;
     std::tie(Ops0, std::ignore) = TL->getLegalizedValues(I.getOperand(0), isSigned);
-    IGC_ASSERT(Ops0->size() == 1);
+    IGC_ASSERT(Ops0 != nullptr && Ops0->size() == 1);
     // we should get value from Ops0 here, as next getLegalizedValues call may grow ValueMap object
     // when inserting new pair with ValueMap.insert(e.g.when ValueMap.NumBuckets grows from 64 to 128)
     // and previously received ValueSeq objects will become invalid.
     Value* LHS = Ops0->front();
 
     std::tie(Ops1, std::ignore) = TL->getLegalizedValues(I.getOperand(1), isSigned);
-    IGC_ASSERT(Ops1->size() == 1);
+    IGC_ASSERT(Ops1 != nullptr && Ops1->size() == 1);
     Value* RHS = Ops1->front();
 
     unsigned initialWidth = I.getOperand(0)->getType()->getIntegerBitWidth();
@@ -125,14 +126,14 @@ bool InstPromoter::visitICmpInst(ICmpInst& I)
 bool InstPromoter::visitBinaryOperator(BinaryOperator& I) {
     ValueSeq* Ops0, * Ops1;
     std::tie(Ops0, std::ignore) = TL->getLegalizedValues(I.getOperand(0));
-    IGC_ASSERT(Ops0->size() == 1);
+    IGC_ASSERT(Ops0 != nullptr && Ops0->size() == 1);
     // we should get value from Ops0 here, as next getLegalizedValues call may grow ValueMap object
     // when inserting new pair with ValueMap.insert(e.g.when ValueMap.NumBuckets grows from 64 to 128)
     // and previously received ValueSeq objects will become invalid.
     Value* LHS = Ops0->front();
 
     std::tie(Ops1, std::ignore) = TL->getLegalizedValues(I.getOperand(1));
-    IGC_ASSERT(Ops1->size() == 1);
+    IGC_ASSERT(Ops1 != nullptr && Ops1->size() == 1);
     Value* RHS = Ops1->front();
 
     switch (I.getOpcode()) {
@@ -179,7 +180,7 @@ bool InstPromoter::visitLoadInst(LoadInst& I) {
 
     TypeSeq* TySeq;
     std::tie(TySeq, std::ignore) = TL->getLegalizedTypes(OrigTy);
-    IGC_ASSERT(TySeq->size() == 1);
+    IGC_ASSERT(TySeq != nullptr && TySeq->size() == 1);
 
     unsigned AS = I.getPointerAddressSpace();
 
@@ -237,7 +238,7 @@ bool InstPromoter::visitStoreInst(StoreInst& I) {
 
     ValueSeq* ValSeq;
     std::tie(ValSeq, std::ignore) = TL->getLegalizedValues(OrigVal);
-    IGC_ASSERT(ValSeq->size() == 1);
+    IGC_ASSERT(ValSeq != nullptr && ValSeq->size() == 1);
 
     unsigned AS = I.getPointerAddressSpace();
 
@@ -378,10 +379,10 @@ bool InstPromoter::visitBitCastInst(BitCastInst& I) {
         unsigned N =
             Val->getType()->getScalarSizeInBits() / DestTy->getScalarSizeInBits();
         Value* BC =
-            IRB->CreateBitCast(Val, VectorType::get(DestTy->getScalarType(), N));
+            IRB->CreateBitCast(Val, IGCLLVM::FixedVectorType::get(DestTy->getScalarType(), N));
 
         std::vector<Constant*> Vals;
-        for (unsigned i = 0; i < DestTy->getVectorNumElements(); i++)
+        for (unsigned i = 0; i < (unsigned)cast<VectorType>(DestTy)->getNumElements(); i++)
             Vals.push_back(IRB->getInt32(i));
 
         Value* Mask = ConstantVector::get(Vals);

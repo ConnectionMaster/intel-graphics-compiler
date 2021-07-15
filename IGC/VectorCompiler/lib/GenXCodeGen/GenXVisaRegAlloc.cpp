@@ -1,24 +1,8 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (c) 2000-2021 Intel Corporation
+Copyright (C) 2017-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"),
-to deal in the Software without restriction, including without limitation
-the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom
-the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-IN THE SOFTWARE.
+SPDX-License-Identifier: MIT
 
 ============================= end_copyright_notice ===========================*/
 
@@ -36,8 +20,11 @@ IN THE SOFTWARE.
 #include "GenXNumbering.h"
 #include "GenXTargetMachine.h"
 #include "GenXUtil.h"
+#include "vc/GenXOpts/Utils/KernelInfo.h"
 #include "vc/Support/BackendConfig.h"
+#include "vc/Utils/General/Types.h"
 #include "visa_igc_common_header.h"
+
 #include "llvm/ADT/MapVector.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
 #include "llvm/GenXIntrinsics/GenXMetadata.h"
@@ -138,7 +125,7 @@ bool GenXVisaRegAlloc::runOnFunctionGroup(FunctionGroup &FGArg)
 
   for (auto &F : *FG) {
     if (F->hasFnAttribute(genx::FunctionMD::CMGenXMain) ||
-        F->hasFnAttribute(genx::FunctionMD::CMStackCall))
+        genx::requiresStackCall(F))
       RegMap[F] = KernRegMap_t();
   }
   // Reserve the reserved registers.
@@ -399,6 +386,35 @@ void GenXVisaRegAlloc::getLiveRangesForValue(
   }
 }
 
+// Coalesce state registers to avoid state registers limit violation.
+// Args:
+//    \p ToCoalesce - potential instruction to coalesce, must have surface
+//                    or sampler category.
+//    \p CommonLR - single LR used for constant state of given type, equals
+//                  null if not yet selected.
+//    \p Liveness - GenX liveness analysis.
+// Returns old common LR value if \p ToCoalesce wasn't coalesced, updated common
+// LR value otherwise.
+static LiveRange *coalesceConstState(Instruction &ToCoalesce,
+                                     LiveRange *CommonLR,
+                                     GenXLiveness &Liveness) {
+  auto *LR = Liveness.getLiveRange(&ToCoalesce);
+  IGC_ASSERT_MESSAGE(LR->Category == RegCategory::SURFACE ||
+                         LR->Category == RegCategory::SAMPLER,
+                     "wrong argument: ToCoalesce should have surface category");
+  auto IID = GenXIntrinsic::getGenXIntrinsicID(&ToCoalesce);
+  if (IID != GenXIntrinsic::genx_convert &&
+      IID != GenXIntrinsic::genx_constanti)
+    return CommonLR;
+  if (!isa<Constant>(ToCoalesce.getOperand(0)))
+    return CommonLR;
+  if (!CommonLR)
+    return LR;
+  if (Liveness.interfere(CommonLR, LR))
+    return CommonLR;
+  return Liveness.coalesce(CommonLR, LR, /*DisalowCASC=*/true);
+}
+
 /***********************************************************************
  * extraCoalescing : do some extra coalescing over and above what
  *    GenXCoalescing does
@@ -416,6 +432,7 @@ void GenXVisaRegAlloc::getLiveRangesForValue(
 void GenXVisaRegAlloc::extraCoalescing()
 {
   LiveRange *CommonSurface = nullptr;
+  LiveRange *CommonSampler = nullptr;
   for (auto fgi = FG->begin(), fge = FG->end(); fgi != fge; ++fgi) {
     Function *F = *fgi;
     for (auto fi = F->begin(), fe = F->end(); fi != fe; ++fi) {
@@ -427,24 +444,18 @@ void GenXVisaRegAlloc::extraCoalescing()
         if (GenXIntrinsic::isWrRegion(Inst))
           continue;
         auto LR = Liveness->getLiveRangeOrNull(Inst);
-        if (!LR || LR->Category != RegCategory::GENERAL)
+        if (!LR)
           continue;
-        // Check for convert of constant ot surface.
-        switch (GenXIntrinsic::getGenXIntrinsicID(Inst)) {
-          case GenXIntrinsic::genx_convert:
-          case GenXIntrinsic::genx_constanti:
-            if (LR->Category == RegCategory::SURFACE
-                && isa<Constant>(Inst->getOperand(0))) {
-              // See if we can coalesce it with CommonSurface.
-              if (!CommonSurface)
-                CommonSurface = LR;
-              else if (!Liveness->interfere(CommonSurface, LR))
-                CommonSurface = Liveness->coalesce(CommonSurface, LR, /*DisalowCASC=*/true);
-            }
-            break;
-          default:
-            break;
+        if (LR->Category == RegCategory::SURFACE) {
+          CommonSurface = coalesceConstState(*Inst, CommonSurface, *Liveness);
+          continue;
         }
+        if (LR->Category == RegCategory::SAMPLER) {
+          CommonSampler = coalesceConstState(*Inst, CommonSampler, *Liveness);
+          continue;
+        }
+        if (LR->Category != RegCategory::GENERAL)
+          continue;
         // We have a non-struct non-wrregion instruction whose result has a
         // live range (it is not baled into anything else).
         // Check all uses to see if there is one in a non-alu intrinsic. We
@@ -501,6 +512,22 @@ void GenXVisaRegAlloc::extraCoalescing()
         if (skipTwoAddrCoalesce(Inst))
           continue;
 
+        // if intrinsic have restrictions on combination for input/output
+        // registers return true
+        auto isRestrictedByVisa = [](unsigned ID, unsigned operandNum) {
+          switch (ID) {
+            // dpas - src1 and src2 should not overlap with dst
+          case GenXIntrinsic::genx_dpas2:
+          case GenXIntrinsic::genx_dpas:
+          case GenXIntrinsic::genx_dpasw:
+            return operandNum == 1 || operandNum == 2;
+          case GenXIntrinsic::genx_dpas_nosrc0:
+          case GenXIntrinsic::genx_dpasw_nosrc0:
+            return operandNum == 0 || operandNum == 1;
+          default:
+            return false;
+          }
+        };
         // See if we can coalesce with any operand.
         for (unsigned oi = 0, oe = Inst->getNumOperands(); oi != oe; ++oi) {
           Value *Operand = Inst->getOperand(oi);
@@ -510,6 +537,8 @@ void GenXVisaRegAlloc::extraCoalescing()
             continue;
           // Do not coalesce with kernel arguments as they are input variables.
           if (FG->getHead() == F && isa<Argument>(Operand))
+            continue;
+          if (isRestrictedByVisa(GenXIntrinsic::getGenXIntrinsicID(Inst), oi))
             continue;
           auto OperandLR = Liveness->getLiveRangeOrNull(Operand);
           if (!OperandLR || OperandLR->Category != RegCategory::GENERAL)
@@ -640,12 +669,13 @@ GenXVisaRegAlloc::Reg* GenXVisaRegAlloc::getRegForValueOrNull(
     if (GV && GV->hasAttribute(genx::FunctionMD::GenXVolatile))
       OverrideType = OverrideType->getPointerElementType();
   }
-  OverrideType = &fixDegenerateVectorType(*OverrideType);
+  OverrideType = &vc::fixDegenerateVectorType(*OverrideType);
+  auto &DL = kernel->getParent()->getDataLayout();
   if (R->Num < VISA_NUM_RESERVED_REGS) {
     OverrideType = IGCLLVM::FixedVectorType::get(
         OverrideType->getScalarType(),
         R->Ty->getPrimitiveSizeInBits() /
-            OverrideType->getScalarType()->getPrimitiveSizeInBits());
+            DL.getTypeSizeInBits(OverrideType->getScalarType()));
   }
 
   Reg *LastAlias = R;
@@ -653,7 +683,7 @@ GenXVisaRegAlloc::Reg* GenXVisaRegAlloc::getRegForValueOrNull(
   for (Reg *CurAlias = R; CurAlias; CurAlias = CurAlias->NextAlias[kernel]) {
     LastAlias = CurAlias;
     Type *ExistingType = CurAlias->Ty;
-    ExistingType = &fixDegenerateVectorType(*ExistingType);
+    ExistingType = &vc::fixDegenerateVectorType(*ExistingType);
     if (ExistingType == OverrideType &&
         CurAlias->Num >= VISA_NUM_RESERVED_REGS &&
         (CurAlias->Signed == Signed || Signed == DONTCARESIGNED)) {

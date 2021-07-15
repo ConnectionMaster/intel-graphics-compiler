@@ -18,21 +18,28 @@ SPDX-License-Identifier: MIT
 #include "LLVMWarningsPop.hpp"
 #include "common/igc_regkeys.hpp"
 
+using namespace llvm;
+using namespace IGC;
+using namespace IGCMD;
 
 namespace IGC
 {
     class FoldKnownWorkGroupSizes : public llvm::FunctionPass, public llvm::InstVisitor<FoldKnownWorkGroupSizes>
     {
     private:
-        static char ID;
         CodeGenContext* ctx = nullptr;
         bool RequirePayloadHeader = true;
     public:
+        static char ID;
         FoldKnownWorkGroupSizes() : FunctionPass(ID) {}
-        bool runOnFunction(llvm::Function& F);
+        bool runOnFunction(llvm::Function& F) override;
         void visitCallInst(llvm::CallInst& I);
 
-        void getAnalysisUsage(llvm::AnalysisUsage& AU) const
+        llvm::StringRef getPassName() const override {
+            return "FoldKnownWorkGroupSizes";
+        }
+
+        void getAnalysisUsage(llvm::AnalysisUsage& AU) const override
         {
             AU.addRequired<IGC::CodeGenContextWrapper>();
         }
@@ -40,13 +47,14 @@ namespace IGC
     };
     bool m_changed = false;
     char FoldKnownWorkGroupSizes::ID = 0;
+
+#define PASS_FLAG "igc-fold-workgroup-sizes"
+#define PASS_DESCRIPTION "Fold global offset and enqueued local sizes"
+#define PASS_CFG_ONLY false
+#define PASS_ANALYSIS false
+    IGC_INITIALIZE_PASS_BEGIN(FoldKnownWorkGroupSizes, PASS_FLAG, PASS_DESCRIPTION, PASS_CFG_ONLY, PASS_ANALYSIS)
+    IGC_INITIALIZE_PASS_END(FoldKnownWorkGroupSizes, PASS_FLAG, PASS_DESCRIPTION, PASS_CFG_ONLY, PASS_ANALYSIS)
 }
-
-
-
-using namespace llvm;
-using namespace IGC;
-using namespace IGCMD;
 
 bool FoldKnownWorkGroupSizes::runOnFunction(Function& F)
 {

@@ -1,28 +1,10 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2020-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
+============================= end_copyright_notice ===========================*/
 
 #include "DebugInfo.h"
 #include "common.h"
@@ -163,6 +145,7 @@ void LinearScanRA::setLexicalID()
             }
         }
     }
+    lastInstLexID = id;
 }
 
 bool LinearScanRA::hasDstSrcOverlapPotential(G4_DstRegRegion* dst, G4_SrcRegRegion* src)
@@ -601,7 +584,8 @@ void LinearScanRA::linearScanMarkReferences(unsigned int& numRowsEOT)
                     continue;
                 }
 
-                if (l.isLiveAtEntry(curBB, dcl->getRegVar()->getId()))
+                if (!l.isEmptyLiveness() &&
+                    l.isLiveAtEntry(curBB, dcl->getRegVar()->getId()))
                 {
                     lr->recordRef(curBB, true);
                 }
@@ -691,7 +675,7 @@ void LinearScanRA::preRAAnalysis()
     int numGRF = kernel.getNumRegTotal();
 
     // Clear LSLiveRange* computed preRA
-    gra.clearStaleLiveRanges();
+    gra.clearLocalLiveRanges();
 
     createLiveIntervals();
 
@@ -718,65 +702,6 @@ void LinearScanRA::preRAAnalysis()
         {
             unsigned int regNum = forbiddenRegs[i];
             pregs->setGRFUnavailable(regNum); //un-available will always be there, if it's conflict with input or pre-assigned, it's still un-available.
-        }
-
-        if (builder.getOption(vISA_Debug))
-        {
-            // Since LinearScanRA is not undone when debug info generation is required,
-            // for keeping compile time low, we allow fewer physical registers
-            // as assignable candidates. Without this, we could run in to a
-            // situation where very few physical registers are available for GRA
-            // and it is unable to assign registers even with spilling.
-#define USABLE_GRFS_WITH_DEBUG_INFO 80
-            int maxSendReg = 0;
-            for (auto bb : kernel.fg)
-            {
-                for (auto inst : *bb)
-                {
-                    if (inst->isSend() || inst->isSplitSend())
-                    {
-                        maxSendReg = ((int)inst->getMsgDesc()->getDstLenRegs() > maxSendReg) ?
-                            ((int)inst->getMsgDesc()->getDstLenRegs()) : maxSendReg;
-                        maxSendReg = ((int)inst->getMsgDesc()->getSrc0LenRegs() > maxSendReg) ?
-                            ((int)inst->getMsgDesc()->getSrc0LenRegs()) : maxSendReg;
-                        maxSendReg = ((int)inst->getMsgDesc()->getSrc1LenRegs() > maxSendReg) ?
-                            ((int)inst->getMsgDesc()->getSrc1LenRegs()) : maxSendReg;
-                    }
-                }
-            }
-
-            int maxRegsToUse = USABLE_GRFS_WITH_DEBUG_INFO;
-            if (maxSendReg > (numGRF - USABLE_GRFS_WITH_DEBUG_INFO))
-            {
-                maxRegsToUse = (numGRF - maxSendReg) - 10;
-            }
-
-            // Also check max size of addressed GRF
-            unsigned int maxAddressedRows = 0;
-            for (auto dcl : kernel.Declares)
-            {
-                if (dcl->getAddressed() &&
-                    maxAddressedRows < dcl->getNumRows())
-                {
-                    maxAddressedRows = dcl->getNumRows();
-                }
-            }
-
-            // Assume indirect operand of maxAddressedRows exists
-            // on dst, src0, src1. This is overly conservative but
-            // should work for general cases.
-            if ((numGRF - maxRegsToUse) / 3 < (int)maxAddressedRows)
-            {
-                maxRegsToUse = (numGRF - (maxAddressedRows * 3));
-
-                if (maxRegsToUse < 0)
-                    maxRegsToUse = 0;
-            }
-
-            for (int i = maxRegsToUse; i < numGRF; i++)
-            {
-                pregs->setGRFUnavailable(i);
-            }
         }
     }
     else
@@ -962,6 +887,7 @@ int LinearScanRA::linearScanRA()
         printInputLiveIntervalsGlobal();
 #endif
 
+        liveThroughIntervals.clear();
         globalLiveIntervals.clear();
         preAssignedLiveIntervals.clear();
         eotLiveIntervals.clear();
@@ -979,6 +905,15 @@ int LinearScanRA::linearScanRA()
                 latestLexID = bb->back()->getLexicalId() * 2;
             }
         }
+
+        if (liveThroughIntervals.size())
+        {
+            for (auto lr : liveThroughIntervals)
+            {
+                globalLiveIntervals.insert(globalLiveIntervals.begin(), lr);
+            }
+        }
+
 #ifdef DEBUG_VERBOSE_ON
         COUT_ERROR << "===== globalLiveIntervals============" << std::endl;
         printLiveIntervals(globalLiveIntervals);
@@ -1077,7 +1012,6 @@ int LinearScanRA::linearScanRA()
                 }
                 jitInfo->numGRFSpillFill = GRFSpillFillCount;
             }
-
             undoLinearScanRAAssignments();
         }
 
@@ -1241,6 +1175,18 @@ void LinearScanRA::setDstReferences(G4_BB* bb, INST_LIST_ITER inst_it, G4_Declar
         lr = CreateLocalLiveRange(dcl);
     }
 
+    if (dcl->isLiveIn() && dcl->isOutput() && !lr->isGRFRegAssigned())
+    {
+        if (lr->getRegionID() != regionID)
+        {
+            lr->setFirstRef(curInst, 0);
+            lr->setLastRef(curInst, lastInstLexID * 2 + 1);
+            liveThroughIntervals.push_back(lr);
+            lr->setRegionID(regionID);
+        }
+        return;
+    }
+
     if (lr == nullptr ||
         (dcl->getRegFile() == G4_INPUT && dcl != kernel.fg.builder->getStackCallArg() && dcl != kernel.fg.builder->getStackCallRet())||
         (lr->isGRFRegAssigned() && (!dcl->getRegVar()->isGreg())))  //ARF
@@ -1332,6 +1278,18 @@ void LinearScanRA::setSrcReferences(G4_BB* bb, INST_LIST_ITER inst_it, int srcId
         lr = CreateLocalLiveRange(dcl);
     }
 
+    if (dcl->isLiveIn() && dcl->isOutput() && !lr->isGRFRegAssigned())
+    {
+        if (lr->getRegionID() != regionID)
+        {
+            lr->setFirstRef(curInst, 0);
+            lr->setLastRef(curInst, lastInstLexID * 2 + 1);
+            liveThroughIntervals.push_back(lr);
+            lr->setRegionID(regionID);
+        }
+        return;
+    }
+
     if (lr == nullptr ||
         (dcl->getRegFile() == G4_INPUT && dcl != kernel.fg.builder->getStackCallRet() && dcl != kernel.fg.builder->getStackCallArg()) ||
         (lr->isGRFRegAssigned() && (!dcl->getRegVar()->isGreg())))  //ARF
@@ -1366,6 +1324,7 @@ void LinearScanRA::setSrcReferences(G4_BB* bb, INST_LIST_ITER inst_it, int srcId
     if ((builder.WaDisableSendSrcDstOverlap() &&
         ((curInst->isSend() && srcIdx == 0) ||
             (curInst->isSplitSend() && srcIdx == 1)))
+        || (curInst->isDpas() && srcIdx == 1)  //For DPAS, as part of same instruction, src1 should not have overlap with dst.
         || (builder.avoidDstSrcOverlap() && curInst->getDst() != NULL && hasDstSrcOverlapPotential(curInst->getDst(), curInst->getSrc(srcIdx)->asSrcRegRegion()))
         )
     {
@@ -1424,6 +1383,7 @@ void LinearScanRA::calculateInputIntervalsGlobal(PhyRegsLocalRA &initPregs, std:
 {
     int numGRF = kernel.getNumRegTotal();
     std::vector<uint32_t> inputRegLastRef(numGRF * numEltPerGRF<Type_UW>(), UINT_MAX);
+    G4_INST* lastInst = nullptr;
 
     for (BB_LIST_RITER bb_it = bbList.rbegin(), bb_rend = bbList.rend();
         bb_it != bb_rend;
@@ -1460,6 +1420,10 @@ void LinearScanRA::calculateInputIntervalsGlobal(PhyRegsLocalRA &initPregs, std:
             G4_INST* curInst = (*inst_it);
             G4_Declare* topdcl = NULL;
 
+            if (lastInst == nullptr)
+            {
+                lastInst = curInst;
+            }
             // scan dst operand (may be unnecessary but added for safety)
             if (curInst->getDst() != NULL)
             {
@@ -1505,7 +1469,14 @@ void LinearScanRA::calculateInputIntervalsGlobal(PhyRegsLocalRA &initPregs, std:
                         }
                         else
                         {
-                            generateInputIntervals(topdcl, curInst, inputRegLastRef, initPregs, false);
+                            if (l.isLiveAtEntry(bb, topdcl->getRegVar()->getId()))
+                            {
+                                generateInputIntervals(topdcl, curInst, inputRegLastRef, initPregs, false);
+                            }
+                            else //Not capture by liveness analysis
+                            {
+                                generateInputIntervals(topdcl, lastInst, inputRegLastRef, initPregs, false);
+                            }
                         }
                     }
                 }
@@ -1551,7 +1522,7 @@ void LinearScanRA::calculateLiveInIntervals(G4_BB* bb, std::vector<LSLiveRange*>
             continue;
         }
         LSLiveRange* lr = gra.getLSLR(dcl);
-        if (lr &&
+        if (lr && !l.isEmptyLiveness() &&
             l.isLiveAtEntry(bb, dcl->getRegVar()->getId()))
         {
             if (lr->getRegionID() != regionID)
@@ -2048,6 +2019,7 @@ bool globalLinearScan::runLinearScan(IR_Builder& builder, std::vector<LSLiveRang
     for (auto lr : liveIntervals)
     {
         G4_Declare* dcl = lr->getTopDcl();
+
         lr->getFirstRef(idx);
         if (!lr->isEOT() && !lr->getAssigned())
         {
@@ -2309,7 +2281,7 @@ bool globalLinearScan::insertLiveRange(std::list<LSLiveRange*>* liveIntervals, L
     return false;
 }
 
-bool globalLinearScan::canBeSpilledLR(LSLiveRange* tlr, LSLiveRange* lr, int GRFNum)
+bool globalLinearScan::canBeSpilledLR(LSLiveRange* lr)
 {
     if (lr->isUseUnAvailableReg())
     {
@@ -2368,13 +2340,6 @@ bool globalLinearScan::canBeSpilledLR(LSLiveRange* tlr, LSLiveRange* lr, int GRF
         return false;
     }
 
-    //GRF spill is forbidden for current lr
-    const bool* forbidden = lr->getForbidden();
-    if (forbidden[GRFNum])
-    {
-        return false;
-    }
-
     return true;
 }
 
@@ -2420,7 +2385,7 @@ int globalLinearScan::findSpillCandidate(LSLiveRange* tlr)
 
                     analyzedLV = lr;
 
-                    if (!canBeSpilledLR(tlr, lr, k))
+                    if (!canBeSpilledLR(lr) || lr->getForbidden()[k])
                     {
                         int startsregnum = 0;
                         G4_VarBase* op = lr->getPhyReg(startsregnum);

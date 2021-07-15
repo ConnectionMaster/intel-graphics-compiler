@@ -1,28 +1,10 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2017-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
+============================= end_copyright_notice ===========================*/
 
 #ifndef _LOCALSCHEDULER_H_
 #define _LOCALSCHEDULER_H_
@@ -270,6 +252,7 @@ public:
 
     bool hasReadSuppression(G4_INST *curInst, G4_INST *nextInst, BitSet &liveDst, BitSet &liveSrc);
     bool hasReadSuppression(G4_INST* prevInst, G4_INST* nextInst, bool multipSuppression);
+    bool hasSameSourceOneDPAS(G4_INST * curInst, G4_INST * nextInst, BitSet & liveDst, BitSet & liveSrc);
 
     DDD(Mem_Manager& m, G4_BB* bb, const LatencyTable& lt, G4_Kernel* k);
     ~DDD()
@@ -360,6 +343,39 @@ private:
     Options* m_options;
 };
 
+class GRFMode
+{
+public:
+    GRFMode();
+    void setCurrentMode(unsigned newMode) { currentMode = newMode; }
+    unsigned getNumThreads() const { return configurations[currentMode].second; }
+    unsigned getMinGRF() const { return configurations[0].first; }
+    unsigned getMaxGRF() const { return configurations[configurations.size() - 1].first; }
+    unsigned getDefaultGRF() const { return configurations[defaultMode].first; }
+    unsigned getMinNumThreads() const { return configurations[configurations.size() - 1].second; }
+    unsigned getMaxNumThreads() const { return configurations[0].second; }
+    unsigned getDefaultNumThreads() const { return configurations[defaultMode].second; }
+
+private:
+    // Store all configurations <GRF, numThreads> for current platform
+    std::vector<std::pair<unsigned, unsigned>> configurations;
+    unsigned defaultMode;
+    unsigned currentMode;
+};
+
+class preRA_RegSharing
+{
+public:
+    preRA_RegSharing(G4_Kernel& k, Mem_Manager& m, RPE* rpe);
+    ~preRA_RegSharing();
+    bool run();
+
+private:
+    G4_Kernel& kernel;
+    Mem_Manager& mem;
+    RPE* rpe;
+
+};
 } // namespace vISA
 
 #endif // _LOCALSCHEDULER_H_

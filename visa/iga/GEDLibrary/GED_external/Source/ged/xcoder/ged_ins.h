@@ -1,28 +1,10 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2017-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
+============================= end_copyright_notice ===========================*/
 
 #ifndef GED_INS_H
 #define GED_INS_H
@@ -65,7 +47,7 @@ public:
     /*!
      * Initialize an empty instruction with a new opcode.
      *
-     * @param[in]   modelId     GEN version as specified by @ref GED_MODEL.
+     * @param[in]   modelId     GED model version as specified by @ref GED_MODEL.
      * @param[in]   opcode      The enumerator representing the new opcode.
      *
      * @return      GED_RETURN_VALUE indicating success or invalid opcode.
@@ -76,7 +58,7 @@ public:
     /*!
      * Assign raw (undecoded) bytes to the GEDIns object. If the instruction is compact, it is mapped to the native format.
      *
-     * @param[in]   modelId     GEN version as specified by @ref GED_MODEL.
+     * @param[in]   modelId     GED model version as specified by @ref GED_MODEL.
      * @param[in]   rawBytes    An array of size "size" containing the raw bytes.
      * @param[in]   size        The size of the array.
      *
@@ -160,7 +142,7 @@ public:
     GED_RETURN_VALUE QueryFieldBitLocation(const /* GED_INS_FIELD */ uint32_t field, uint32_t *fragments, uint32_t *length) const;
 
     /*!
-     * Get the GED_MODEL Id for the GEN version by which this instruction is decoded.
+     * Get the GED_MODEL Id for the GED model version by which this instruction is decoded.
      *
      * @return      The requested GED_MODEL Id.
      */
@@ -169,7 +151,7 @@ public:
 
     /*!
      * Get the instruction's opcode in the form of a GED_OPCODE enumerator. Use @ref GetRawOpcode for obtaining the raw encoding of
-     * the opcode in the GEN instruction.
+     * the opcode in the GED model instruction.
      *
      * @return      The enumerator representing the instruction's opcode.
      *
@@ -179,7 +161,7 @@ public:
 
 
     /*!
-     * Get the instruction raw opcode as it is encoded in the GEN instruction. Use @ref GetOpcode for obtaining the GED_OPCODE for
+     * Get the instruction raw opcode as it is encoded in the GED model instruction. Use @ref GetOpcode for obtaining the GED_OPCODE for
      * this opcode.
      *
      * @return      The opcode encoding.

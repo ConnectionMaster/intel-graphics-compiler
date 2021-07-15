@@ -1,24 +1,8 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (c) 2000-2021 Intel Corporation
+Copyright (C) 2019-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"),
-to deal in the Software without restriction, including without limitation
-the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom
-the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-IN THE SOFTWARE.
+SPDX-License-Identifier: MIT
 
 ============================= end_copyright_notice ===========================*/
 
@@ -38,6 +22,10 @@ IN THE SOFTWARE.
 #include "common/VCPlatformSelector.hpp"
 
 #include "AdaptorOCL/OCL/sp/spp_g8.h"
+
+namespace llvm {
+class Error;
+} // namespace llvm
 
 namespace vc {
 
@@ -100,6 +88,9 @@ public:
   // Sampler
   void createSamplerAnnotation(unsigned argNo);
 
+  void createPrintfBufferArgAnnotation(unsigned Index, unsigned BTI,
+                                       unsigned Size, unsigned ArgOffset);
+
   void RecomputeBTLayout(int numUAVs, int numResources);
 };
 
@@ -114,6 +105,9 @@ public:
     bool needsSystemKernel() const override { return false; }
     bool isProgramDebuggable() const override { return IsDebuggable; }
     bool hasProgrammableBorderColor() const override { return false; }
+    bool useBindlessMode() const override { return false; }
+    bool useBindlessLegacyMode() const override { return false; }
+
 
     void updateDebuggableStatus(bool Debuggable) { IsDebuggable = Debuggable; }
 
@@ -122,21 +116,24 @@ public:
   };
 
   explicit CGen8CMProgram(PLATFORM platform, const WA_TABLE& WATable);
-  ~CGen8CMProgram();
 
   // Produce the final ELF binary with the given CM kernels
   // in OpenCL format.
   void CreateKernelBinaries();
   void GetZEBinary(llvm::raw_pwrite_stream &programBinary,
                    unsigned pointerSizeInBytes) override;
+  bool HasErrors() const { return !m_ErrorLog.empty(); };
+  llvm::Error GetError() const;
 
   // CM kernel list.
-  std::vector<CMKernel *> m_kernels;
+  using CMKernelsStorage = std::vector<std::unique_ptr<CMKernel>>;
+  CMKernelsStorage m_kernels;
 
   // Data structure to create patch token based binaries.
   std::unique_ptr<IGC::SOpenCLProgramInfo> m_programInfo;
 
   CMProgramCtxProvider m_ContextProvider;
+  std::string m_ErrorLog;
 };
 
 void createBinary(

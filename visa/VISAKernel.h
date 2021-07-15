@@ -1,28 +1,10 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2017-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
+============================= end_copyright_notice ===========================*/
 
 #ifndef VISA_KERNEL_H
 #define VISA_KERNEL_H
@@ -104,8 +86,6 @@ public:
 
         m_inputSize = 0;
         m_opndCounter = 0;
-        // give it some default name in case AsmName is not set
-        m_asmName = "test";
 
         varNameCount = COMMON_ISA_NUM_PREDEFINED_VAR_VER_3;
         addressNameCount = 0;
@@ -128,7 +108,6 @@ public:
 
         InitializeKernel(name);
         SetGTPinInit(m_CISABuilder->getGtpinInit());
-
     }
 
     void* alloc(size_t sz) { return m_mem.alloc(sz); }
@@ -566,7 +545,25 @@ public:
 
     VISA_BUILDER_API int AppendVISALifetime(VISAVarLifetime startOrEnd, VISA_VectorOpnd *varId);
 
+    VISA_BUILDER_API int AppendVISADpasInst(
+        ISA_Opcode opcode, VISA_EMask_Ctrl emask, VISA_Exec_Size executionSize,
+        VISA_RawOpnd *tmpDst, VISA_RawOpnd *src0, VISA_RawOpnd *src1, VISA_VectorOpnd *src2,
+        GenPrecision src2Precision, GenPrecision src1Precision,
+        uint8_t Depth, uint8_t Count);
 
+    VISA_BUILDER_API int AppendVISABfnInst(
+        uint8_t booleanFuncCtrl, VISA_PredOpnd *pred, bool satMode, VISA_EMask_Ctrl emask,
+        VISA_Exec_Size executionSize, VISA_VectorOpnd *tmpDst, VISA_VectorOpnd *src0, VISA_VectorOpnd *src1, VISA_VectorOpnd *src2);
+
+    VISA_BUILDER_API virtual int AppendVISAQwordGatherInst(VISA_PredOpnd *pred,
+        VISA_EMask_Ctrl emask, VISA_Exec_Size executionSize,
+        VISA_SVM_Block_Num numBlocks, VISA_StateOpndHandle *surface,
+        VISA_RawOpnd* address, VISA_RawOpnd *src);
+
+    VISA_BUILDER_API virtual int AppendVISAQwordScatterInst(VISA_PredOpnd *pred,
+        VISA_EMask_Ctrl emask, VISA_Exec_Size executionSize,
+        VISA_SVM_Block_Num numBlocks, VISA_StateOpndHandle *surface,
+        VISA_RawOpnd* address, VISA_RawOpnd *dst);
 
 
 
@@ -762,6 +759,7 @@ public:
     void setJitInfo(FINALIZER_INFO* jitInfo) { m_jitInfo = jitInfo; }
 
     std::string getOutputAsmPath() const { return m_asmName; }
+    void setOutputAsmPath(std::string val) { m_asmName = val; }
 
     int compileFastPath();
 
@@ -907,6 +905,12 @@ private:
     VISA_opnd * getOpndFromPool();
 
     void AppendVISAInstCommon();
+    int AppendVISADpasInstCommon(
+        ISA_Opcode opcode, VISA_EMask_Ctrl emask, VISA_Exec_Size executionSize,
+        VISA_RawOpnd* tmpDst, VISA_RawOpnd* src0, VISA_RawOpnd* src1,
+        VISA_VectorOpnd* src2, VISA_VectorOpnd* src3,
+        GenPrecision src2Precision, GenPrecision src1Precision,
+        uint8_t Depth, uint8_t Count);
 
     void createBindlessSampler();
 

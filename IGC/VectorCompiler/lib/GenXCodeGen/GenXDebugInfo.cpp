@@ -1,24 +1,8 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (c) 2000-2021 Intel Corporation
+Copyright (C) 2020-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"),
-to deal in the Software without restriction, including without limitation
-the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom
-the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-IN THE SOFTWARE.
+SPDX-License-Identifier: MIT
 
 ============================= end_copyright_notice ===========================*/
 
@@ -50,13 +34,198 @@ IN THE SOFTWARE.
 
 #include "Probe/Assertion.h"
 
+#include <unordered_set>
+
+//
+/// GenXDebugInfo
+/// -------------
+///
+/// The goal of the pass is to provide debug information for each generated
+/// genisa instruction (if such information is available).  The debug
+/// information is encoded in DWARF format.
+///
+/// Ultimately, the pass gets data from 2 sources:
+///
+///   1. LLVM debug information encoded in LLVM IR itself. It captures the
+///   important pieces of the source language's Abstract Syntax Tree and
+///   maps it onto LLVM code.
+///   LLVM framework should maintain it automatically, given that we follow
+///   relatively simple rules while designing IR transformations:
+///      https://llvm.org/docs/HowToUpdateDebugInfo.html
+///
+///   2. Debug information obtained from the finalizer. This information is
+///   encoded in some proprietary format (blob) and contains the following:
+///     a. mapping between vISA and genISA instructions
+///     b. live intervals of the virtual registers, information about spilled
+///     values, etc.
+///     c. call frame information
+///
+/// The pass feeds the above information to the DebugInfo library which in turn
+/// produces the final DWARF.
+///
+/// Operation of the pass
+/// ^^^^^^^^^^^^^^^^^^^^^
+///
+/// The pass assumes that some data is already being made available by other
+/// passes/analysis.
+///
+/// * FunctionGroupAnalysis:
+///     provides information about the overall "structure"
+///     of the program: functions, stack calls, indirect calls, subroutines and
+///     relationships.
+///
+/// * GenXModule:
+///     1. for each LLVM Function provides information about
+///        LLVM instruction -> vISA instructions mapping. This information is
+///        produced/maintained during operation of CISABuilder pass.
+///     2. for each LLVM Function provides access to a corresponding
+///      *VISAKernel* object.
+///
+/// * GenXVisaRegAlloc:
+///     provides the mapping between LLVM values and virtual registers.
+///
+/// * GenXCisaBuilder:
+///     provides access to VISABuilder, which allows us to have access to
+///     VISAKernel objects (some Functions from LLVM IR, like the ones
+///     representing kernel spawns these) that contain:
+///         a. debug information maintained by finalizer (see above)
+///         b. the respected gen binaries
+///
+/// Data Structures
+/// ^^^^^^^^^^^^^^^
+///
+/// Since data is aggregated from different sources, some extra data structures
+/// are used to simplify bookkeeping.
+///
+/// - *genx::di::VisaMapping*
+///   provides the mapping from LLMV IR instruction to vISA instruction index,
+///   that represents the first vISA instruction spawned by the LLVM IR
+///   instruction. A single LLVM IR instruction can spawn several
+///   vISA instructions - currently the number of spawned instructions is
+///   derived implicitly (which is not always correct but works in most of the
+///   cases).
+///
+/// - *ProgramInfo*
+///   A transient object that groups several llvm Functions that are eventually
+///   get compiled into a single gen entity. A separate elf file with the
+///   debug information is generated for each gen entity.
+///
+///   The grouping is done as follows:
+///   - We piggyback on FunctionGroup analysis. Each kernel function becomes the
+///   head of the group. Different FunctionGroups always result in different
+///   *ProgramInfo* objects. However, a single FunctionGroup can be split even
+///   further. This can happen if we have an indirect call to some function. In
+///   this case, this function shall is compiled into a separate gen object
+///   (and a separate VISAKernel is produced aswell).
+///
+///   The above approach does not work correctly in all cases. See
+///   *KNOWN ISSUES* section.
+///
+/// - *CompiledVisaWrapper*
+///  For an arbitrary pair of llvm IR Function and VISAKernel objects,
+///  does the following:
+///     + Validates that IR Function and VISAKernel object are related (that is
+///       the vISA spawned by IR Function is owned by the VISAKernel.
+///     + Extracts Gen Binary.
+///     + Extracts Debug Info Blob from finalizer and decodes it.
+///
+/// *GenXFunction*
+///  An object that loosely resembles MachineFunctoin from the LLVM Machine IR.
+///  This is an object that for a given LLVM IR Function can access to:
+///     - LLVM IR Function
+///     - VisaMapping
+///     - Subtarget
+///     - CompiledVisaWrapper
+///     - GenXVisaRegAlloc
+///  GenXFunctoin serves as a primary method to communicate with the DebugInfo
+///  library. The data these objects hold allow us to reason about the debug
+///  information for any Gen construct (instruction, variable, etc).
+///
+/// Examples
+/// ^^^^^^^^
+///
+/// Examples below use the following naming conventions:
+///     K* - kernel function
+///     L* - subroutine (non-inlined function)
+///     S* - simple stack call
+///     I* - indirectly-called function
+///
+/// FunctionGroup construction peculiarities.
+///
+///   When function groups are constructed, we do some peculiar transformations.
+///
+///    Case_1 (FG):
+///         Source Code: { K1 calls L1, K2 calls L1 }
+///         IR after function groups: { G1 = {K1, L1}, G2 = { K2, L1'} },
+///             where L1' is a clone of L1.
+///    Case_2 (FG):
+///         Source Code: { K1 calls S_1, both call L1 }.
+///         IR after function groups: { G1 = {K1, L1, S1, L1' } }.
+///    Case_3 (FG):
+///         Source Code: { K1 calls I1 and I2 }.
+///         IR after function grups { G1 = {K1}, G2 = {I1}, G3={I2} }.
+///
+/// VISA/genISA  construction peculiarities.
+///
+///   Case 1:
+///     Source code: K1, K2.
+///     Compilation phase:
+///         two function groups are created, K1 and K2 are heads.
+///         two different VISAKernel produced.
+///     DebugInfoGeneration:
+///         Decoded Debug info for each VISAKernel contains:
+///           one compiled object description.
+///           two "*.elf" files are created.
+///
+///   Case 2:
+///     Source code: K1, S1. K1 calls S1.
+///     Compilation phase:
+///         1 function group is created, K1 is the head.
+///         1 VISAKernel and 1 VISAFunction are created.
+///     DebugInfoGeneratation:
+///         Decoded debug info contains *2* compiled objects.
+///         Each object has separate vISA indexes - visa instructions are
+///         counted separately. Still, both are compiled into the same gen
+///         object, so only one "*.elf" file is emitted.
+///
+///   Case 3:
+///     Source code: K1, I1. K1 calls I1
+///     Compilation phase:
+///         1 function group is created, K1 is the head.
+///         Somehow 2 VISAKernels are created.
+///     DebugInfoGeneratation:
+///         Decoded debug info contains *1* compiled objects (but we have 2
+///         VISAKernel).
+///         In the end, we emit two "*.elf" files.
+///
+/// KNOWN ISSUES
+/// ^^^^^^^^^^^^
+///
+/// Note: see the "Examples" section for the description of the used naming
+/// convention.
+///
+///   Case 1: (debug info can't be emitted)
+///     Source code: *K1*, *L1* *K1* calls *L1*.
+///     Compilation phase:
+///         1 function group is created.
+///         1 VISAKernel produced.
+///     DebugInfoGeneration:
+///       1 *ProgramInfo* created { K1, L1}.
+///       Decoded Debug info contains 1 compiled object, that has 1 subroutines.
+///
+///   Problem: way to map LLVM Function onto subroutine is not implemented.
+//===----------------------------------------------------------------------===//
+
 #define DEBUG_TYPE "GENX_DEBUG_INFO"
 
 using namespace llvm;
 
 std::vector<llvm::DISubprogram*> gatherDISubprogramNodes(llvm::Module& M);
 
-namespace {
+
+static cl::opt<std::string> DbgOpt_VisaTransformInfoPath(
+    "vc-dump-module-to-visa-transform-info-path", cl::init(""), cl::Hidden,
+    cl::desc("filename into which MVTI is dumped"));
 
 static void debugDump(const Twine &Name, const char *Content, size_t Size) {
   std::error_code EC;
@@ -64,6 +233,351 @@ static void debugDump(const Twine &Name, const char *Content, size_t Size) {
   raw_fd_ostream OS(Name.str(), EC);
   OS << StringRef(Content, Size);
 }
+
+template <typename ContainerT, class... ArgsT>
+static void checkedEmplace(ContainerT &Container, ArgsT &&... Args) {
+  auto Result = Container.emplace(std::forward<ArgsT>(Args)...);
+  IGC_ASSERT_MESSAGE(Result.second, "unexpected insertion failure");
+  (void)Result;
+  return;
+}
+
+static bool compareFunctionNames(const Function *LF, const Function *RF) {
+  IGC_ASSERT(LF && RF);
+  return LF->getName() > RF->getName();
+}
+
+template <typename ContainerT>
+static std::vector<const Function *>
+extractSortedFunctions(const ContainerT &C) {
+  std::vector<const Function *> Result;
+  std::transform(C.begin(), C.end(), std::back_inserter(Result),
+                 [](const auto &It) { return It.first; });
+  std::sort(Result.begin(), Result.end(), compareFunctionNames);
+  return Result;
+}
+
+//
+// ModuleToVisaTransformInfo
+// Proides information about how LLVM IR functions are mapped onto various
+// vISA (and genISA) objects.
+class ModuleToVisaTransformInfo {
+  using FunctionMapping =
+      std::unordered_map<const Function *, const Function *>;
+  // Note: pointer to VISAKernel can represent either a true kernel or
+  // VISAFunction, depending on the context (this is vISA API limitation)
+  using FunctionToVisaMapping =
+      std::unordered_map<const Function *, VISAKernel *>;
+
+  // Records information about a subroutine and its "owner". The "owner" of
+  // a subroutine is LLVM IR function that spawned *VISAFunction* that contains
+  // vISA for the subroutine
+  FunctionMapping SubroutineOwnersInfo;
+  // "VisaSpanwer" is LLVM IR function that produce *VISAFunction*.
+  // Different "VISAFunctions" have their own vISA instructions enumerated
+  // separately, but they still can be compiled into a single gen object.
+  // does not allow to distiguish those easily).
+  FunctionToVisaMapping VisaSpawnerInfo;
+  // A separate gen object is usually produced by KernelFunctions -
+  // the relationsip between VisaFunction and KernelFunctions is
+  // captured by the FunctionOnwers
+  FunctionMapping FunctionOwnersInfo;
+  // "Kernel functions" are functions that produce genISA object
+  // Usually these are FuntionGroup heads, but indirectly-called functions
+  // also spawn there own genISA object files
+  FunctionToVisaMapping KernelFunctionsInfo;
+  std::unordered_set<const Function *> SourceLevelKernels;
+
+  void extractSubroutineInfo(const Function &F, VISABuilder &VB,
+                             const FunctionGroupAnalysis &FGA);
+  bool tryToProcessCallToVisaEmitter(const CallInst &CI, const Function &F,
+                                     VISABuilder &VB);
+  bool tryToProcessVisaEmitter(const Function &F, VISABuilder &VB);
+  void extractVisaFunctionsEmitters(VISABuilder &VB,
+                                    const FunctionGroupAnalysis &FGA);
+  void extractKernelFunctions(VISABuilder &VB,
+                              const FunctionGroupAnalysis &FGA);
+
+public:
+  void print(raw_ostream &OS) const;
+  void dump() const;
+
+  bool isSourceLevelKernel(const Function *F) const {
+    return SourceLevelKernels.find(F) != SourceLevelKernels.end();
+  }
+  bool isKernelFunction(const Function *F) const {
+    return KernelFunctionsInfo.find(F) != KernelFunctionsInfo.end();
+  }
+  bool isSubroutine(const Function *F) const {
+    return SubroutineOwnersInfo.find(F) != SubroutineOwnersInfo.end();
+  }
+  bool isVisaFunctionSpawner(const Function *F) const {
+    return VisaSpawnerInfo.find(F) != VisaSpawnerInfo.end();
+  }
+  // For a provided function returns visa object spawned by this function
+  // visa object can represent either VISAKernel or VISAFunction
+  VISAKernel *getSpawnedVISAFunction(const Function *F) const {
+    IGC_ASSERT(!isSubroutine(F));
+    auto SpawnedInfoIt = VisaSpawnerInfo.find(F);
+    IGC_ASSERT(SpawnedInfoIt != VisaSpawnerInfo.end());
+    return SpawnedInfoIt->second;
+  }
+  // PrimaryKernel is VISA object representing true *VISAKernel*
+  VISAKernel *getPrimaryKernel(const Function *F) const {
+    const auto *PrimaryFunction = getPrimaryEmitterForVisa(F);
+    IGC_ASSERT(PrimaryFunction);
+    return getSpawnedVISAFunction(PrimaryFunction);
+  }
+  // return an "owner" (on vISA level) of the function representing a
+  // subroutine
+  const Function *getSubroutineOwner(const Function *F) const {
+    IGC_ASSERT(isSubroutine(F));
+    auto SubInfoIt = SubroutineOwnersInfo.find(F);
+    IGC_ASSERT(SubInfoIt != SubroutineOwnersInfo.end());
+    return SubInfoIt->second;
+  }
+  // PrimaryEmitter is the function spawning gen object, that
+  // contains the vISA object emitted by the specified function
+  const Function *getPrimaryEmitterForVisa(const Function *F,
+                                           bool Strict = true) const;
+
+  std::vector<const Function *> getPrimaryFunctions() const {
+    return extractSortedFunctions(KernelFunctionsInfo);
+  }
+
+  std::vector<const Function *>
+    getSecondaryFunctions(const Function *PrimaryFunction) const;
+
+  ModuleToVisaTransformInfo(VISABuilder &VB, const FunctionGroupAnalysis &FGA);
+};
+
+#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+void ModuleToVisaTransformInfo::dump() const {
+  print(errs());
+  errs() << "\n";
+}
+#endif
+
+void ModuleToVisaTransformInfo::print(raw_ostream &OS) const {
+
+  auto KernelFunctions = extractSortedFunctions(KernelFunctionsInfo);
+  auto Subroutines = extractSortedFunctions(SubroutineOwnersInfo);
+  auto VisaProducers = extractSortedFunctions(VisaSpawnerInfo);
+
+  // filter-out kernel functions
+  VisaProducers.erase(
+      std::remove_if(VisaProducers.begin(), VisaProducers.end(),
+                     [this](const auto *F) { return isKernelFunction(F); }),
+      VisaProducers.end());
+
+  auto PrintFunctionSubroutines = [this, &OS, &Subroutines](const Function *F,
+                                                            StringRef Prefix) {
+    unsigned Counter = 0;
+    for (const auto *LF : Subroutines) {
+      if (getSubroutineOwner(LF) != F)
+        continue;
+      OS << Prefix << "l." << Counter << " " << LF->getName() << "\n";
+      ++Counter;
+    }
+  };
+
+  for (size_t i = 0, NumKF = KernelFunctions.size(); i < NumKF; ++i) {
+    const auto *KF = KernelFunctions[i];
+    OS << "[" << i << "] " << KF->getName() << " "
+       << (SourceLevelKernels.count(KF) != 0 ? "(K)" : "(I)") << "\n";
+
+    PrintFunctionSubroutines(KF, "    ");
+
+    unsigned SubIdx = 0;
+    for (const auto *VF : VisaProducers) {
+      if (getPrimaryEmitterForVisa(VF) != KF)
+        continue;
+      OS << "    v." << SubIdx << " " << VF->getName() << "\n";
+      PrintFunctionSubroutines(VF, "        ");
+      ++SubIdx;
+    }
+  }
+}
+std::vector<const Function *> ModuleToVisaTransformInfo::getSecondaryFunctions(
+    const Function *PrimaryFunction) const {
+  auto IsSecondaryFunction = [PrimaryFunction, this](const Function *F) {
+    if (F == PrimaryFunction)
+      return false;
+    return getPrimaryEmitterForVisa(F) == PrimaryFunction;
+  };
+  IGC_ASSERT(isKernelFunction(PrimaryFunction));
+  std::vector<const Function *> Result;
+  for (const auto &[F, VF] : SubroutineOwnersInfo) {
+    (void)VF;
+    if (IsSecondaryFunction(F))
+      Result.push_back(F);
+  }
+  for (const auto &[F, VF] : VisaSpawnerInfo) {
+    (void)VF;
+    if (IsSecondaryFunction(F))
+      Result.push_back(F);
+  }
+  std::sort(Result.begin(), Result.end(), compareFunctionNames);
+  return Result;
+}
+
+void ModuleToVisaTransformInfo::extractSubroutineInfo(
+    const Function &F, VISABuilder &VB, const FunctionGroupAnalysis &FGA) {
+  IGC_ASSERT(isVisaFunctionSpawner(&F));
+  const auto *SubGr = FGA.getSubGroup(&F);
+  IGC_ASSERT(SubGr);
+  for (const Function *SF : *SubGr) {
+    if (isKernelFunction(SF))
+      continue;
+    if (genx::requiresStackCall(SF))
+      continue;
+    checkedEmplace(SubroutineOwnersInfo, SF, &F);
+  }
+}
+
+const Function *
+ModuleToVisaTransformInfo::getPrimaryEmitterForVisa(const Function *F,
+                                                    bool Strict) const {
+  if (isSubroutine(F)) {
+    auto SubrInfoIt = SubroutineOwnersInfo.find(F);
+    IGC_ASSERT(SubrInfoIt != SubroutineOwnersInfo.end());
+    const Function *SubrOwner = SubrInfoIt->second;
+    IGC_ASSERT(SubrOwner);
+    IGC_ASSERT(!isSubroutine(SubrOwner));
+    return getPrimaryEmitterForVisa(SubrOwner);
+  }
+  auto InfoIt = FunctionOwnersInfo.find(F);
+  if (InfoIt != FunctionOwnersInfo.end()) {
+    return InfoIt->second;
+  }
+  if (Strict)
+    IGC_ASSERT_MESSAGE(false, "could not get primary emitter");
+  return nullptr;
+}
+
+bool ModuleToVisaTransformInfo::tryToProcessCallToVisaEmitter(
+    const CallInst &CI, const Function &F, VISABuilder &VB) {
+  const Function *Callee = CI.getCalledFunction();
+  IGC_ASSERT(Callee == &F);
+  IGC_ASSERT(genx::requiresStackCall(&F));
+
+  const Function *Caller = CI.getCaller();
+  IGC_ASSERT(Caller);
+  LLVM_DEBUG(dbgs() << "  detected Caller <" << Caller->getName() << ">\n");
+
+  VISAKernel *VF = VB.GetVISAKernel(Callee->getName().str());
+
+  if (isKernelFunction(Caller)) {
+    checkedEmplace(VisaSpawnerInfo, Callee, VF);
+    checkedEmplace(FunctionOwnersInfo, Callee, Caller);
+    LLVM_DEBUG(dbgs() << "  caller is a kernel function!\n");
+    return true;
+  }
+
+  const bool DisableStrictChecks = false;
+  const auto *PrimaryEmitter =
+      getPrimaryEmitterForVisa(Caller, DisableStrictChecks);
+  if (!PrimaryEmitter)
+    return false;
+
+  checkedEmplace(VisaSpawnerInfo, Callee, VF);
+  checkedEmplace(FunctionOwnersInfo, Callee, PrimaryEmitter);
+  LLVM_DEBUG(dbgs() << "  caller is a function <" << Caller->getName()
+                    << "> owned by <" << PrimaryEmitter->getName() << ">\n");
+  return true;
+}
+
+bool ModuleToVisaTransformInfo::tryToProcessVisaEmitter(const Function &F,
+                                                        VISABuilder &VB) {
+  // Only stack-callee are accepted for now
+  IGC_ASSERT(genx::requiresStackCall(&F));
+
+  LLVM_DEBUG(dbgs() << "searching for the host of a stack-callee "
+                    << "<" << F.getName() << ">\n");
+  for (const auto *U : F.users()) {
+
+    const auto *CI = dyn_cast<CallInst>(U);
+    if (!CI)
+      continue;
+    if (CI->getCalledFunction() != &F)
+      continue;
+
+    if (tryToProcessCallToVisaEmitter(*CI, F, VB))
+      return true;
+  }
+  return false;
+}
+
+void ModuleToVisaTransformInfo::extractVisaFunctionsEmitters(
+    VISABuilder &VB, const FunctionGroupAnalysis &FGA) {
+  std::unordered_set<const Function *> ToProcess;
+  for (const auto *FG : FGA) {
+    for (const Function *F : *FG) {
+      if (genx::requiresStackCall(F) && !genx::isReferencedIndirectly(F)) {
+        checkedEmplace(ToProcess, F);
+      }
+    }
+  }
+
+  while (!ToProcess.empty()) {
+    std::vector<const Function *> Processed;
+    std::copy_if(ToProcess.begin(), ToProcess.end(),
+                 std::back_inserter(Processed), [&VB, this](const Function *F) {
+                   return tryToProcessVisaEmitter(*F, VB);
+                 });
+    for (const auto *F : Processed)
+      extractSubroutineInfo(*F, VB, FGA);
+
+    IGC_ASSERT(!Processed.empty());
+    while (!Processed.empty()) {
+      ToProcess.erase(Processed.back());
+      Processed.pop_back();
+    }
+  }
+}
+
+void ModuleToVisaTransformInfo::extractKernelFunctions(
+    VISABuilder &VB, const FunctionGroupAnalysis &FGA) {
+  for (const auto *FG : FGA) {
+    const Function *KF = FG->getHead();
+
+    for (const Function *F : *FG) {
+      bool TrueKernel = (F == KF);
+      if (genx::isReferencedIndirectly(F) || TrueKernel) {
+        VISAKernel *VF = VB.GetVISAKernel(F->getName().str());
+        if (TrueKernel)
+          checkedEmplace(SourceLevelKernels, F);
+        checkedEmplace(KernelFunctionsInfo, F, VF);
+        checkedEmplace(VisaSpawnerInfo, F, VF);
+        checkedEmplace(FunctionOwnersInfo, F, F);
+
+        extractSubroutineInfo(*F, VB, FGA);
+      }
+    }
+  }
+}
+
+ModuleToVisaTransformInfo::ModuleToVisaTransformInfo(
+    VISABuilder &VB, const FunctionGroupAnalysis &FGA) {
+  extractKernelFunctions(VB, FGA);
+  extractVisaFunctionsEmitters(VB, FGA);
+
+  for (const auto *FG : FGA) {
+    for (const Function *F : *FG) {
+      if (isSourceLevelKernel(F))
+        IGC_ASSERT(isKernelFunction(F) && isVisaFunctionSpawner(F) &&
+                   !isSubroutine(F));
+      if (isKernelFunction(F))
+        IGC_ASSERT(isVisaFunctionSpawner(F) && !isSubroutine(F));
+      if (isVisaFunctionSpawner(F))
+        IGC_ASSERT(!isSubroutine(F));
+      if (isSubroutine(F))
+        IGC_ASSERT(!isVisaFunctionSpawner(F) && !isKernelFunction(F));
+    }
+  }
+}
+
+namespace {
 
 class CompiledVisaWrapper {
 
@@ -78,6 +592,13 @@ class CompiledVisaWrapper {
   const FinalizedDI *VisaKernelDI = nullptr;
 
   std::string ErrMsg;
+
+  void setErrorForFunction(const std::string &Err, const Function &F) {
+    ErrMsg.append(Err).append("<").append(F.getName()).append(">");
+
+    LLVM_DEBUG(dbgs() << "CW creation for <" << F.getName() << "> aborted: " <<
+               ErrMsg);
+  }
 
 public:
   const FINALIZER_INFO &getJitInfo() const {
@@ -99,7 +620,7 @@ public:
     unsigned VisaIdx;
   };
 
-  void releaseDebugInfoResources(const VISAKernel &VK) {
+  static void releaseDebugInfoResources(const VISAKernel &VK) {
     void *GenXdbgInfo = nullptr;
     unsigned int DbgSize = 0;
     auto Result = VK.GetGenxDebugInfo(GenXdbgInfo, DbgSize);
@@ -109,22 +630,35 @@ public:
     freeBlock(GenXdbgInfo);
   }
 
-  CompiledVisaWrapper(const Function &F, const VISAKernel &VK) {
+  static void printDecodedGenXDebug(raw_ostream &OS, const VISAKernel &VK) {
+    void *GenXdbgInfo = nullptr;
+    unsigned int DbgSize = 0;
+    auto Result = VK.GetGenxDebugInfo(GenXdbgInfo, DbgSize);
+    IGC_ASSERT_MESSAGE(Result == 0,
+                       "could not get debug blob during debug printing");
+    IGC::DbgDecoder(GenXdbgInfo).print(OS);
+  }
+
+  CompiledVisaWrapper(const Function &F, const VISAKernel &VK,
+                      StringRef CompiledObjectName) {
+    LLVM_DEBUG(dbgs() << "creating CW for <" << F.getName() << ">, using <" <<
+               CompiledObjectName << "> as a CompiledObject moniker\n");
+
     void *GenXdbgInfo = nullptr;
     unsigned int DbgSize = 0;
     if (VK.GetJitInfo(JitInfo) != 0) {
-      ErrMsg = "could not extract jitter info";
+      setErrorForFunction("could not extract jitter info", F);
       return;
     }
     IGC_ASSERT(JitInfo);
 
     if (VK.GetGenxDebugInfo(GenXdbgInfo, DbgSize) != 0) {
-      ErrMsg = "visa info decode error";
+      setErrorForFunction("visa info decode error", F);
       return;
     }
 
     if (!GenXdbgInfo) {
-      ErrMsg = "could not get debug information from finalizer";
+      setErrorForFunction("could not get debug information from finalizer", F);
       return;
     }
 
@@ -132,28 +666,18 @@ public:
     DbgInfoBlob = std::vector<char>(DbgBlobBytes, DbgBlobBytes + DbgSize);
 
     DecodedDebugInfo = std::make_unique<IGC::DbgDecoder>(DbgInfoBlob.data());
-    auto GetDebugInfoForKernel = [this](StringRef KernelName) {
-      const auto &CO = DecodedDebugInfo->compiledObjs;
-      auto FoundIt =
-          std::find_if(CO.begin(), CO.end(), [&KernelName](const auto &DI) {
-            return KernelName == StringRef(DI.kernelName);
-          });
-      const IGC::DbgDecoder::DbgInfoFormat *Result = nullptr;
-      if (FoundIt != CO.end())
-        Result = &*FoundIt;
-      return Result;
-    };
-    VisaKernelDI = GetDebugInfoForKernel(F.getName());
+    const auto &CO = DecodedDebugInfo->compiledObjs;
+    auto FoundCoIt = std::find_if(
+        CO.begin(), CO.end(), [&CompiledObjectName](const auto &DI) {
+          return CompiledObjectName == StringRef(DI.kernelName);
+        });
+    VisaKernelDI = (FoundCoIt == CO.end()) ? nullptr : &*FoundCoIt;
     if (!VisaKernelDI) {
-      ErrMsg = "could not find debug information for <" +
-               std::string(F.getName()) + ">";
+      setErrorForFunction("could not find debug information for", F);
       return;
     }
-
-    LLVM_DEBUG(VisaKernelDI->dump(); dbgs() << "\n";);
-
     if (VisaKernelDI->CISAIndexMap.empty()) {
-      ErrMsg = "empty CisaIndexMap for <" + std::string(F.getName()) + ">";
+      setErrorForFunction("empty CisaIndexMap for", F);
       return;
     }
 
@@ -179,8 +703,9 @@ public:
           return Idx.GenOffset <= GenBinary.size();
         });
     if (!InBounds) {
-      ErrMsg = "fatal error (debug info). inconsistent gen->visa mapping: "
-               "gen index is out of bounds";
+      setErrorForFunction("fatal error (debug info). inconsistent gen->visa "
+                          "mapping: gen index is out of bounds",
+                          F);
       return;
     }
 
@@ -195,8 +720,9 @@ public:
                                         return L.GenOffset == R.GenOffset;
                                       }));
     if (!Validated) {
-      ErrMsg = "fatal error (debug info). inconsistent gen->visa mapping: "
-               "gen index are not ordered properly";
+      setErrorForFunction("fatal error (debug info). inconsistent gen->visa "
+                          "mapping: gen index are not ordered properly",
+                          F);
       return;
     }
   }
@@ -207,11 +733,38 @@ class GenXFunction final : public IGC::VISAModule {
 public:
   GenXFunction(const GenXSubtarget &STIn, const GenXVisaRegAlloc &RAIn,
                const Function &F, const CompiledVisaWrapper &CW,
-               const genx::di::VisaMapping &V2I)
+               const genx::di::VisaMapping &V2I,
+               const ModuleToVisaTransformInfo &MVTI)
       : F{F}, ST{STIn}, VisaMapping{V2I}, CompiledVisa{CW}, RA{RAIn},
-        VISAModule(const_cast<Function *>(&F)) {
+        MVTI(MVTI), VISAModule(const_cast<Function *>(&F)) {
 
-    isDirectElfInput = true;
+    if (MVTI.isSubroutine(&F))
+       SetType(ObjectType::SUBROUTINE);
+    else if (MVTI.isKernelFunction(&F))
+       SetType(ObjectType::KERNEL);
+    else
+       SetType(ObjectType::STACKCALL_FUNC);
+  }
+
+  const IGC::DbgDecoder::DbgInfoFormat*
+      getCompileUnit(const IGC::DbgDecoder& VD) const override {
+
+    StringRef CompiledObjectName;
+    if (MVTI.isSubroutine(&F)) {
+      IGC_ASSERT(GetType() == ObjectType::SUBROUTINE);
+      CompiledObjectName = MVTI.getSubroutineOwner(&F)->getName();
+    } else {
+      CompiledObjectName = F.getName();
+    }
+
+    auto FoundIt = std::find_if(VD.compiledObjs.begin(), VD.compiledObjs.end(),
+                                [&CompiledObjectName](const auto &CO) {
+                                  return (CO.kernelName == CompiledObjectName);
+                                });
+    if (FoundIt == VD.compiledObjs.end())
+      return nullptr;
+
+    return &*FoundIt;
   }
 
   unsigned int getUnpaddedProgramSize() const override {
@@ -269,19 +822,26 @@ public:
     LLVM_DEBUG(dbgs() << " >>>\n  GetVariableLocation for " << *DbgInst
                       << "\n");
     const Value *DbgValue = nullptr;
-    DIVariable *VarDescr = nullptr;
-    if (auto *pDbgAddrInst = dyn_cast<DbgDeclareInst>(DbgInst)) {
+    const DIVariable *VarDescr = nullptr;
+    if (const auto *pDbgAddrInst = dyn_cast<DbgDeclareInst>(DbgInst)) {
       DbgValue = pDbgAddrInst->getAddress();
       VarDescr = pDbgAddrInst->getVariable();
       return EmptyLoc("llvm.dbg.declare is not supported");
-    } else if (auto *pDbgValInst = dyn_cast<DbgValueInst>(DbgInst)) {
+    } else if (const auto *pDbgValInst = dyn_cast<DbgValueInst>(DbgInst)) {
       DbgValue = pDbgValInst->getValue();
       VarDescr = pDbgValInst->getVariable();
     } else {
-      return EmptyLoc("Unsupported Debug Intrinsic");
+      return EmptyLoc("unsupported Debug Intrinsic");
+    }
+
+    IGC_ASSERT(VarDescr);
+    if (!DbgValue) {
+      if (const auto *LocalVar = dyn_cast<DILocalVariable>(VarDescr))
+        if (LocalVar->isParameter())
+          return EmptyLoc("unsupported parameter description");
+      return EmptyLoc("unsupported DbgInst");
     }
     IGC_ASSERT(DbgValue);
-    IGC_ASSERT(VarDescr);
     LLVM_DEBUG(dbgs() << "   Value:" << *DbgValue << "\n");
     LLVM_DEBUG(dbgs() << "   Var: " << VarDescr->getName()
                       << "/Type:" << *VarDescr->getType() << "\n");
@@ -293,7 +853,7 @@ public:
     }
     auto *Reg = RA.getRegForValueUntyped(&F, const_cast<Value *>(DbgValue));
     if (!Reg) {
-      return EmptyLoc("   could not find virtual register");
+      return EmptyLoc("could not find virtual register");
     }
     const bool IsRegister = true;
     const bool IsMemory = false;
@@ -331,9 +891,10 @@ private:
   const genx::di::VisaMapping &VisaMapping;
   const CompiledVisaWrapper &CompiledVisa;
   const GenXVisaRegAlloc &RA;
+  const ModuleToVisaTransformInfo &MVTI;
 };
 
-void processGenXFunction(IGC::IDebugEmitter *Emitter, GenXFunction *GF) {
+static void processGenXFunction(IGC::IDebugEmitter *Emitter, GenXFunction *GF) {
   Emitter->setCurrentVISA(GF);
   const auto &V2I = GF->getVisaMapping().V2I;
   const auto &FDI = GF->getFinalizerDI();
@@ -376,15 +937,36 @@ void processGenXFunction(IGC::IDebugEmitter *Emitter, GenXFunction *GF) {
 
 namespace llvm {
 
-void GenXDebugInfo::processKernel(const ProgramInfo &PI) {
+static void dumpDebugInfoFiles(const GenXBackendConfig &BC,
+                               const StringRef &KernelName,
+                               const ArrayRef<char> ElfBin,
+                               const ArrayRef<char> GenDbgBlob) {
+  std::string NamePrefix = "dbginfo_";
+  if (!BC.dbgInfoDumpsNameOverride().empty())
+    NamePrefix.append(BC.dbgInfoDumpsNameOverride()).append("_");
+
+  auto DwarfDumpName = (NamePrefix + KernelName + "_dwarf.elf").str();
+  auto GendbgDumpName = (NamePrefix + KernelName + "_gen.dump").str();
+  if (BC.hasShaderDumper()) {
+    BC.getShaderDumper().dumpBinary(ElfBin, DwarfDumpName);
+    BC.getShaderDumper().dumpBinary(GenDbgBlob, GendbgDumpName);
+  } else {
+    debugDump(DwarfDumpName, ElfBin.data(), ElfBin.size());
+    debugDump(GendbgDumpName, GenDbgBlob.data(), GenDbgBlob.size());
+  }
+}
+
+void GenXDebugInfo::processKernel(const IGC::DebugEmitterOpts &DebugOpts,
+                                  const ProgramInfo &PI) {
 
   IGC_ASSERT_MESSAGE(!PI.FIs.empty(),
                      "Program must include at least one function");
+  IGC_ASSERT_MESSAGE(PI.MVTI.getPrimaryEmitterForVisa(&PI.FIs.front().F) ==
+                         &PI.FIs.front().F,
+                     "The head of ProgramInfo is expected to be a kernel");
 
-  IGC::DebugEmitterOpts DebugOpts;
-  DebugOpts.DebugEnabled = true;
-  DebugOpts.isDirectElf = true;
-  DebugOpts.UseNewRegisterEncoding = true;
+  LLVM_DEBUG(CompiledVisaWrapper::printDecodedGenXDebug(
+      dbgs(), *PI.MVTI.getPrimaryKernel(&PI.FIs.front().F)));
 
   auto Deleter = [](IGC::IDebugEmitter *Emitter) {
     IGC::IDebugEmitter::Release(Emitter);
@@ -395,13 +977,19 @@ void GenXDebugInfo::processKernel(const ProgramInfo &PI) {
   using CompiledVisaWrappers =
       std::vector<std::unique_ptr<CompiledVisaWrapper>>;
   CompiledVisaWrappers CWs;
+  const auto &MVTI = PI.MVTI;
   std::transform(PI.FIs.begin(), PI.FIs.end(), std::back_inserter(CWs),
-                 [](const auto &FI) {
+                 [&MVTI](const auto &FI) {
+                   StringRef CompiledObjectName = FI.F.getName();
+                   if (MVTI.isSubroutine(&FI.F))
+                     CompiledObjectName =
+                         MVTI.getSubroutineOwner(&FI.F)->getName();
                    return std::make_unique<CompiledVisaWrapper>(
-                       FI.F, FI.CompiledKernel);
+                       FI.F, FI.CompiledKernel, CompiledObjectName);
                  });
   auto FaultyCwIt = std::find_if(
       CWs.begin(), CWs.end(), [](const auto &CW) { return CW->hasErrors(); });
+
   if (FaultyCwIt != CWs.end())
     report_fatal_error((*FaultyCwIt)->getError(), false);
 
@@ -419,8 +1007,8 @@ void GenXDebugInfo::processKernel(const ProgramInfo &PI) {
 
         IGC_ASSERT(CWs.size() == PI.FIs.size());
         for (auto &&[FI, CW] : llvm::zip(PI.FIs, CWs)) {
-          auto GF =
-              std::make_unique<GenXFunction>(ST, RA, FI.F, *CW, FI.VisaMapping);
+          auto GF = std::make_unique<GenXFunction>(ST, RA, FI.F, *CW,
+                                                   FI.VisaMapping, PI.MVTI);
           GFs.push_back(GF.get());
           if (&FI.F == &PI.FIs.front().F) {
             Emitter->Initialize(std::move(GF), DebugOpts);
@@ -468,23 +1056,9 @@ void GenXDebugInfo::processKernel(const ProgramInfo &PI) {
                     << "- " << ElfBin.size() << " bytes\n");
 
   const auto &BC = getAnalysis<GenXBackendConfig>();
-  if (BC.dbgInfoDumpsEnabled()) {
-
-    std::string NamePrefix = "dbginfo_";
-    if (!BC.dbgInfoDumpsNameOverride().empty())
-      NamePrefix.append(BC.dbgInfoDumpsNameOverride()).append("_");
-
-    auto DwarfDumpName = (NamePrefix + KernelName + "_dwarf.elf").str();
-    auto GendbgDumpName = (NamePrefix + KernelName + "_gen.dump").str();
-    const auto &GenDbgBlob = GenXFunctions.front()->getGenDebug();
-    if (BC.hasShaderDumper()) {
-      BC.getShaderDumper().dumpBinary(ElfBin, DwarfDumpName);
-      BC.getShaderDumper().dumpBinary(GenDbgBlob, GendbgDumpName);
-    } else {
-      debugDump(DwarfDumpName, ElfBin.data(), ElfBin.size());
-      debugDump(GendbgDumpName, GenDbgBlob.data(), GenDbgBlob.size());
-    }
-  }
+  if (BC.dbgInfoDumpsEnabled())
+    dumpDebugInfoFiles(BC, KernelName, ElfBin,
+                       GenXFunctions.front()->getGenDebug());
 
   // this reset is needed to gracefully cleanup resources held by CWs
   GenXFunctions.clear();
@@ -495,7 +1069,10 @@ void GenXDebugInfo::processKernel(const ProgramInfo &PI) {
   return;
 }
 
-void GenXDebugInfo::cleanup() { ElfOutputs.clear(); }
+void GenXDebugInfo::cleanup() {
+  DISubprogramNodes.clear();
+  ElfOutputs.clear();
+}
 
 void GenXDebugInfo::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.addRequired<FunctionGroupAnalysis>();
@@ -506,48 +1083,38 @@ void GenXDebugInfo::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.setPreservesAll();
 }
 
-void GenXDebugInfo::processFunctionGroup(GenXModule &GM, VISABuilder &VB,
-                                         const FunctionGroup &FG) {
-  const auto *KF = FG.getHead();
-  VISAKernel *VKEntry = VB.GetVISAKernel(KF->getName().str());
+void GenXDebugInfo::processPrimaryFunction(
+    const IGC::DebugEmitterOpts &Opts, const ModuleToVisaTransformInfo &MVTI,
+    const GenXModule &GM, VISABuilder &VB, const Function &PF) {
+  LLVM_DEBUG(dbgs() << "DbgInfo: processing <" << PF.getName() << ">\n");
+  IGC_ASSERT(MVTI.isKernelFunction(&PF));
+  VISAKernel *VKEntry = MVTI.getPrimaryKernel(&PF);
   IGC_ASSERT(VKEntry);
-  LLVM_DEBUG(dbgs() << "DbgInfo: processing <" << KF->getName() << ">\n");
 
-  auto BuildFunctionInfo = [&GM](VISAKernel *VF, Function *F) {
-    const auto &Mapping = *GM.getVisaMapping(F);
-    return ProgramInfo::FunctionInfo{Mapping, *VF, *F};
-  };
-  // Currently, llvm Function can produce vISA which is incorporated in
-  // the main vISA object or in case of vISA-external functions - it can spawn
-  // a completely new vISA object.
-  // Thus, to create debug info, we split each function group into
-  // the set of "primary" and "indirectly-called" functions
-  std::vector<Function *> PrimaryFunctions, IndirectlyCalledFunctions;
-  std::partition_copy(
-      FG.begin(), FG.end(), std::back_inserter(IndirectlyCalledFunctions),
-      std::back_inserter(PrimaryFunctions), [](Function *F) {
-        return F->hasFnAttribute(genx::FunctionMD::ReferencedIndirectly);
-      });
-  for (auto *F : IndirectlyCalledFunctions) {
-    LLVM_DEBUG(dbgs() << "  F: " << F->getName().str() << " called indirectly!\n");
-    // Each indirectly-called function is compiled into a separate vISA kernel
-    auto *VF = VB.GetVISAKernel(F->getName().str());
-    processKernel(ProgramInfo{{BuildFunctionInfo(VF, F)}});
-  }
-  std::vector<ProgramInfo::FunctionInfo> PrimaryFIs;
-  std::transform(PrimaryFunctions.begin(), PrimaryFunctions.end(),
-                 std::back_inserter(PrimaryFIs),
-                 [&VKEntry, &BuildFunctionInfo](auto *F) {
-                   return BuildFunctionInfo(VKEntry, F);
+  using FunctionInfo = ProgramInfo::FunctionInfo;
+  std::vector<FunctionInfo> FIs;
+  FIs.push_back(FunctionInfo{*GM.getVisaMapping(&PF), *VKEntry, PF});
+  const auto &SecondaryFunctions = MVTI.getSecondaryFunctions(&PF);
+  std::transform(SecondaryFunctions.begin(), SecondaryFunctions.end(),
+                 std::back_inserter(FIs), [&GM, &VKEntry](const Function *F) {
+                   const auto &Mapping = *GM.getVisaMapping(F);
+                   return FunctionInfo{Mapping, *VKEntry, *F};
                  });
-  LLVM_DEBUG({
-    dbgs() << " - main kernel structure: ";
-    for (const auto *F : PrimaryFunctions)
-      dbgs() << F->getName() << ",";
-    dbgs() << "\n";
-  });
-  processKernel(ProgramInfo{std::move(PrimaryFIs)});
+  processKernel(Opts, ProgramInfo{MVTI, std::move(FIs)});
 }
+
+static void fillDbgInfoOptions(const GenXBackendConfig &BC,
+                               IGC::DebugEmitterOpts &DebugOpts) {
+  DebugOpts.DebugEnabled = true;
+  DebugOpts.UseNewRegisterEncoding = true;
+
+  if (BC.emitDebugInfoForZeBin()) {
+    DebugOpts.ZeBinCompatible = true;
+    DebugOpts.EnableRelocation = true;
+    DebugOpts.EnforceAMD64Machine = true;
+  }
+}
+
 bool GenXDebugInfo::runOnModule(Module &M) {
 
   const auto &BC = getAnalysis<GenXBackendConfig>();
@@ -562,9 +1129,21 @@ bool GenXDebugInfo::runOnModule(Module &M) {
   VISABuilder *VB = GM.GetCisaBuilder();
   if (GM.HasInlineAsm())
     VB = GM.GetVISAAsmReader();
+  IGC_ASSERT(VB);
 
-  for (const auto *FG : FGA)
-    processFunctionGroup(GM, *VB, *FG);
+  ModuleToVisaTransformInfo MVTI(*VB, FGA);
+  if (!DbgOpt_VisaTransformInfoPath.empty()) {
+    std::error_code IgnoredEC;
+    raw_fd_ostream DumpStream(DbgOpt_VisaTransformInfoPath, IgnoredEC);
+    MVTI.print(DumpStream);
+  }
+  LLVM_DEBUG(MVTI.print(dbgs()); dbgs() << "\n");
+
+  IGC::DebugEmitterOpts DebugInfoOpts;
+  fillDbgInfoOptions(BC, DebugInfoOpts);
+
+  for (const Function *PF : MVTI.getPrimaryFunctions())
+    processPrimaryFunction(DebugInfoOpts, MVTI, GM, *VB, *PF);
 
   return false;
 }

@@ -1,28 +1,10 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2017-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
+============================= end_copyright_notice ===========================*/
 
 #include "Rematerialization.h"
 
@@ -73,6 +55,7 @@ namespace vISA
                                     r.rowsUsed.insert(k);
                                 }
                                 //r.uses.push_back(std::make_pair(inst, bb));
+                                r.lastUseLexId = inst->getLexicalId();
                                 operations.insert(std::make_pair(topdcl, r));
                             }
                             else
@@ -103,6 +86,14 @@ namespace vISA
                     }
                 }
             }
+        }
+
+        for (auto& ref : operations)
+        {
+            auto dcl = ref.first;
+            if (dcl->getRegVar() &&
+                dcl->getRegVar()->getPhyReg())
+                preDefinedVars.push_back(dcl);
         }
     }
 
@@ -325,12 +316,21 @@ namespace vISA
             {
                 auto inst = (*instIt);
 
-                if (inst->isSplitSend() &&
-                    inst->getMsgDesc()->isSampler() &&
-                    inst->getMsgDescRaw() &&
-                    inst->getMsgDescRaw()->isHeaderPresent())
+                if (toErase != bb->end())
                 {
-                    toErase = bb->end();
+                    for (unsigned int i = 0; i != inst->getNumSrc(); ++i)
+                    {
+                        auto src = inst->getSrc(i);
+                        if (src && src->isSrcRegRegion())
+                        {
+                            auto topdcl = src->getTopDcl();
+                            if (topdcl == samplerHeader)
+                            {
+                                // samplerHeader is used, so can't erase it
+                                toErase = bb->end();
+                            }
+                        }
+                    }
                 }
 
                 if (inst->isMov() && inst->getDst() && inst->getExecSize() == 1)
@@ -449,6 +449,50 @@ namespace vISA
         return defInst->getPredicate()->isSameAsNoMask();
     }
 
+    bool Rematerialization::isPartGRFBusyInput(G4_Declare* inputDcl, unsigned int atLexId)
+    {
+        // inputDcl is an input G4_Declare that has pre-defined assignment.
+        // Extending a pre-assigned assignment can be bad if its a scalar
+        // and no other part of that GRF is busy. OTOH, it may be beneficial
+        // to extend inputDcl if there is another pre-defined G4_Declare
+        // sharing physical register assignment (different sub-register)
+        // with inputDcl and is live beyond where we want to extend inputDcl.
+
+        // This function checks whether there is any other G4_Declare that
+        // shares same GRF assignment as inputDcl. If there is then check
+        // whether last use of that assignment is beyond atLexId. If one
+        // if found then return true. Return false otherwise.
+
+        if (!inputDcl->getRegVar()->getPhyReg() ||
+            !inputDcl->getRegVar()->getPhyReg()->isGreg())
+        {
+            return false;
+        }
+
+        auto inputRegNum = inputDcl->getRegVar()->getPhyReg()->asGreg()->getRegNum();
+
+        for (auto dcl : preDefinedVars)
+        {
+            auto ref = operations.find(dcl);
+            if (ref == operations.end())
+                continue;
+
+            if (!dcl->getRegVar()->getPhyReg() ||
+                !dcl->getRegVar()->getPhyReg()->isGreg())
+                continue;
+
+            auto regNum = dcl->getRegVar()->getPhyReg()->asGreg()->getRegNum();
+            if (regNum == inputRegNum)
+            {
+                if ((*ref).second.lastUseLexId >= atLexId)
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
+
     bool Rematerialization::canRematerialize(G4_SrcRegRegion* src, G4_BB* bb, const Reference*& ref, INST_LIST_ITER instIter)
     {
         // op1 (8) A   B   C
@@ -493,6 +537,9 @@ namespace vISA
         auto uniqueDef = findUniqueDef(refs, src);
 
         if (!uniqueDef)
+            return false;
+
+        if (gra.isNoRemat(uniqueDef->first))
             return false;
 
         // Def has a lot of uses so we will need lots of remat to make this profitable
@@ -668,10 +715,9 @@ namespace vISA
                             return false;
                     }
 
-                    if (uniqueDefInst->getExecSize() == 1 &&
-                        (*opIt).second.lastUseLexId < srcLexId)
+                    if ((*opIt).second.lastUseLexId < srcLexId &&
+                        !isPartGRFBusyInput((*opIt).first, srcLexId))
                     {
-                        // Skip remat if src is an input and exec size is 1.
                         // Inputs are pre-assigned and extending such ranges
                         // could lead to worse RA results, unless the input
                         // already extends beyond where we intend to remat.
@@ -938,21 +984,29 @@ namespace vISA
                 MUST_BE_TRUE(ops != operations.end(), "Didnt find record in map");
                 MUST_BE_TRUE((*ops).second.numUses == 1, "Expecting src0 to be used only in sampler");
 
-                auto newSrc0Dcl = kernel.fg.builder->createTempVar(src0TopDcl->getTotalElems(),
-                    src0TopDcl->getElemType(), gra.getSubRegAlign(src0TopDcl));
-
-                // Clone all defining instructions for sampler's msg header
-                for (unsigned int i = 0; i != (*ops).second.def.size(); i++)
+                G4_Declare* newSrc0Dcl = nullptr;
+                if (src0TopDcl->getRegVar()->isPhyRegAssigned())
                 {
-                    auto& headerDefInst = (*ops).second.def[i].first;
+                    newSrc0Dcl = src0TopDcl;
+                }
+                else
+                {
+                    newSrc0Dcl = kernel.fg.builder->createTempVar(src0TopDcl->getTotalElems(),
+                        src0TopDcl->getElemType(), gra.getSubRegAlign(src0TopDcl));
 
-                    auto dupOp = headerDefInst->cloneInst();
-                    auto headerDefDst = headerDefInst->getDst();
-                    assert(!headerDefDst->isIndirect()); // we dont allow send header to be defined indirectly
-                    dupOp->setDest(kernel.fg.builder->createDst(
-                        newSrc0Dcl->getRegVar(), headerDefDst->getRegOff(), headerDefDst->getSubRegOff(),
-                        headerDefDst->getHorzStride(), headerDefDst->getType()));
-                    newInst.push_back(dupOp);
+                    // Clone all defining instructions for sampler's msg header
+                    for (unsigned int i = 0; i != (*ops).second.def.size(); i++)
+                    {
+                        auto& headerDefInst = (*ops).second.def[i].first;
+
+                        auto dupOp = headerDefInst->cloneInst();
+                        auto headerDefDst = headerDefInst->getDst();
+                        assert(!headerDefDst->isIndirect()); // we dont allow send header to be defined indirectly
+                        dupOp->setDest(kernel.fg.builder->createDst(
+                            newSrc0Dcl->getRegVar(), headerDefDst->getRegOff(), headerDefDst->getSubRegOff(),
+                            headerDefDst->getHorzStride(), headerDefDst->getType()));
+                        newInst.push_back(dupOp);
+                    }
                 }
 
                 auto rd = kernel.fg.builder->createRegionDesc(src0Rgn->getRegion()->vertStride,
@@ -983,6 +1037,7 @@ namespace vISA
                 kernel.fg.builder->duplicateOperand(dstInst->getSrc(1))->asSrcRegRegion(),
                 kernel.fg.builder->duplicateOperand(dstInst->asSendInst()->getMsgDescOperand()), dstInst->getOption(),
                 newMsgDesc, kernel.fg.builder->duplicateOperand(dstInst->getSrc(3)), true);
+            dupOp->setCISAOff(dstInst->getCISAOff());
             dupOp->inheritDIFrom(dstInst);
 
             newInst.push_back(dupOp);

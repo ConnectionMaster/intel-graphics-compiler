@@ -1,28 +1,10 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2017-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
+============================= end_copyright_notice ===========================*/
 
 #ifndef COMMON_ISA_OPCODE_INCLUDED
 #define COMMON_ISA_OPCODE_INCLUDED
@@ -474,6 +456,13 @@ typedef struct {
 } kernel_format_t;
 typedef kernel_format_t function_format_t;
 
+typedef struct
+{
+    GenPrecision   Prec;
+    unsigned int   BitSize;
+    const char*    Name;
+} GenPrecision_Info_t;
+extern GenPrecision_Info_t GenPrecisionTable[(unsigned int)GenPrecision::TOTAL_NUM];
 
 class print_format_provider_t {
 public:
@@ -770,6 +759,8 @@ typedef enum {
     GEN_ATOMIC_FMAX                    = 0x1,  // FOP_FMAX
     GEN_ATOMIC_FMIN                    = 0x2,  // FOP_FMIN
     GEN_ATOMIC_FCMPWR                  = 0x3,  // FOP_FCMPWR
+    GEN_ATOMIC_FADD                    = 0x4,  // FOP_FADD
+    GEN_ATOMIC_FSUB                    = 0x5,  // FOP_FSUB
     GEN7_ATOMIC_UNDEF                   = 0xFF
 } GenAtomicOp;
 
@@ -878,7 +869,7 @@ extern vISAPreDefinedSurface vISAPreDefSurf[COMMON_ISA_NUM_PREDEFINED_SURF_VER_3
 const int BINDLESS_SAMPLER_ID = 31;
 static const char* BINDLESS_SAMPLER_NAME = "S31";
 
-extern const char* SAMPLE_OP_3D_NAME[VISA_3D_TOTAL_NUM_OPS];
+const char* getSampleOp3DName(int opcode);
 
 /// ChannelMask - Channel mask used in vISA builder.
 /// NOTE: This class is added to discourage developers to directly manipulate

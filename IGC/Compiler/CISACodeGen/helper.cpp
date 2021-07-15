@@ -321,22 +321,27 @@ namespace IGC
     }
 
     // Create a ldraw from a load instruction
-    Value* CreateLoadRawIntrinsic(LoadInst* inst, Instruction* bufPtr, Value* offsetVal)
+    LdRawIntrinsic* CreateLoadRawIntrinsic(LoadInst* inst, Value* bufPtr, Value* offsetVal)
     {
-        Module* module = inst->getParent()->getParent()->getParent();
-        Function* func = nullptr;
+        Type* tys[] = {
+            inst->getType(),
+            bufPtr->getType()
+        };
+
+        auto* M = inst->getModule();
+        auto& DL = M->getDataLayout();
+        Function *func = GenISAIntrinsic::getDeclaration(
+            M,
+            inst->getType()->isVectorTy() ?
+                GenISAIntrinsic::GenISA_ldrawvector_indexed :
+                GenISAIntrinsic::GenISA_ldraw_indexed,
+            tys);
+
+        unsigned alignment = inst->getAlignment();
+        if (alignment == 0)
+            alignment = DL.getABITypeAlignment(inst->getType());
+
         IRBuilder<> builder(inst);
-
-        llvm::Type* tys[2];
-        tys[0] = inst->getType();
-        tys[1] = bufPtr->getType();
-        func = GenISAIntrinsic::getDeclaration(module, inst->getType()->isVectorTy() ? llvm::GenISAIntrinsic::GenISA_ldrawvector_indexed : llvm::GenISAIntrinsic::GenISA_ldraw_indexed, tys);
-
-        unsigned alignment = (inst->getType()->getScalarSizeInBits() / 8);
-        if (inst->getAlignment() > 0)
-        {
-            alignment = inst->getAlignment();
-        }
 
         Value* attr[] =
         {
@@ -345,50 +350,53 @@ namespace IGC
             builder.getInt32(alignment),
             builder.getInt1(inst->isVolatile()) // volatile
         };
-        Value* ld = builder.CreateCall(func, attr);
-        IGC_ASSERT(nullptr != ld);
+        auto* ld = builder.CreateCall(func, attr);
         IGC_ASSERT(ld->getType() == inst->getType());
-        return ld;
+        return cast<LdRawIntrinsic>(ld);
     }
 
     // Creates a storeraw from a store instruction
-    Value* CreateStoreRawIntrinsic(StoreInst* inst, Instruction* bufPtr, Value* offsetVal)
+    StoreRawIntrinsic* CreateStoreRawIntrinsic(StoreInst* inst, Value* bufPtr, Value* offsetVal)
     {
-        Module* module = inst->getParent()->getParent()->getParent();
+        Module* module = inst->getModule();
         Function* func = nullptr;
-        IRBuilder<> builder(inst);
         Value* storeVal = inst->getValueOperand();
+        auto& DL = module->getDataLayout();
         if (storeVal->getType()->isVectorTy())
         {
-            llvm::Type* tys[2];
-            tys[0] = bufPtr->getType();
-            tys[1] = inst->getValueOperand()->getType();
+            Type* tys[] = {
+                bufPtr->getType(),
+                storeVal->getType()
+            };
             func = GenISAIntrinsic::getDeclaration(module, llvm::GenISAIntrinsic::GenISA_storerawvector_indexed, tys);
         }
         else
         {
-            llvm::Type* dataType = storeVal->getType();
-            IGC_ASSERT(nullptr != dataType);
-            IGC_ASSERT((dataType->getPrimitiveSizeInBits() == 8)  ||
-                       (dataType->getPrimitiveSizeInBits() == 16) ||
-                       (dataType->getPrimitiveSizeInBits() == 32));
+            Type* dataType = storeVal->getType();
+            const uint64_t typeSize = DL.getTypeSizeInBits(dataType);
+            IGC_ASSERT(typeSize == 8 || typeSize == 16 || typeSize == 32 || typeSize == 64);
 
-            llvm::Type* types[2] = {
+            Type* types[] = {
                 bufPtr->getType(),
-                storeVal->getType() };
+                storeVal->getType()
+            };
 
             func = GenISAIntrinsic::getDeclaration(module, llvm::GenISAIntrinsic::GenISA_storeraw_indexed, types);
         }
+        IRBuilder<> builder(inst);
+        unsigned alignment = inst->getAlignment();
+        if (alignment == 0)
+            alignment = DL.getABITypeAlignment(storeVal->getType());
         Value* attr[] =
         {
             bufPtr,
             offsetVal,
             storeVal,
-            builder.getInt32(storeVal->getType()->getScalarSizeInBits() / 8),
+            builder.getInt32(alignment),
             builder.getInt1(inst->isVolatile()) // volatile
         };
-        Value* st = builder.CreateCall(func, attr);
-        return st;
+        auto* st = builder.CreateCall(func, attr);
+        return cast<StoreRawIntrinsic>(st);
     }
 
     ///
@@ -815,6 +823,13 @@ namespace IGC
             offsetVal = ptrVal;
             statelessBuf = (as == ADDRESS_SPACE_CONSTANT);
         }
+        else if (LdRawIntrinsic* ldRaw = dyn_cast<LdRawIntrinsic>(&I))
+        {
+            as = ldRaw->getResourceValue()->getType()->getPointerAddressSpace();
+            ptrVal = ldRaw->getResourceValue();
+            offsetVal = ldRaw->getOffsetValue();
+            bindlessBuf = (DecodeBufferType(as) == SSH_BINDLESS_CONSTANT_BUFFER);
+        }
         else
             return false;
 
@@ -949,6 +964,11 @@ namespace IGC
         }
         case llvm::GenISAIntrinsic::GenISA_typedread:
         case llvm::GenISAIntrinsic::GenISA_typedwrite:
+        case llvm::GenISAIntrinsic::GenISA_ldstructured:
+        case llvm::GenISAIntrinsic::GenISA_storestructured1:
+        case llvm::GenISAIntrinsic::GenISA_storestructured2:
+        case llvm::GenISAIntrinsic::GenISA_storestructured3:
+        case llvm::GenISAIntrinsic::GenISA_storestructured4:
             overloadedTys.push_back(newPtr->getType());
             break;
         case llvm::GenISAIntrinsic::GenISA_intatomicraw:
@@ -1003,11 +1023,12 @@ namespace IGC
             overloadedTys.push_back(pIntr->getType());
             overloadedTys.push_back(args[0]->getType());
             break;
-            //case llvm::GenISAIntrinsic::GenISA_ldrawvector_indexed:
+        case llvm::GenISAIntrinsic::GenISA_ldrawvector_indexed:
         case llvm::GenISAIntrinsic::GenISA_ldraw_indexed:
             overloadedTys.push_back(pCalledFunc->getReturnType());
             overloadedTys.push_back(newPtr->getType());
             break;
+        case llvm::GenISAIntrinsic::GenISA_storerawvector_indexed:
         case llvm::GenISAIntrinsic::GenISA_storeraw_indexed:
             overloadedTys.push_back(newPtr->getType());
             overloadedTys.push_back(args[2]->getType());
@@ -1023,6 +1044,7 @@ namespace IGC
             overloadedTys);
 
         llvm::CallInst* pNewCall = llvm::CallInst::Create(pNewIntr, args, "", pIntr);
+        pNewCall->setDebugLoc(pIntr->getDebugLoc());
 
         pIntr->replaceAllUsesWith(pNewCall);
         pIntr->eraseFromParent();
@@ -1162,6 +1184,7 @@ namespace IGC
                 isa<IntToPtrInst>(ptrVal) ||
                 isa<GetElementPtrInst>(ptrVal) ||
                 isa<ConstantExpr>(ptrVal) ||
+                isa<LoadInst>(ptrVal) ||
                 isa<Argument>(ptrVal))
             {
                 eltPtrVal = ptrVal;

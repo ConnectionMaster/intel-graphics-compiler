@@ -1,24 +1,8 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (c) 2000-2021 Intel Corporation
+Copyright (C) 2020-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"),
-to deal in the Software without restriction, including without limitation
-the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom
-the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-IN THE SOFTWARE.
+SPDX-License-Identifier: MIT
 
 ============================= end_copyright_notice ===========================*/
 
@@ -244,6 +228,7 @@ static GenXBackendOptions createBackendOptions(const vc::CompileOptions &Opts) {
   }
   BackendOpts.EmitDebugInformation = Opts.EmitDebugInformation;
   BackendOpts.EmitDebuggableKernels = Opts.EmitDebuggableKernels;
+  BackendOpts.DebugInfoForZeBin = (Opts.Binary == vc::BinaryKind::ZE);
   BackendOpts.EnableAsmDumps = Opts.DumpAsm;
   BackendOpts.EnableDebugInfoDumps = Opts.DumpDebugInfo;
   BackendOpts.Dumper = Opts.Dumper.get();
@@ -257,6 +242,8 @@ static GenXBackendOptions createBackendOptions(const vc::CompileOptions &Opts) {
     BackendOpts.DisableNonOverlappingRegionOpt = true;
   BackendOpts.FCtrl = Opts.FCtrl;
   BackendOpts.WATable = Opts.WATable;
+  BackendOpts.IsLargeGRFMode = Opts.IsLargeGRFMode;
+  BackendOpts.UseBindlessBuffers = Opts.UseBindlessBuffers;
   return BackendOpts;
 }
 
@@ -447,10 +434,6 @@ Expected<vc::CompileOutput> vc::Compile(ArrayRef<char> Input,
   PerModulePasses.add(createGenXRestoreIntrAttrPass());
   PerModulePasses.run(M);
 
-  // Temporary measure till KernelArgOffset is moved to the backend
-  if (Opts.EmitDebuggableKernels)
-    M.getOrInsertNamedMetadata(llvm::genx::DebugMD::DebuggableKernels);
-
   Triple TheTriple = overrideTripleWithVC(M.getTargetTriple());
   M.setTargetTriple(TheTriple.getTriple());
 
@@ -484,10 +467,9 @@ Expected<vc::CompileOutput> vc::Compile(ArrayRef<char> Input,
 
 template <typename ID, ID... UnknownIDs>
 static Expected<opt::InputArgList>
-parseOptions(const SmallVectorImpl<const char *> &Argv,
-             IGC::options::Flags FlagsToInclude, const opt::OptTable &Options,
-             bool IsStrictMode) {
-  const bool IsInternal = FlagsToInclude == IGC::options::VCInternalOption;
+parseOptions(const SmallVectorImpl<const char *> &Argv, unsigned FlagsToInclude,
+             const opt::OptTable &Options, bool IsStrictMode) {
+  const bool IsInternal = FlagsToInclude & IGC::options::VCInternalOption;
 
   unsigned MissingArgIndex = 0;
   unsigned MissingArgCount = 0;
@@ -526,9 +508,12 @@ parseApiOptions(StringSaver &Saver, StringRef ApiOptions, bool IsStrictMode) {
   };
   const std::string VCCodeGenOptName =
       Options.getOption(OPT_vc_codegen).getPrefixedName();
-  if (HasOption(VCCodeGenOptName))
-    return parseOptions<ID, OPT_UNKNOWN, OPT_INPUT>(
-        Argv, IGC::options::VCApiOption, Options, IsStrictMode);
+  if (HasOption(VCCodeGenOptName)) {
+    const unsigned FlagsToInclude =
+        IGC::options::VCApiOption | IGC::options::IGCApiOption;
+    return parseOptions<ID, OPT_UNKNOWN, OPT_INPUT>(Argv, FlagsToInclude,
+                                                    Options, IsStrictMode);
+  }
   // Deprecated -cmc parsing just for compatibility.
   const std::string IgcmcOptName =
       Options.getOption(OPT_igcmc).getPrefixedName();
@@ -537,8 +522,10 @@ parseApiOptions(StringSaver &Saver, StringRef ApiOptions, bool IsStrictMode) {
         << "'" << IgcmcOptName
         << "' option is deprecated and will be removed in the future release. "
            "Use -vc-codegen instead for compiling from SPIRV.\n";
-    return parseOptions<ID, OPT_UNKNOWN, OPT_INPUT>(
-        Argv, IGC::options::IgcmcApiOption, Options, IsStrictMode);
+    const unsigned FlagsToInclude =
+        IGC::options::IgcmcApiOption | IGC::options::IGCApiOption;
+    return parseOptions<ID, OPT_UNKNOWN, OPT_INPUT>(Argv, FlagsToInclude,
+                                                    Options, IsStrictMode);
   }
 
   return make_error<vc::NotVCError>();
@@ -553,8 +540,10 @@ parseInternalOptions(StringSaver &Saver, StringRef InternalOptions) {
   // Internal options are always unchecked.
   constexpr bool IsStrictMode = false;
   const opt::OptTable &Options = IGC::getInternalOptTable();
-  return parseOptions<ID, OPT_UNKNOWN, OPT_INPUT>(
-      Argv, IGC::options::VCInternalOption, Options, IsStrictMode);
+  const unsigned FlagsToInclude =
+      IGC::options::VCInternalOption | IGC::options::IGCInternalOption;
+  return parseOptions<ID, OPT_UNKNOWN, OPT_INPUT>(Argv, FlagsToInclude, Options,
+                                                  IsStrictMode);
 }
 
 static Error makeOptionError(const opt::Arg &A, const opt::ArgList &Opts,
@@ -578,6 +567,8 @@ static Error fillApiOptions(const opt::ArgList &ApiOptions,
     Opts.NoJumpTables = true;
   if (ApiOptions.hasArg(OPT_vc_ftranslate_legacy_memory_intrinsics))
     Opts.TranslateLegacyMemoryIntrinsics = true;
+  if (ApiOptions.hasArg(OPT_large_GRF))
+    Opts.IsLargeGRFMode = true;
 
   if (opt::Arg *A = ApiOptions.getLastArg(OPT_vc_optimize)) {
     StringRef Val = A->getValue();
@@ -613,6 +604,8 @@ static Error fillInternalOptions(const opt::ArgList &InternalOptions,
     Opts.DumpAsm = true;
   if (InternalOptions.hasArg(OPT_ftime_report))
     Opts.TimePasses = true;
+  if (InternalOptions.hasArg(OPT_intel_use_bindless_buffers_ze))
+    Opts.UseBindlessBuffers = true;
 
   if (opt::Arg *A = InternalOptions.getLastArg(OPT_binary_format)) {
     StringRef Val = A->getValue();
@@ -674,9 +667,10 @@ static std::string composeLLVMArgs(const opt::ArgList &ApiArgs,
   std::string Result;
 
   // Handle input llvm options.
-  if (const opt::Arg *BaseArg =
-          InternalArgs.getLastArg(IGC::options::internal::OPT_llvm_options))
-    Result += BaseArg->getValue();
+  if (InternalArgs.hasArg(IGC::options::internal::OPT_llvm_options))
+    Result += join(
+        InternalArgs.getAllArgValues(IGC::options::internal::OPT_llvm_options),
+        " ");
 
   // Add visaopts if any.
   for (auto OptID : {IGC::options::api::OPT_igcmc_visaopts,
@@ -721,6 +715,43 @@ fillOptions(const opt::ArgList &ApiOptions,
   return {std::move(Opts)};
 }
 
+// Filter input argument list to derive options that will contribute
+// to subsequent translation.
+// InputArgs -- argument list to filter, should outlive resulting
+// derived option list.
+// IncludeFlag -- options with that flag will be included in result.
+static opt::DerivedArgList filterUsedOptions(opt::InputArgList &InputArgs,
+                                             IGC::options::Flags IncludeFlag) {
+  opt::DerivedArgList FilteredArgs(InputArgs);
+
+  // InputArg is not a constant. This is required to pass it to append
+  // function of derived argument list. Derived argument list will not
+  // own added argument so it will not try to free this memory.
+  // Additionally note that InputArgs are used in derived arg list as
+  // a constant so added arguments should not be modified through
+  // derived list to avoid unexpected results.
+  for (opt::Arg *InputArg : InputArgs) {
+    const opt::Arg *Arg = InputArg;
+    // Get alias as unaliased form can belong to used flags
+    // (see cl intel gtpin options).
+    if (const opt::Arg *AliasArg = InputArg->getAlias())
+      Arg = AliasArg;
+    // Ignore options without required flag.
+    if (!Arg->getOption().hasFlag(IncludeFlag))
+      continue;
+    FilteredArgs.append(InputArg);
+  }
+
+  return FilteredArgs;
+}
+
+opt::DerivedArgList filterApiOptions(opt::InputArgList &InputArgs) {
+  if (InputArgs.hasArg(IGC::options::api::OPT_igcmc))
+    return filterUsedOptions(InputArgs, IGC::options::IgcmcApiOption);
+
+  return filterUsedOptions(InputArgs, IGC::options::VCApiOption);
+}
+
 llvm::Expected<vc::CompileOptions>
 vc::ParseOptions(llvm::StringRef ApiOptions, llvm::StringRef InternalOptions,
                  bool IsStrictMode) {
@@ -729,12 +760,15 @@ vc::ParseOptions(llvm::StringRef ApiOptions, llvm::StringRef InternalOptions,
   auto ExpApiArgList = parseApiOptions(Saver, ApiOptions, IsStrictMode);
   if (!ExpApiArgList)
     return ExpApiArgList.takeError();
-  const opt::InputArgList &ApiArgs = ExpApiArgList.get();
+  opt::InputArgList &ApiArgs = ExpApiArgList.get();
+  const opt::DerivedArgList VCApiArgs = filterApiOptions(ApiArgs);
 
   auto ExpInternalArgList = parseInternalOptions(Saver, InternalOptions);
   if (!ExpInternalArgList)
     return ExpInternalArgList.takeError();
-  const opt::InputArgList &InternalArgs = ExpInternalArgList.get();
+  opt::InputArgList &InternalArgs = ExpInternalArgList.get();
+  const opt::DerivedArgList VCInternalArgs =
+      filterUsedOptions(InternalArgs, IGC::options::VCInternalOption);
 
-  return fillOptions(ApiArgs, InternalArgs);
+  return fillOptions(VCApiArgs, VCInternalArgs);
 }

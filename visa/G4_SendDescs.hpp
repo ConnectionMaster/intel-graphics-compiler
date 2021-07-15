@@ -1,28 +1,11 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
+============================= end_copyright_notice ===========================*/
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
 #ifndef G4_SEND_DESCS_HPP
 #define G4_SEND_DESCS_HPP
 
@@ -196,9 +179,19 @@ static inline ElemsPerAddr::Chs operator|(
 
 class G4_Operand;
 
-// Base class for all send descriptors
+// Base class for all send descriptors.
+// (Note that G4_SendDesc could be reused by more than one instruction.)
 class G4_SendDesc
 {
+    friend class G4_InstSend;
+
+protected:
+    // The execution size for this message.
+    G4_ExecSize execSize;
+
+    // Limit access to G4_InstSend and any derived classes.
+    void setExecSize(G4_ExecSize v) { execSize = v; }
+
 public:
     enum class Kind {INVALID, RAW, LDST};
 
@@ -206,9 +199,17 @@ public:
 
     SFID        sfid;
 
-    G4_SendDesc(Kind k, SFID _sfid) : kind(k), sfid(_sfid) { }
+    G4_SendDesc(Kind k, SFID _sfid) : kind(k), sfid(_sfid), execSize(g4::SIMD_UNDEFINED) { }
+    G4_SendDesc(Kind k, SFID _sfid, G4_ExecSize _execSize)
+        : kind(k),
+          sfid(_sfid),
+          execSize(_execSize)
+    {}
 
     SFID getSFID() const {return sfid;}
+
+    // execSize: need to set it in the ctor
+    G4_ExecSize getExecSize() const { return execSize; }
 
     bool isRaw() const {return kind == Kind::RAW;}
     bool isLdSt() const {return kind == Kind::LDST;}
@@ -290,9 +291,6 @@ public:
 struct G4_SendDescLdSt : G4_SendDesc {
     // The message op
     LdStOp op;
-
-    // The execution size for this message.
-    G4_ExecSize execSize;
 
     // E.g. flat, bti, ...
     AddrType addrType;
@@ -508,6 +506,18 @@ public:
         G4_Operand *bti,
         bool isValidFuncCtrl);
 
+    // Preferred constructor takes an explicit SFID and src1 length
+    // Need execSize, so it is created for a particular send.
+    G4_SendDescRaw(
+        SFID sfid,
+        uint32_t desc,
+        uint32_t extDesc,
+        int src1Len,
+        SendAccess access,
+        G4_Operand* bti,
+        G4_ExecSize execSize,
+        bool isValidFuncCtrl);
+
     void *operator new(size_t sz, Mem_Manager &m) { return m.alloc(sz); }
 
     static uint32_t createExtDesc(SFID funcID, bool isEot = false)
@@ -626,6 +636,10 @@ public:
         uint16_t bitV = ((getFuncCtrl() & 0x3000u) >> 12);
         return  0x1 << bitV;
     }
+    bool isByteScatterRW() const;
+    bool isDWScatterRW() const;
+    bool isQWScatterRW() const;
+    bool isUntypedRW() const;
 
     bool isA64Message() const;
 
@@ -636,10 +650,10 @@ public:
     bool is16BitInput() const;
     bool is16BitReturn() const;
 
-    bool isThreadMessage() const
-    {
+    bool isThreadMessage() const {
         return getSFID() == SFID::GATEWAY || getSFID() == SFID::SPAWNER;
     }
+
 
     // atomic write or explicit barrier
     bool isBarrierOrAtomic() const {

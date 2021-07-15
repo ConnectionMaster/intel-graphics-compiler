@@ -78,11 +78,9 @@ namespace IGC
         typedef std::vector<vISA::ZESymEntry> SymbolListTy;
         typedef std::vector<vISA::ZERelocEntry> RelocListTy;
         typedef std::vector<vISA::ZEFuncAttribEntry> FuncAttrListTy;
-        struct SymbolLists {
+        // function scope symbols
+        struct ZEBinFuncSymbolTable {
             SymbolListTy function;          // function symbols
-            SymbolListTy global;            // global symbols
-            SymbolListTy globalConst;       // global constant symbols
-            SymbolListTy globalStringConst; // global string constant symbols
             SymbolListTy sampler;           // sampler symbols
             SymbolListTy local;             // local symbols
         };
@@ -95,8 +93,10 @@ namespace IGC
         unsigned int    m_scratchSpaceUsedBySpills = 0; //<! amount of scratch space needed for shader spilling
         unsigned int    m_scratchSpaceUsedByShader = 0; //<! amount of scratch space needed by shader
         unsigned int    m_scratchSpaceUsedByGtpin = 0; //<! amount of scratch space used by gtpin
-        void* m_debugDataVISA = nullptr;            //<! VISA debug data (source -> VISA)
-        unsigned int    m_debugDataVISASize = 0;        //<! Number of bytes of VISA debug data
+        void*           m_debugData = nullptr;      //<! elf file containing debug information for the kernel (source->genIsa)
+        unsigned int    m_debugDataSize = 0;        //<! size of the elf file containing debug information
+        // TODO: m_debugDataGenISA and m_debugDataGenISASize
+        // are not really needed, consider removal
         void* m_debugDataGenISA = nullptr;          //<! GenISA debug data (VISA -> GenISA)
         unsigned int    m_debugDataGenISASize = 0;      //<! Number of bytes of GenISA debug data
         unsigned int    m_InstructionCount = 0;
@@ -106,7 +106,7 @@ namespace IGC
         void* m_funcSymbolTable = nullptr;
         unsigned int    m_funcSymbolTableSize = 0;
         unsigned int    m_funcSymbolTableEntries = 0;
-        SymbolLists     m_symbols;                 // duplicated information of m_funcSymbolTable, for zebin
+        ZEBinFuncSymbolTable m_symbols;           // duplicated information of m_funcSymbolTable, for zebin
         void* m_funcRelocationTable = nullptr;
         unsigned int    m_funcRelocationTableSize = 0;
         unsigned int    m_funcRelocationTableEntries = 0;
@@ -117,10 +117,8 @@ namespace IGC
         FuncAttrListTy  m_funcAttrs;               // duplicated information of m_funcAttributeTable, for zebin
         unsigned int    m_offsetToSkipPerThreadDataLoad = 0;
         uint32_t        m_offsetToSkipSetFFIDGP = 0;
-        //true means we separate pvtmem and spillfill. pvtmem could go into stateless.
-        //false means all of them are together
-        bool            m_separatePvtSpill = false;
         bool            m_roundPower2KBytes = false;
+        bool            m_UseScratchSpacePrivateMemory = true;
         unsigned int m_scratchSpaceSizeLimit = 0;
         unsigned int m_numGRFTotal = 128;
 
@@ -129,6 +127,7 @@ namespace IGC
         std::optional<uint64_t> m_NumGRFFill;
         std::optional<uint64_t> m_NumSends;
         std::optional<uint64_t> m_NumCycles;
+        std::optional<uint64_t> m_NumSendStallCycles;
 
 
         void Destroy()
@@ -137,9 +136,9 @@ namespace IGC
             {
                 IGC::aligned_free(m_programBin);
             }
-            if (m_debugDataVISA)
+            if (m_debugData)
             {
-                IGC::aligned_free(m_debugDataVISA);
+                IGC::aligned_free(m_debugData);
             }
             if (m_debugDataGenISA)
             {
@@ -151,34 +150,36 @@ namespace IGC
             }
         }
 
-        void init(bool setSeparatePvtSpillT, bool roundPower2KBytes, unsigned int scratchSpaceSizeLimitT)
+        void init(bool roundPower2KBytes, unsigned int scratchSpaceSizeLimitT, bool useScratchSpacePrivateMemory)
         {
-            m_separatePvtSpill = setSeparatePvtSpillT;
             m_roundPower2KBytes = roundPower2KBytes;
             m_scratchSpaceSizeLimit = scratchSpaceSizeLimitT;
+            m_UseScratchSpacePrivateMemory = useScratchSpacePrivateMemory;
         }
 
         //InSlot0
         //Todo: rename later
         unsigned int getScratchSpaceUsageInSlot0() const
         {
-            //FIXME: temporarily disable slot1, enable it again when IGC is ready to handle r0.5+1
-            //return roundSize(m_scratchSpaceUsedBySpills + m_scratchSpaceUsedByGtpin + (m_separatePvtSpill ? 0 : m_scratchSpaceUsedByShader));
-            return roundSize(m_scratchSpaceUsedBySpills
-                            + m_scratchSpaceUsedByGtpin
-                            + ((m_separatePvtSpill && m_scratchSpaceUsedByShader > m_scratchSpaceSizeLimit) ? 0 : m_scratchSpaceUsedByShader));
+            unsigned int privateMemoryScratchSpaceSize =
+                getScratchSpaceUsageInSlot1() > 0 || getScratchSpaceUsageInStateless() > 0 ? 0 : m_scratchSpaceUsedByShader;
+            unsigned int result = roundSize(m_scratchSpaceUsedBySpills + m_scratchSpaceUsedByGtpin + privateMemoryScratchSpaceSize);
+            IGC_ASSERT(result <= m_scratchSpaceSizeLimit);
+            return result;
         }
 
         unsigned int getScratchSpaceUsageInSlot1() const
         {
+            unsigned int result = 0;
             //FIXME: temporarily disable slot1, enable it again when IGC is ready to handle r0.5+1
-            return 0;
-            //return roundSize((m_separatePvtSpill && m_scratchSpaceUsedByShader <= m_scratchSpaceSizeLimit) ? m_scratchSpaceUsedByShader : 0);
+            // result = roundSize(m_UseScratchSpacePrivateMemory ? m_scratchSpaceUsedByShader : 0);
+            IGC_ASSERT(result <= m_scratchSpaceSizeLimit);
+            return result;
         }
 
         unsigned int getScratchSpaceUsageInStateless() const
         {
-            return roundSize(((m_separatePvtSpill && m_scratchSpaceUsedByShader > m_scratchSpaceSizeLimit) ? m_scratchSpaceUsedByShader : 0));
+            return roundSize(!m_UseScratchSpacePrivateMemory ? m_scratchSpaceUsedByShader : 0);
         }
 
         void setScratchSpaceUsedByShader(unsigned int scratchSpaceUsedByShader)
@@ -200,6 +201,14 @@ namespace IGC
             return (size ? iSTD::RoundPower2(iSTD::Max(int_cast<DWORD>(size), static_cast<DWORD>(sizeof(KILOBYTE)))) : 0);
         }
 
+        // XeHP_SDV+ : we round to one of values: pow(2, (0, 6, 7, 8...18))
+        unsigned int roundPower2Byte(unsigned int size) const
+        {
+            unsigned int ret = (size ? iSTD::RoundPower2(int_cast<DWORD>(size)) : 0);
+            //round any value in (0,32] to 64 BYTEs
+            ret = ((ret > 0 && ret <= 32) ? 64 : ret);
+            return ret;
+        }
     };
 
     enum InstrStatTypes
@@ -625,7 +634,7 @@ namespace IGC
         QWORD       m_ShaderHashCode = {};
 
         std::vector<std::unique_ptr<iOpenCL::PointerInputAnnotation>>       m_pointerInput;
-        std::vector<std::unique_ptr<iOpenCL::PointerArgumentAnnotation>>    m_pointerArgument;
+        std::vector<std::shared_ptr<iOpenCL::PointerArgumentAnnotation>>    m_pointerArgument;
         std::vector<std::unique_ptr<iOpenCL::LocalArgumentAnnotation>>      m_localPointerArgument;
         std::vector<std::unique_ptr<iOpenCL::SamplerInputAnnotation>>       m_samplerInput;
         std::vector<std::unique_ptr<iOpenCL::SamplerArgumentAnnotation>>    m_samplerArgument;
@@ -647,6 +656,8 @@ namespace IGC
         // This maps argument numbers to BTI and sampler indices
         // (e.g. kernel argument 3, which is is an image_2d, may be mapped to BTI 6)
         std::map<DWORD, unsigned int> m_argIndexMap = {};
+
+        std::map<unsigned int, std::shared_ptr<iOpenCL::PointerArgumentAnnotation>> m_argOffsetMap = {};
 
         iOpenCL::ThreadPayload        m_threadPayload = {};
 
@@ -677,11 +688,13 @@ namespace IGC
             std::vector<vISA::ZERelocEntry> globalReloc;
             std::vector<vISA::ZERelocEntry> globalConstReloc;
         };
-        struct ZEBinSymbolTable
+        // program scope symbols
+        struct ZEBinProgramSymbolTable
         {
             using SymbolSeq = std::vector<vISA::ZESymEntry>;
             SymbolSeq global;            // global symbols
             SymbolSeq globalConst;       // global constant symbols
+            SymbolSeq globalStringConst; // global string constant symbols
         };
         struct LegacySymbolTable
         {
@@ -697,7 +710,7 @@ namespace IGC
         std::vector<std::unique_ptr<iOpenCL::KernelTypeProgramBinaryInfo> > m_initKernelTypeAnnotation;
 
         ZEBinRelocTable m_GlobalPointerAddressRelocAnnotation;
-        ZEBinSymbolTable m_zebinSymbolTable;
+        ZEBinProgramSymbolTable m_zebinSymbolTable;
         LegacySymbolTable m_legacySymbolTable;
     };
 
@@ -810,7 +823,7 @@ namespace IGC
 
         CShader* PickCSEntryForcedFromDriver(SIMDMode& simdMode,
             unsigned char forcedSIMDModeFromDriver);
-        CShader* PickCSEntryByRegKey(SIMDMode& simdMode);
+        CShader* PickCSEntryByRegKey(SIMDMode& simdMode, ComputeShaderContext* cgCtx);
         CShader* PickCSEntryEarly(SIMDMode& simdMode,
             ComputeShaderContext* cgCtx);
         CShader* PickCSEntryFinally(SIMDMode& simdMode);
@@ -933,6 +946,7 @@ namespace IGC
         std::vector<int> m_dsNonDefaultIdxMap;
         std::vector<int> m_gsNonDefaultIdxMap;
         std::vector<int> m_psIdxMap;
+        DWORD dsInSize = 0;
         DWORD LtoUsedMask = 0;
         uint64_t m_SIMDInfo;
     private:
@@ -990,7 +1004,7 @@ namespace IGC
 
         void initLLVMContextWrapper(bool createResourceDimTypes = true);
         llvm::LLVMContext* getLLVMContext() const;
-        IGC::IGCMD::MetaDataUtils* getMetaDataUtils();
+        IGC::IGCMD::MetaDataUtils* getMetaDataUtils() const;
         IGCLLVM::Module* getModule() const;
 
         void setModule(llvm::Module* m);
@@ -1020,7 +1034,9 @@ namespace IGC
         virtual uint32_t getNumThreadsPerEU() const;
         virtual uint32_t getNumGRFPerThread() const;
         virtual bool forceGlobalMemoryAllocation() const;
+        virtual bool allocatePrivateAsGlobalBuffer() const;
         virtual bool hasNoLocalToGenericCast() const;
+        virtual bool hasNoPrivateToGenericCast() const;
         virtual int16_t getVectorCoalescingControl() const;
         bool isPOSH() const;
 
@@ -1334,6 +1350,27 @@ namespace IGC
                 {
                     IntelEnablePreRAScheduling = false;
                 }
+                //
+                // Options to set the number of GRF and threads
+                //
+                if (strstr(options, IGC_MANGLE("-intel-128-GRF-per-thread")))
+                {
+                    Intel128GRFPerThread = true;
+                    numThreadsPerEU = 8;
+                }
+                if (strstr(options, IGC_MANGLE("-intel-256-GRF-per-thread")) ||
+                    strstr(options, IGC_MANGLE("-opt-large-register-file")))
+                {
+                    Intel256GRFPerThread = true;
+                    numThreadsPerEU = 4;
+                }
+                if (const char* op = strstr(options, IGC_MANGLE("-intel-num-thread-per-eu")))
+                {
+                    IntelNumThreadPerEU = true;
+                    // Take an integer value after this option
+                    // atoi(..) ignores leading white spaces and characters after the actual number
+                    numThreadsPerEU = atoi(op + strlen(IGC_MANGLE("-intel-num-thread-per-eu")));
+                }
                 if (strstr(options, "-intel-use-bindless-buffers"))
                 {
                     PromoteStatelessToBindless = true;
@@ -1355,13 +1392,9 @@ namespace IGC
                 {
                     UseBindlessPrintf = true;
                 }
-                if (strstr(options, "-intel-force-global-mem-allocation"))
+                if (strstr(options, "-intel-use-bindless-legacy-mode"))
                 {
-                    IntelForceGlobalMemoryAllocation = true;
-                }
-                if (strstr(options, "-intel-no-local-to-generic"))
-                {
-                    hasNoLocalToGeneric = true;
+                    UseBindlessLegacyMode = true;
                 }
                 if (const char* O = strstr(options, "-intel-vector-coalesing"))
                 {
@@ -1418,8 +1451,7 @@ namespace IGC
             bool PreferBindlessImages = false;
             bool UseBindlessMode = false;
             bool UseBindlessPrintf = false;
-            bool IntelForceGlobalMemoryAllocation = false;
-            bool hasNoLocalToGeneric = false;
+            bool UseBindlessLegacyMode = true;
             bool EnableZEBinary = false;
             bool NoSpill = false;
 
@@ -1427,6 +1459,10 @@ namespace IGC
             // 0-5: valid values set from the cmdline
             int16_t VectorCoalescingControl = -1;
 
+            bool Intel128GRFPerThread = false;
+            bool Intel256GRFPerThread = false;
+            bool IntelNumThreadPerEU = false;
+            uint32_t numThreadsPerEU = 0;
         };
 
         class Options
@@ -1472,6 +1508,14 @@ namespace IGC
                 {
                     IsLibraryCompilation = true;
                 }
+                if (strstr(options, "-no-local-to-generic"))
+                {
+                    HasNoLocalToGeneric = true;
+                }
+                if (strstr(options, "-force-global-mem-allocation"))
+                {
+                    ForceGlobalMemoryAllocation = true;
+                }
 
                 // GTPin flags used by L0 driver runtime
                 if (strstr(options, "-gtpin-rera"))
@@ -1492,6 +1536,13 @@ namespace IGC
                         GTPinScratchAreaSizeValue = atoi(optionVal);
                     }
                 }
+                if (const char* op = strstr(options, IGC_MANGLE("-intel-reqd-eu-thread-count")))
+                {
+                    IntelRequiredEUThreadCount = true;
+                    // Take an integer value after this option
+                    // atoi(..) ignores leading white spaces and characters after the actual number
+                    requiredEUThreadCount = atoi(op + strlen("-intel-reqd-eu-thread-count="));
+                }
             }
 
             bool CorrectlyRoundedSqrt;
@@ -1499,10 +1550,14 @@ namespace IGC
             bool UniformWGS;
             bool EnableTakeGlobalAddress = false;
             bool IsLibraryCompilation = false;
+            bool HasNoLocalToGeneric = false;
+            bool ForceGlobalMemoryAllocation = false;
             bool GTPinReRA = false;
             bool GTPinGRFInfo = false;
             bool GTPinScratchAreaSize = false;
             uint32_t GTPinScratchAreaSizeValue = 0;
+            bool IntelRequiredEUThreadCount = false;
+            uint32_t requiredEUThreadCount = 0;
         };
 
         // output: shader information
@@ -1537,7 +1592,9 @@ namespace IGC
         uint32_t getNumGRFPerThread() const override;
         uint32_t getNumThreadsPerEU() const override;
         bool forceGlobalMemoryAllocation() const override;
+        bool allocatePrivateAsGlobalBuffer() const override;
         bool hasNoLocalToGenericCast() const override;
+        bool hasNoPrivateToGenericCast() const override;
         int16_t getVectorCoalescingControl() const override;
     private:
         llvm::DenseMap<llvm::Function*, std::string> m_hashes_per_kernel;

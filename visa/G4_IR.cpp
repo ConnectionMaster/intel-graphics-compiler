@@ -1,28 +1,10 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2017-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
+============================= end_copyright_notice ===========================*/
 
 #include "IGC/common/StringMacros.hpp"
 #include "visa_igc_common_header.h"
@@ -67,7 +49,7 @@ static const G4_InstOptInfo InstOptInfo[] =
     {InstOpt_EOT, "EOT"},
     {InstOpt_AccWrCtrl, "AccWrEn"},
     {InstOpt_Compacted, "Compacted"},
-    {InstOpt_NoCompact, "NoCompact" },
+    {InstOpt_NoCompact, "NoCompact"},
     {InstOpt_NoSrcDepSet, "NoSrcDepSet"},
     {InstOpt_NoPreempt, "NoPreempt"},
     {InstOpt_Serialize, "Serialize"},
@@ -82,7 +64,7 @@ static const G4_InstOptInfo InstOptInfo[] =
     { G4_##op, name, nsrc, ndst, type, plat, attr },
 
 const G4_Inst_Info G4_Inst_Table[] = {
-#include "G4Instruction.def"
+#include "G4Instruction.h"
 };
 
 
@@ -215,98 +197,18 @@ static bool Is_Type_Included(G4_Type type1, G4_Type type2, const IR_Builder& bui
     return false;
 }
 
-TARGET_PLATFORM G4_INST::getPlatform() const
+static void resetRightBound(G4_Operand* opnd)
 {
-    return builder.getPlatform();
+    if (opnd) {
+        opnd->unsetRightBound();
+    }
 }
 
-G4_INST::G4_INST(
-    const IR_Builder& irb,
-    G4_Predicate* prd,
-    G4_opcode o,
-    G4_CondMod* m,
-    G4_Sat s,
-    G4_ExecSize size,
-    G4_DstRegRegion* d,
-    G4_Operand* s0,
-    G4_Operand* s1,
-    unsigned int opt) :
-    op(o), dst(d), predicate(prd), mod(m), option(opt),
-    useInstList(irb.getAllocator()),
-    defInstList(irb.getAllocator()),
-    local_id(0),
-    srcCISAoff(UndefinedCisaOffset),
-    sat(s ? 1 : 0),
-    evenlySplitInst(false),
-    execSize(size),
-    bin(nullptr),
-    builder(irb)
+static void associateOpndWithInst(G4_Operand* opnd, G4_INST* inst)
 {
-    srcs[0] = s0;
-    srcs[1] = s1;
-    srcs[2] = nullptr;
-    srcs[3] = nullptr;
-
-    dead = false;
-    implAccSrc = nullptr;
-    implAccDst = nullptr;
-
-    resetRightBound(dst);
-    resetRightBound(s0);
-    resetRightBound(s1);
-    computeRightBound(predicate);
-    computeRightBound(mod);
-
-    associateOpndWithInst(dst, this);
-    associateOpndWithInst(s0, this);
-    associateOpndWithInst(s1, this);
-}
-
-G4_INST::G4_INST(
-    const IR_Builder& irb,
-    G4_Predicate* prd,
-    G4_opcode o,
-    G4_CondMod* m,
-    G4_Sat s,
-    G4_ExecSize size,
-    G4_DstRegRegion* d,
-    G4_Operand* s0,
-    G4_Operand* s1,
-    G4_Operand* s2,
-    unsigned int opt) :
-    op(o), dst(d), predicate(prd), mod(m), option(opt),
-    useInstList(irb.getAllocator()),
-    defInstList(irb.getAllocator()),
-    local_id(0),
-    srcCISAoff(UndefinedCisaOffset),
-    sat(s ? 1 : 0),
-    evenlySplitInst(false),
-    execSize(size),
-    bin(nullptr),
-    builder(irb)
-{
-    srcs[0] = s0;
-    srcs[1] = s1;
-    srcs[2] = s2;
-    srcs[3] = nullptr;
-
-    dead = false;
-    implAccSrc = nullptr;
-    implAccDst = nullptr;
-
-    resetRightBound(dst);
-    resetRightBound(s0);
-    resetRightBound(s1);
-    resetRightBound(s2);
-    computeRightBound(predicate);
-    computeRightBound(mod);
-
-    associateOpndWithInst(dst, this);
-    associateOpndWithInst(s0, this);
-    associateOpndWithInst(s1, this);
-    associateOpndWithInst(s2, this);
-    associateOpndWithInst(predicate, this);
-    associateOpndWithInst(mod, this);
+    if (opnd) {
+        opnd->setInst(inst);
+    }
 }
 
 G4_INST::G4_INST(
@@ -321,11 +223,11 @@ G4_INST::G4_INST(
     G4_Operand* s1,
     G4_Operand* s2,
     G4_Operand* s3,
-    unsigned int opt) :
+    G4_InstOpts opt) :
     op(o), dst(d), predicate(prd), mod(m), option(opt),
     useInstList(irb.getAllocator()),
     defInstList(irb.getAllocator()),
-    local_id(0),
+    localId(0),
     srcCISAoff(UndefinedCisaOffset),
     sat(s ? 1 : 0),
     evenlySplitInst(false),
@@ -372,6 +274,7 @@ G4_InstSend::G4_InstSend(
     G4_INST(builder, prd, o, nullptr, g4::NOSAT, size, dst, payload, desc, opt),
     msgDesc(md)
 {
+    md->setExecSize(size);
 }
 
 G4_InstSend::G4_InstSend(
@@ -390,6 +293,7 @@ G4_InstSend::G4_InstSend(
     msgDesc(md)
 {
     setSrc(extDesc, 3);
+    md->setExecSize(size);
 }
 
 void G4_INST::setOpcode(G4_opcode opcd)
@@ -703,8 +607,8 @@ void G4_INST::removeAllUses()
 // (i.e., not Opnd_dst/Opnd_condMod/Opnd_implAccDst)
 void G4_INST::removeDefUse(Gen4_Operand_Number opndNum)
 {
-    DEF_EDGE_LIST_ITER iter = this->defInstList.begin();
-    while (iter != this->defInstList.end())
+    DEF_EDGE_LIST_ITER iter = defInstList.begin();
+    while (iter != defInstList.end())
     {
         if ((*iter).second == opndNum)
         {
@@ -712,7 +616,7 @@ void G4_INST::removeDefUse(Gen4_Operand_Number opndNum)
             defInst->useInstList.remove_if(
                 [&](USE_DEF_NODE node) { return node.first == this && node.second == opndNum; });
             DEF_EDGE_LIST_ITER curr_iter = iter++;
-            this->defInstList.erase(curr_iter);
+            defInstList.erase(curr_iter);
         }
         else
         {
@@ -753,8 +657,8 @@ USE_EDGE_LIST_ITER G4_INST::eraseUse(USE_EDGE_LIST_ITER iter)
 // inst2[opndNum2] and update definitions's def-use chain accordingly.
 void G4_INST::transferDef(G4_INST *inst2, Gen4_Operand_Number opndNum1, Gen4_Operand_Number opndNum2)
 {
-    DEF_EDGE_LIST_ITER iter = this->defInstList.begin();
-    while (iter != this->defInstList.end())
+    DEF_EDGE_LIST_ITER iter = defInstList.begin();
+    while (iter != defInstList.end())
     {
         auto defInst = (*iter).first;
         if ((*iter).second == opndNum1)
@@ -765,7 +669,7 @@ void G4_INST::transferDef(G4_INST *inst2, Gen4_Operand_Number opndNum1, Gen4_Ope
                 [&](USE_DEF_NODE node) { return node.second == opndNum1 && node.first == this; });
             defInst->useInstList.push_back(USE_DEF_NODE(inst2, opndNum2));
             DEF_EDGE_LIST_ITER curr_iter = iter++;
-            this->defInstList.erase(curr_iter);
+            defInstList.erase(curr_iter);
         }
         else
         {
@@ -780,8 +684,11 @@ void G4_INST::transferDef(G4_INST *inst2, Gen4_Operand_Number opndNum1, Gen4_Ope
 //
 // If 'checked' is true, then this only copies those effective defs to inst2.
 //
-void G4_INST::copyDef(G4_INST *inst2, Gen4_Operand_Number opndNum1,
-                      Gen4_Operand_Number opndNum2, bool checked)
+void G4_INST::copyDef(
+    G4_INST *inst2,
+    Gen4_Operand_Number opndNum1,
+    Gen4_Operand_Number opndNum2,
+    bool checked)
 {
     for (auto I = def_begin(); I != def_end(); ++I)
     {
@@ -919,16 +826,16 @@ void G4_INST::removeUseOfInst()
 void G4_INST::trimDefInstList()
 {
     // trim def list
-    DEF_EDGE_LIST_ITER iter = this->defInstList.begin();
+    DEF_EDGE_LIST_ITER iter = defInstList.begin();
     // since ACC is only exposed in ARCTAN intrinsic translation, there is no instruction split with ACC
-    while (iter != this->defInstList.end())
+    while (iter != defInstList.end())
     {
-        G4_Operand *src = this->getOperand((*iter).second);
+        G4_Operand *src = getOperand((*iter).second);
 
         if (src == nullptr)
         {
             // it's possible the source is entirely gone (e.g., predicate removed)
-            iter = this->defInstList.erase(iter);
+            iter = defInstList.erase(iter);
             continue;
         }
         G4_CmpRelation rel = Rel_undef;
@@ -971,7 +878,7 @@ void G4_INST::trimDefInstList()
             }
             DEF_EDGE_LIST_ITER tmpIter = iter;
             iter++;
-            this->defInstList.erase(tmpIter);
+            defInstList.erase(tmpIter);
             continue;
         }
         iter++;
@@ -1009,7 +916,11 @@ bool G4_INST::isMathPipeInst() const
 
 bool G4_INST::distanceHonourInstruction() const
 {
-    if (isSend() || op == G4_nop || isWait() || isMath() || op == G4_halt)
+    if (isSend() || op == G4_nop || isWait() || isDpas())
+    {
+        return false;
+    }
+    if (isMathPipeInst())
     {
         return false;
     }
@@ -1018,7 +929,18 @@ bool G4_INST::distanceHonourInstruction() const
 
 bool G4_INST::tokenHonourInstruction() const
 {
-    return isSend() || isMath();
+    if (isSend() || isDpas())
+    {
+        return true;
+    }
+    else
+    {
+        if (isMathPipeInst())
+        {
+            return true;
+        }
+        return false;
+    }
 }
 
 bool G4_INST::hasNoPipe()
@@ -1031,6 +953,282 @@ bool G4_INST::hasNoPipe()
 }
 
 
+bool G4_INST::isLongPipeType(G4_Type type) const
+{
+    if (builder.hasPartialInt64Support())
+    {
+        return type == Type_DF;
+    }
+    return IS_TYPE_LONG(type);
+}
+
+bool G4_INST::isIntegerPipeType(G4_Type type) const
+{
+    if (IS_TYPE_INTEGER(type))
+    {
+        return true;
+    }
+
+    if (builder.hasPartialInt64Support())
+    {
+        return type == Type_UQ || type == Type_Q;
+    }
+
+    return false;
+}
+
+bool G4_INST::isJEUPipeInstructionXe() const
+{
+    if (op == G4_jmpi ||
+        op == G4_if ||
+        op == G4_else ||
+        op == G4_endif ||
+        op == G4_break ||
+        op == G4_join ||
+        op == G4_cont ||
+        op == G4_while ||
+        op == G4_brc ||
+        op == G4_brd ||
+        op == G4_goto ||
+        op == G4_call ||
+        op == G4_return)
+    {
+        return true;
+    }
+    return false;
+}
+
+bool G4_INST::isLongPipeInstructionXe() const
+{
+    if (isJEUPipeInstructionXe())
+    {
+        return false;
+    }
+
+    if (!distanceHonourInstruction())
+    {
+        return false;
+    }
+
+    if (builder.hasFixedCycleMathPipeline() &&
+        isMath())
+    {
+        return false;
+    }
+
+    const G4_Operand* dst = getDst();
+    if (dst && isLongPipeType(dst->getType()))
+    {
+        return true;
+    }
+
+    if (!builder.hasPartialInt64Support())
+    {
+        for (int i = 0; i < G4_MAX_SRCS; i++)
+        {
+            const G4_Operand* src = getSrc(i);
+            if (src && isLongPipeType(src->getType()))
+            {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+bool G4_INST::isIntegerPipeInstructionXe() const
+{
+    if (isJEUPipeInstructionXe())
+    {
+        return true;
+    }
+
+    if (!distanceHonourInstruction())
+    {
+        return false;
+    }
+
+    if (isLongPipeInstructionXe())
+    {
+        return false;
+    }
+
+    if (builder.hasFixedCycleMathPipeline() &&
+        isMath())
+    {
+        return false;
+    }
+
+    G4_Operand* dst = getDst();
+    if (dst && isIntegerPipeType(dst->getType()))
+    {
+        return true;
+    }
+
+    if (!dst)
+    {
+        const G4_Operand* src = getSrc(0);
+        if (src && isIntegerPipeType(src->getType()))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool G4_INST::isFloatPipeInstructionXe() const
+{
+    if (isJEUPipeInstructionXe())
+    {
+        return false;
+    }
+
+    if (!distanceHonourInstruction())
+    {
+        return false;
+    }
+
+    if (isLongPipeInstructionXe())
+    {
+        return false;
+    }
+
+    if (builder.hasFixedCycleMathPipeline() &&
+        isMath())
+    {
+        return false;
+    }
+
+    const G4_Operand* dst = getDst();
+    if (dst &&
+        (dst->getType() == Type_F ||
+            dst->getType() == Type_HF ||
+            dst->getType() == Type_BF))
+    {
+        return true;
+    }
+
+    if (!dst)
+    {
+        const G4_Operand* src = getSrc(0);
+        if (src &&
+            (src->getType() == Type_F ||
+                src->getType() == Type_HF ||
+                src->getType() == Type_BF))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+SB_INST_PIPE G4_INST::getDataTypePipeXe(G4_Type type)
+{
+    switch (type)
+    {
+    case Type_UB:
+    case Type_B:
+    case Type_UW:
+    case Type_W:
+    case Type_UD:
+    case Type_D:
+    case Type_UV:
+    case Type_V:
+        return PIPE_INT;
+
+    case Type_Q:
+    case Type_UQ:
+        if (builder.hasPartialInt64Support())
+        {
+            return PIPE_INT;
+        }
+        return PIPE_LONG;
+
+    case Type_DF:
+        return PIPE_LONG;
+
+    case Type_HF:
+    case Type_F:
+    case Type_VF:
+    case Type_NF:
+    case Type_BF:
+        return PIPE_FLOAT;
+
+    default:
+        return PIPE_NONE;
+    }
+
+    return PIPE_NONE;
+}
+
+SB_INST_PIPE G4_INST::getInstructionPipeXe()
+{
+    if (isLongPipeInstructionXe())
+    {
+        return PIPE_LONG;
+    }
+
+    if (isIntegerPipeInstructionXe())
+    {
+        return PIPE_INT;
+    }
+
+    if (isFloatPipeInstructionXe())
+    {
+        return PIPE_FLOAT;
+    }
+
+    if (builder.hasFixedCycleMathPipeline() &&
+        isMath())
+    {
+        return PIPE_MATH;
+    }
+
+    if (tokenHonourInstruction())
+    {
+        if (isDpas())
+        {
+            return PIPE_DPAS;
+        }
+        if (isMathPipeInst())
+        {
+            return PIPE_MATH;
+        }
+        if (isSend())
+        {
+            return PIPE_SEND;
+        }
+
+        ASSERT_USER(0, "Wrong token pipe instruction!");
+    }
+
+    ASSERT_USER(hasNoPipe(), "No pipe instruction");
+    return PIPE_NONE;
+}
+
+template <typename T>
+static std::string fmtHexBody(T t, int cols = 0)
+{
+    std::stringstream ss;
+    if (sizeof(t) == 1) // char/unsigned char to int
+        ss << std::hex << std::setw(cols) << std::uppercase <<
+            std::setfill('0') << (int)t;
+    else
+        ss << std::hex << std::setw(cols) << std::uppercase <<
+            std::setfill('0') << t;
+    return ss.str();
+}
+
+template <typename T>
+static std::string fmtHex(T t, int cols = 0)
+{
+    std::stringstream ss;
+    ss << "0x" << fmtHexBody(t, cols);
+    return ss.str();
+}
 
 
 #ifdef _DEBUG
@@ -1122,16 +1320,16 @@ void G4_INST::addDefUse(G4_INST* inst, Gen4_Operand_Number srcPos)
     MUST_BE_TRUE(srcPos == Opnd_dst || srcPos == Opnd_src0 || srcPos == Opnd_src1 ||
         srcPos == Opnd_src2 || srcPos == Opnd_src3 || srcPos == Opnd_pred ||
         srcPos == Opnd_implAccSrc, "unexpected operand number");
-    this->useInstList.push_back(std::pair<G4_INST*, Gen4_Operand_Number>(inst, srcPos));
-    inst->defInstList.push_back(std::pair<G4_INST*, Gen4_Operand_Number>(this, srcPos));
+    useInstList.emplace_back(inst, srcPos);
+    inst->defInstList.emplace_back(this, srcPos);
 }
 
 // exchange def/use info of src0 and src1 after they are swapped.
 void G4_INST::swapDefUse()
 {
-    DEF_EDGE_LIST_ITER iter = this->defInstList.begin();
+    DEF_EDGE_LIST_ITER iter = defInstList.begin();
     // since ACC is only exposed in ARCTAN intrinsic translation, there is no instruction split with ACC
-    while (iter != this->defInstList.end())
+    while (iter != defInstList.end())
     {
         if ((*iter).second == Opnd_src1)
         {
@@ -1215,8 +1413,8 @@ void G4_INST::fixMACSrc2DefUse()
     {
         return;
     }
-    for (DEF_EDGE_LIST_ITER iter = this->defInstList.begin();
-        iter != this->defInstList.end();
+    for (DEF_EDGE_LIST_ITER iter = defInstList.begin();
+        iter != defInstList.end();
         iter++)
     {
         if ((*iter).second == Opnd_src2)
@@ -1272,7 +1470,8 @@ bool G4_INST::hasACCOpnd() const
         (dst && dst->isAccReg()) ||
         (srcs[0] && srcs[0]->isAccReg()) ||
         (srcs[1] && srcs[1]->isAccReg()) ||
-        (srcs[2] && srcs[2]->isAccReg()));
+        (srcs[2] && srcs[2]->isAccReg()) ||
+        op == G4_madw);
 }
 
 G4_Type G4_INST::getOpExecType(int& extypesize)
@@ -1590,6 +1789,15 @@ bool G4_INST::isLegalType(G4_Type type, Gen4_Operand_Number opndNum) const
             return false;
         }
         return true;
+    case G4_bfn:
+        // do not allow copy propagation to change BFN operand type
+        if (isSrc && type != getOperand(opndNum)->getType())
+        {
+            return false;
+        }
+        // fall through
+    case G4_add3:
+        return type == Type_W || type == Type_UW || type == Type_D || type == Type_UD;
     }
 }
 
@@ -1640,6 +1848,7 @@ bool G4_INST::isSignSensitive(Gen4_Operand_Number opndNum) const
     case G4_sel:
     case G4_cmp:
     case G4_cmpn:
+    case G4_madw:
         return true;
     case G4_mov:
         // inttofp is sign sensitive
@@ -1756,6 +1965,7 @@ G4_Type G4_INST::getPropType(
 
 static bool isLegalImmType(G4_Type type)
 {
+    return type != Type_BF;
     return true;
 }
 
@@ -1769,7 +1979,7 @@ static bool isLegalImmType(G4_Type type)
 // 6. When useinst is lifetime.end
 // 7. use inst does not have dst
 bool G4_INST::canPropagateTo(
-    G4_INST *useInst, Gen4_Operand_Number opndNum, MovType MT, bool inSimdFlow)
+    G4_INST *useInst, Gen4_Operand_Number opndNum, MovType MT, bool inSimdFlow, bool statelessAddr)
 {
     G4_Operand *src = srcs[0];
     bool indirectSrc = src->isSrcRegRegion() &&
@@ -1795,6 +2005,11 @@ bool G4_INST::canPropagateTo(
         return false;
     }
 
+    // Skip dpas as it has no region (maybe too conservative)
+    if (useInst->isDpas())
+    {
+        return false;
+    }
 
     // skip the instruction has no dst. e.g. G4_pseudo_fcall
     if (useInst->getDst() == nullptr)
@@ -1827,7 +2042,7 @@ bool G4_INST::canPropagateTo(
             return false;
         }
     }
-    else if (srcType != useType && useInst->opcode() == G4_mulh)
+    else if (srcType != useType && (useInst->opcode() == G4_mulh || useInst->opcode() == G4_madw))
     {
         // don't propagate widening ops into a mul/mach
         //   mov  T:d  SRC:w
@@ -1859,7 +2074,7 @@ bool G4_INST::canPropagateTo(
 
     // The following are copied from local dataflow analysis.
     // TODO: re-examine..
-    if ((opndNum == Opnd_src0 && useInst->isSend()) ||
+    if (((opndNum == Opnd_src0 && useInst->isSend()) && !statelessAddr) ||
         (opndNum == Opnd_src1 && useInst->isSplitSend()))
     {
         return false;
@@ -1876,7 +2091,7 @@ bool G4_INST::canPropagateTo(
     // FIXME: remove this once DU/UD chain are computed correctly.
     //
     // Only skip when the defInst ('this') is defined in SIMD CF.
-    if (useInst->isWriteEnableInst() && !this->isWriteEnableInst() && inSimdFlow)
+    if (useInst->isWriteEnableInst() && !isWriteEnableInst() && inSimdFlow)
     {
         return false;
     }
@@ -1953,7 +2168,7 @@ bool G4_INST::canPropagateTo(
     // Check T1 and T2 has the same bit/byte size. Otherwise, it's not legal to
     // be propagated.
     // TODO: Revisit later if exection mask is guaranteed to be NoMask.
-    if (TypeSize(dstType) != TypeSize(useType)) {
+    if (TypeSize(dstType) != TypeSize(useType) && !statelessAddr) {
         return false;
     }
 
@@ -1997,6 +2212,27 @@ bool G4_INST::canPropagateTo(
         return false;
     }
 
+    if (propType == Type_BF)
+    {
+        // bfloat specific checks
+        if (use->asSrcRegRegion()->hasModifier() && useInst->isMov())
+        {
+            // BF_CVT does not like source modifier
+            return false;
+        }
+        if (src->isSrcRegRegion() && src->asSrcRegRegion()->isScalar() &&
+            useInst->opcode() != G4_mov)
+        {
+            // HW has bug with scalar bfloat in mix mode instructions
+            return false;
+        }
+        if (useInst->getDst()->getType() != Type_F)
+        {
+            // we currently don't handle BF->HF or BF->DF conversion
+            return false;
+        }
+    }
+
     // Don't propagate unsupported propType.
     if (!useInst->isLegalType(propType, opndNum))
     {
@@ -2027,7 +2263,7 @@ bool G4_INST::canPropagateTo(
     const RegionDesc *rd =
         src->isSrcRegRegion() ? src->asSrcRegRegion()->getRegion() : nullptr;
     G4_ExecSize newExecSize = useInst->getExecSize();
-    if (useElSize != dstElSize &&
+    if ((useElSize != dstElSize && !statelessAddr) &&
         (!src->isSrcRegRegion()
          || rd->isRepeatRegion(execSize)
          || !(rd->isFlatRegion() && rd->isPackedRegion())))
@@ -2052,7 +2288,7 @@ bool G4_INST::canPropagateTo(
     bool repeatUseRegion = useRd && useRd->isRepeatRegion(newExecSize);
     bool scalarUse = useRd && useRd->isScalar();
     bool repeatSrcRegion = (rd && rd->isRepeatRegion(execSize));
-    if (!sameExecSize &&
+    if (!sameExecSize && !statelessAddr &&
         !((sameDefUseELSize && scalarUse) ||
           (!repeatUseRegion && rd && rd->isFlatRegion() && rd->isPackedRegion()) ||
           (repeatUseRegion && sameDefUseELSize && (src->isImm() || !repeatSrcRegion))))
@@ -2246,6 +2482,7 @@ bool G4_INST::canHoistTo(const G4_INST *defInst, bool simdBB) const
         (defInst->opcode() == G4_pseudo_mad &&
             !(IS_TYPE_FLOAT_ALL(dstType) && IS_TYPE_FLOAT_ALL(defDstType)));
     if ((defInst->useInstList.size() != 1) ||
+        (defInst->opcode() == G4_madw) ||
         (defInst->opcode() == G4_sad2) ||
         (defInst->opcode() == G4_sada2) ||
         (defInst->opcode() == G4_cbit && dstType != defDstType) ||
@@ -2283,6 +2520,12 @@ bool G4_INST::canHoistTo(const G4_INST *defInst, bool simdBB) const
             {
                 return false;
             }
+        }
+        if (!builder.getOption(vISA_ignoreBFRounding) && dstType == Type_BF && defOp != G4_mov)
+        {
+            // F->BF move has RNE mode while mix mode BF uses RTZ due to HW bug
+            // so we have to disallow the def-hoisting
+            return false;
         }
     }
 
@@ -2485,7 +2728,7 @@ bool G4_INST::canHoistTo(const G4_INST *defInst, bool simdBB) const
             break;
         }
     }
-    if (hasSrcModifier && !this->canSupportSrcModifier())
+    if (hasSrcModifier && !canSupportSrcModifier())
     {
         return false;
     }
@@ -2567,9 +2810,9 @@ bool G4_INST::isWARdep(G4_INST* inst)
     G4_Operand* implicitSrc0 = inst->getImplAccSrc();
     G4_Predicate* pred0 = inst->getPredicate();
 
-    G4_Operand* dst1 = this->dst;
+    G4_Operand* dst1 = dst;
 
-    if (dst1 && !this->hasNULLDst())
+    if (dst1 && !hasNULLDst())
     {
 
         if (
@@ -2596,7 +2839,7 @@ bool G4_INST::isWARdep(G4_INST* inst)
         }
     }
 
-    if (this->implAccDst)
+    if (implAccDst)
     {
         if ((implicitSrc0 && implicitSrc0->compareOperand(implAccDst) != Rel_disjoint) ||
             (src0_0 && src0_0->isAccReg() && src0_0->compareOperand(implAccDst) != Rel_disjoint) ||
@@ -2612,13 +2855,13 @@ bool G4_INST::isWARdep(G4_INST* inst)
 bool G4_INST::isWAWdep(G4_INST *inst)
 {
     G4_Operand *dst0 = inst->getDst();
-    G4_Operand *dst1 = this->dst;
-    G4_CondMod *cMod0   = inst->getCondMod();
-    G4_CondMod *cMod1   = this->mod;
-    G4_Operand *implicitDst0   = inst->getImplAccDst();
-    G4_Operand *implicitDst1   = this->implAccDst;
+    G4_Operand *dst1 = dst;
+    G4_CondMod *cMod0 = inst->getCondMod();
+    G4_CondMod *cMod1 = mod;
+    G4_Operand *implicitDst0 = inst->getImplAccDst();
+    G4_Operand *implicitDst1 = implAccDst;
 
-    bool NULLDst1 = !dst1 || this->hasNULLDst();
+    bool NULLDst1 = !dst1 || hasNULLDst();
     if (dst0 && !inst->hasNULLDst())
     {
         if ((!NULLDst1 && dst1->compareOperand(dst0) != Rel_disjoint) ||
@@ -2655,14 +2898,14 @@ bool G4_INST::isRAWdep(G4_INST *inst)
     G4_CondMod *cMod0 = inst->getCondMod();
     G4_Operand *implicitDst0   = inst->getImplAccDst();
     G4_Operand *msg1 = NULL;
-    G4_Predicate *pred1   = this->getPredicate();
-    G4_Operand *src1_0 = this->getSrc(0);
-    G4_Operand *src1_1 = this->getSrc(1);
-    G4_Operand *src1_2 = this->getSrc(2);
-    G4_Operand* src1_3 = this->getSrc(3);
-    G4_Operand *implicitSrc1   = this->implAccSrc;
+    G4_Predicate *pred1   = getPredicate();
+    G4_Operand *src1_0 = getSrc(0);
+    G4_Operand *src1_1 = getSrc(1);
+    G4_Operand *src1_2 = getSrc(2);
+    G4_Operand* src1_3 = getSrc(3);
+    G4_Operand *implicitSrc1   = implAccSrc;
 
-    bool NULLSrc1 = (this->opcode() == G4_math && src1_1->isNullReg());
+    bool NULLSrc1 = (opcode() == G4_math && src1_1->isNullReg());
     if (dst0 && !inst->hasNULLDst())
     {
         if ((src1_0 && src1_0->compareOperand(dst0) != Rel_disjoint) ||
@@ -3204,9 +3447,7 @@ void G4_INST::emitInstIds(std::ostream& output) const
 
     int64_t pc = getGenOffset();
     if (pc != -1) {
-        std::stringstream ss;
-        ss << std::hex << std::setw(5) << std::setfill('0') << pc;
-        output << "[" << ss.str() << "]";
+        output << "[" << fmtHexBody(pc, 5) << "]";
     }
 }
 
@@ -3277,6 +3518,15 @@ void G4_INST::emit_options(std::ostream& output) const
     // SWSB options
     if (distanceHonourInstruction() && getDistance() != 0) {
         std::stringstream dists;
+        switch (getDistanceTypeXe()) {
+        case DistanceType::DIST:                    break;
+        case DistanceType::DISTALL:   dists << 'A'; break;
+        case DistanceType::DISTINT:   dists << 'I'; break;
+        case DistanceType::DISTFLOAT: dists << 'F'; break;
+        case DistanceType::DISTLONG:  dists << 'L'; break;
+        case DistanceType::DISTMATH:  dists << 'M'; break;
+        default:                      dists << "?"; break;
+        }
         dists << '@' << (int)getDistance();
         emitOption(dists.str());
     }
@@ -3309,7 +3559,7 @@ void G4_INST::emit_options(std::ostream& output) const
 
     ////////////////////////////////////////////////
     // bitset options
-    unsigned int currOpts = option;
+    G4_InstOpts currOpts = option;
     if (isEOT()) {
         currOpts |= InstOpt_EOT;
     }
@@ -3398,6 +3648,19 @@ bool G4_INST::isMixedMode() const
     return false;
 }
 
+void G4_InstSend::setMsgDesc(G4_SendDesc *in)
+{
+    assert(in && "null descriptor not expected");
+#if defined(_DEBUG)
+    if (in && in->getExecSize() == g4::SIMD_UNDEFINED)
+    {
+        DEBUG_MSG("Msg Desc has execSize undefined!\n");
+    }
+#endif
+    msgDesc = in;
+    resetRightBound((G4_Operand*)dst);
+    resetRightBound(srcs[0]);
+}
 
 bool G4_InstSend::isDirectSplittableSend()
 {
@@ -3509,8 +3772,7 @@ void G4_InstSend::emit_send(std::ostream& output, bool symbol_dst, bool *symbol_
     {
         if (getMsgDescRaw()) {
             std::ios::fmtflags outFlags(output.flags());
-            output.flags(std::ios_base::hex | std::ios_base::showbase);
-            output << getMsgDescRaw()->getExtendedDesc();
+            output << fmtHex(getMsgDescRaw()->getExtendedDesc());
             output << ' ';
             output.flags(outFlags);
         }
@@ -3543,6 +3805,8 @@ void G4_InstSend::emit_send_desc(std::ostream& output)
     auto desc = msgDesc->getDescription();
     if (!desc.empty()) {
         output << msgDesc->getDescription();
+    }
+    if (const auto *rawDesc = sendInst->getMsgDescRaw()) {
     }
 
     output << ", resLen=" << msgDesc->getDstLenRegs();
@@ -4465,6 +4729,13 @@ unsigned G4_DstRegRegion::computeRightBound(uint8_t exec_size)
             unsigned short type_size = TypeSize(type);
             unsigned short s_size = horzStride * type_size;
             unsigned totalBytes = (exec_size - 1) * s_size + type_size;
+
+            // For madw opcode, the dst(SOA layout) size should be double as it has both low and high results
+            if (inst->opcode() == G4_madw)
+            {
+                totalBytes *= 2;
+            }
+
             right_bound = left_bound + totalBytes - 1;
         }
         else
@@ -5603,17 +5874,15 @@ bool G4_Imm::isSignBitZero() const
 G4_CmpRelation G4_Imm::compareOperand(G4_Operand *opnd)
 {
     G4_CmpRelation rel = Rel_disjoint;
-    if (opnd->isImm() && this->isEqualTo(opnd->asImm()))
+    if (opnd->isImm() && isEqualTo(opnd->asImm()))
     {
         return Rel_eq;
     }
     return rel;
 }
 
-void
-G4_Imm::emit(std::ostream& output, bool symbolreg)
+void G4_Imm::emit(std::ostream& output, bool symbolreg)
 {
-
     //
     // we only emit hex in this function
     //
@@ -5653,9 +5922,8 @@ G4_Imm::emit(std::ostream& output, bool symbolreg)
     }
 }
 
-void
 // emit number, automatically select the format according to its original format
-G4_Imm::emitAutoFmt(std::ostream& output)
+void G4_Imm::emitAutoFmt(std::ostream& output)
 {
     if (Type_F == type)
     {
@@ -5675,7 +5943,7 @@ G4_Imm::emitAutoFmt(std::ostream& output)
     }
     else //unsigned value
     {
-        output << (unsigned int)imm.num;
+        output << (unsigned)imm.num;
     }
 
     if (Type_UNDEF != type)
@@ -5693,7 +5961,7 @@ int64_t G4_Imm::typecastVals(int64_t value, G4_Type type)
     case Type_UV:
     case Type_VF:
     {
-        retVal = (int64_t)((unsigned int)value);
+        retVal = (int64_t)((unsigned)value);
         break;
     }
     case Type_D:
@@ -6791,7 +7059,7 @@ bool G4_INST::canSupportSaturate() const
         return true;
     }
 
-    if (isIntrinsic() || op == G4_mulh)
+    if (isIntrinsic() || op == G4_mulh || op == G4_madw)
     {
         return false;
     }
@@ -6838,6 +7106,10 @@ bool G4_INST::canSupportCondMod() const
         return true;
     }
 
+    if (op == G4_mov)
+    {
+        return dst->getType() != Type_BF && getSrc(0)->getType() != Type_BF;
+    }
 
     // ToDo: replace with IGA model
     return ((op == G4_add) ||
@@ -6877,6 +7149,13 @@ bool G4_INST::canSupportCondMod() const
 
 bool G4_INST::canSupportSrcModifier() const
 {
+    if (opcode() == G4_mov)
+    {
+        if (getDst()->getType() == Type_BF)
+        {
+            return false;
+        }
+    }
 
     if (opcode() == G4_pseudo_mad)
     {
@@ -7046,24 +7325,7 @@ void G4_SrcRegRegion::rewriteContiguousRegion(IR_Builder& builder, uint16_t opNu
     }
 }
 
-
-void resetRightBound(G4_Operand* opnd)
-{
-    if (opnd)
-    {
-        opnd->unsetRightBound();
-    }
-}
-
-void associateOpndWithInst(G4_Operand* opnd, G4_INST* inst)
-{
-    if (opnd)
-    {
-        opnd->setInst(inst);
-    }
-}
-
-void LiveIntervalInfo:: getLiveIntervals(std::vector<std::pair<uint32_t, uint32_t>>& intervals)
+void LiveIntervalInfo::getLiveIntervals(std::vector<std::pair<uint32_t, uint32_t>>& intervals)
 {
     for (auto&& it : liveIntervals)
     {
@@ -7075,7 +7337,7 @@ void LiveIntervalInfo::addLiveInterval(uint32_t start, uint32_t end)
 {
     if (liveIntervals.size() == 0)
     {
-        liveIntervals.push_back(std::make_pair(start, end));
+        liveIntervals.emplace_back(start, end);
     }
     else if (start - liveIntervals.back().second <= 1)
     {
@@ -7083,12 +7345,12 @@ void LiveIntervalInfo::addLiveInterval(uint32_t start, uint32_t end)
     }
     else if (liveIntervals.back().second < start)
     {
-        liveIntervals.push_back(std::make_pair(start, end));
+        liveIntervals.emplace_back(start, end);
     }
     else if (liveIntervals.front().first >= start && liveIntervals.back().second <= end)
     {
         liveIntervals.clear();
-        liveIntervals.push_back(std::make_pair(start, end));
+        liveIntervals.emplace_back(start, end);
     }
     else
     {
@@ -7163,7 +7425,7 @@ void LiveIntervalInfo::addLiveInterval(uint32_t start, uint32_t end)
             if (start - liveIntervals.back().second <= 1)
                 liveIntervals.back().second = end;
             else
-                liveIntervals.push_back(std::make_pair(start, end));
+                liveIntervals.emplace_back(start, end);
         }
     }
 }
@@ -7330,6 +7592,7 @@ bool G4_INST::mayExpandToAccMacro() const
 
     return opcode() == G4_mach ||
            opcode() == G4_mulh ||
+           opcode() == G4_madw ||
            isDMul(this) ||
            mayBeMAC(this) ||
            (opcode() == G4_pln && !builder.doPlane());
@@ -7340,6 +7603,7 @@ bool G4_INST::canExecSizeBeAcc(Gen4_Operand_Number opndNum) const
     switch (dst->getType())
     {
     case Type_HF:
+    case Type_BF:
         if (builder.relaxedACCRestrictions())
         {
             if (!((isMixedMode() && getExecSize() == g4::SIMD8) ||
@@ -7504,6 +7768,19 @@ bool G4_INST::canDstBeAcc() const
         // disable for now since it's causing some SKL tests to fail
         return false;
     case G4_mov:
+        if (builder.hasFormatConversionACCRestrictions())
+        {
+            const bool allowedICombination = (IS_DTYPE(getSrc(0)->getType()) || getSrc(0)->getType() == Type_W || getSrc(0)->getType() == Type_UW) &&
+                (IS_DTYPE(dst->getType()) || dst->getType() == Type_W || dst->getType() == Type_UW);
+            const bool allowedFCombination = (getSrc(0)->getType() == Type_F || getSrc(0)->getType() == Type_HF) &&
+                (dst->getType() == Type_F || dst->getType() == Type_HF);
+            const bool allowedDFCombination = getSrc(0)->getType() == Type_DF &&
+                dst->getType() == Type_DF;
+            if (!allowedICombination && !allowedFCombination && !allowedDFCombination)
+            {
+                return false;
+            }
+        }
         return builder.relaxedACCRestrictions() || !getSrc(0)->isAccReg();
     case G4_pln:
         // we can't use acc if plane will be expanded
@@ -7515,6 +7792,9 @@ bool G4_INST::canDstBeAcc() const
         return builder.canMadHaveAcc();
     case G4_dp4a:
         return builder.relaxedACCRestrictions2();
+    case G4_bfn:
+    case G4_add3:
+        return true;
     default:
         return false;
     }
@@ -7568,6 +7848,7 @@ bool G4_INST::canSrcBeAcc(Gen4_Operand_Number opndNum) const
     // dst must be GRF-aligned
     if ((getDst()->getLinearizedStart() % numEltPerGRF<Type_UB>()) != 0)
     {
+        if (!(isMixedMode() && builder.getPlatform() == XeHP_SDV))
             return false;
     }
 
@@ -7638,6 +7919,19 @@ bool G4_INST::canSrcBeAcc(Gen4_Operand_Number opndNum) const
     case G4_ror:
         return true;
     case G4_mov:
+        if (builder.hasFormatConversionACCRestrictions())
+        {
+            const bool allowedICombination = (IS_DTYPE(src->getType()) || src->getType() == Type_W || src->getType() == Type_UW) &&
+                (IS_DTYPE(dst->getType()) || dst->getType() == Type_W || dst->getType() == Type_UW);
+            const bool allowedFCombination = (src->getType() == Type_F || src->getType() == Type_HF) &&
+                (dst->getType() == Type_F || dst->getType() == Type_HF);
+            const bool allowedDFCombination = src->getType() == Type_DF &&
+                dst->getType() == Type_DF;
+            if (!allowedICombination && !allowedFCombination && !allowedDFCombination)
+            {
+                return false;
+            }
+        }
         return builder.relaxedACCRestrictions() || !getDst()->isAccReg();
     case G4_madm:
         return builder.useAccForMadm();
@@ -7661,9 +7955,17 @@ bool G4_INST::canSrcBeAcc(Gen4_Operand_Number opndNum) const
         return builder.doPlane() && src->getModifier() == Mod_src_undef;
     case G4_dp4a:
         return builder.relaxedACCRestrictions2();
+    case G4_bfn:
+    case G4_add3:
+        return true;
     default:
         return false;
     }
+}
+
+TARGET_PLATFORM G4_INST::getPlatform() const
+{
+    return builder.getPlatform();
 }
 
 G4_INST* G4_INST::cloneInst()
@@ -7864,6 +8166,121 @@ G4_INST* G4_InstMath::cloneInst()
         dst, src0, src1, getMathCtrl(), option);
 }
 
+G4_INST* G4_InstBfn::cloneInst()
+{
+    auto nonConstBuilder = const_cast<IR_Builder*>(&builder);
+    auto prd = nonConstBuilder->duplicateOperand(getPredicate());
+    auto condMod = nonConstBuilder->duplicateOperand(getCondMod());
+    auto dst = nonConstBuilder->duplicateOperand(getDst());
+    auto src0 = nonConstBuilder->duplicateOperand(getSrc(0));
+    auto src1 = nonConstBuilder->duplicateOperand(getSrc(1));
+    auto src2 = nonConstBuilder->duplicateOperand(getSrc(2));
+    return nonConstBuilder->createInternalBfnInst(
+        getBooleanFuncCtrl(), prd, condMod, getSaturate(), getExecSize(),
+        dst, src0, src1, src2, option);
+}
+
+G4_INST* G4_InstDpas::cloneInst()
+{
+    auto nonConstBuilder = const_cast<IR_Builder*>(&builder);
+    auto dst = nonConstBuilder->duplicateOperand(getDst());
+    auto src0 = nonConstBuilder->duplicateOperand(getSrc(0));
+    auto src1 = nonConstBuilder->duplicateOperand(getSrc(1));
+    auto src2 = nonConstBuilder->duplicateOperand(getSrc(2));
+    auto src3 = nonConstBuilder->duplicateOperand(getSrc(3));
+    return nonConstBuilder->createInternalDpasInst(
+        op, getExecSize(),
+        dst, src0, src1, src2, src3, option,
+        getSrc2Precision(), getSrc1Precision(), getSystolicDepth(), getRepeatCount());
+}
+
+bool G4_InstDpas::isInt() const
+{
+    // Check Src1 is enough.
+    switch (Src1Precision)
+    {
+    case GenPrecision::S8:
+    case GenPrecision::U8:
+    case GenPrecision::S4:
+    case GenPrecision::U4:
+    case GenPrecision::S2:
+    case GenPrecision::U2:
+        return true;
+    default:
+        break;
+    }
+    return false;
+}
+
+bool G4_InstDpas::is2xInt8() const
+{
+    if ((Src1Precision == GenPrecision::S4 || Src1Precision == GenPrecision::U4 ||
+         Src1Precision == GenPrecision::S2 || Src1Precision == GenPrecision::U2)
+        &&
+        (Src2Precision == GenPrecision::S4 || Src2Precision == GenPrecision::U4 ||
+         Src2Precision == GenPrecision::S2 || Src2Precision == GenPrecision::U2))
+    {
+        return true;
+    }
+    return false;
+}
+
+uint8_t G4_InstDpas::getOpsPerChan() const
+{
+    if (isBF16() || isFP16())
+        return OPS_PER_CHAN_2;
+    else if (is2xInt8())
+        return OPS_PER_CHAN_8;
+    // int8
+    return OPS_PER_CHAN_4;
+}
+
+void G4_InstDpas::computeRightBound(G4_Operand* opnd)
+{
+    associateOpndWithInst(opnd, this);
+    if (opnd && !opnd->isImm() && !opnd->isNullReg())
+    {
+        G4_InstDpas* dpasInst = asDpasInst();
+        uint8_t D = dpasInst->getSystolicDepth();
+        uint8_t C = dpasInst->getRepeatCount();
+
+        auto computeDpasOperandBound = [](G4_Operand* opnd, unsigned leftBound, unsigned rightBound)
+        {
+            unsigned NBytes = rightBound - leftBound + 1;
+            opnd->setBitVecFromSize(NBytes);
+            opnd->setRightBound(rightBound);
+        };
+
+        if (opnd == dst || (opnd == srcs[0] && !opnd->isNullReg()))
+        {
+            // dst and src0 are always packed, and RB is exec_size * type_size * rep_count
+            auto opndSize = builder.getNativeExecSize() * opnd->getTypeSize() * C;
+            computeDpasOperandBound(opnd, opnd->left_bound, opnd->left_bound + opndSize - 1);
+        }
+        else if (opnd == srcs[1])
+        {
+            uint32_t bytesPerLane = dpasInst->getSrc1SizePerLaneInByte();
+            uint8_t src1_D = D;
+
+            // Each lanes needs (src1_D * bytesPerLane) bytes, and it's multiple of DW!
+            uint32_t bytesPerLaneForAllDepth = bytesPerLane * src1_D;
+            bytesPerLaneForAllDepth = ((bytesPerLaneForAllDepth + 3) / 4) * 4;
+
+            uint32_t bytes = bytesPerLaneForAllDepth * builder.getNativeExecSize();
+            computeDpasOperandBound(opnd, opnd->left_bound, opnd->left_bound + bytes - 1);
+        }
+        else if (opnd == srcs[2])
+        {
+            // src2 is uniform.
+            uint32_t bytesPerLane = dpasInst->getSrc2SizePerLaneInByte();
+            uint32_t bytes = bytesPerLane * D * C;
+            if (op == G4_dpasw) {
+                bytes = bytesPerLane * D * ((C + 1) / 2);
+            }
+            computeDpasOperandBound(opnd, opnd->left_bound, opnd->left_bound + bytes - 1);
+        }
+    }
+}
 
 void G4_INST::inheritDIFrom(const G4_INST* inst)
 {
@@ -7878,6 +8295,7 @@ void G4_INST::inheritSWSBFrom(const G4_INST* inst)
     setDistance(inst->getDistance());
     setLexicalId(inst->getLexicalId());
 
+    setDistanceTypeXe(inst->getDistanceTypeXe());
     unsigned short token = inst->getToken();
     setToken(token);
     SWSBTokenType type = inst->getTokenType();

@@ -13,6 +13,7 @@ SPDX-License-Identifier: MIT
 #include "common/LLVMWarningsPush.hpp"
 #include <llvm/Pass.h>
 #include <llvm/IR/DataLayout.h>
+#include <llvm/ADT/MapVector.h>
 #include "common/LLVMWarningsPop.hpp"
 
 namespace IGC
@@ -52,7 +53,7 @@ namespace IGC
 
     protected:
         typedef std::vector<unsigned char> DataVector;
-        typedef std::map<llvm::GlobalVariable*, int> BufferOffsetMap;
+        typedef llvm::MapVector<llvm::GlobalVariable*, int> BufferOffsetMap;
 
         struct PointerOffsetInfo
         {
@@ -88,10 +89,6 @@ namespace IGC
 
         const llvm::DataLayout* m_DL;
         ModuleMetaData* m_pModuleMd;
-
-        // Used to patch offsets for zero initialized globals
-        typedef std::tuple<char*, unsigned, llvm::GlobalVariable*, uint64_t> ZeroInitPatchInfo;
-        std::vector<ZeroInitPatchInfo> m_PatchLaterDataVector;
     };
 
 } // namespace IGC

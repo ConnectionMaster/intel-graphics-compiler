@@ -1,24 +1,8 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (c) 2020-2021 Intel Corporation
+Copyright (C) 2020-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"),
-to deal in the Software without restriction, including without limitation
-the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom
-the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-IN THE SOFTWARE.
+SPDX-License-Identifier: MIT
 
 ============================= end_copyright_notice ===========================*/
 
@@ -98,7 +82,7 @@ static void deducePayloadSizes(
             dlen *= mi.elemsPerAddr;
         }
         //
-        const auto &opInfo = lookupSendOpInfo(mi.op);
+        const auto &opInfo = lookupSendOp(mi.op);
         lens.src0Len = numAddrRegsForVector();
         if (opInfo.isLoad()) {
             lens.dstLen = dlen;
@@ -113,7 +97,7 @@ static void deducePayloadSizes(
             IGA_ASSERT_FALSE("invalid message type");
         }
     };
-    lens.uvrlod = mi.hasAttr(MessageInfo::TYPED);
+    lens.uvrlod = mi.hasAttr(MessageInfo::Attr::TYPED);
 
     switch (mi.op) {
     ///////////////////////////////////////////////////////////////////////
@@ -169,11 +153,14 @@ static void deducePayloadSizes(
         handleVectorMessage(2);
         break;
     ///////////////////////////////////////////////////////////////////////
-    // control messages that are 0, 1, 0
+    // barrier is 1, 1, 0 until XeHP
     case SendOp::BARRIER:
+        message(p < Platform::XE_HP ? 1 : 0, 1, 0);
+        break;
+    // other control messages that are 0, 1, 0
     case SendOp::MONITOR:
     case SendOp::UNMONITOR:
-    case SendOp::SIGNAL_EVENT:
+    case SendOp::SIGNAL:
     case SendOp::EOT:
         message();
         break;
@@ -311,16 +298,16 @@ std::string MessageSyntax::sym() const
 }
 
 
-static constexpr SendOpInfo SEND_OPS[] {
-#define DEFINE_SEND_OP(ENUM, MNE, ATTRS) \
-    SendOpInfo(SendOp::ENUM, MNE, ATTRS),
+static constexpr SendOpDefinition SEND_OPS[] {
+#define DEFINE_SEND_OP(ENUM, MNE, DESC, ATTRS) \
+    {SendOp::ENUM, MNE, DESC, ATTRS},
 #include "EnumSendOpInfo.hpp"
 #undef DEFINE_SEND_OP
 };
 
 std::string iga::ToSyntax(SendOp op)
 {
-    const auto &opInfo = lookupSendOpInfo(op);
+    const auto &opInfo = lookupSendOp(op);
     if (opInfo.isValid()) {
         return opInfo.mnemonic;
     } else {
@@ -332,6 +319,7 @@ std::string iga::ToSymbol(CacheOpt op)
 {
 #define MK_CASE(X) case CacheOpt::X: return #X
     switch (op) {
+    MK_CASE(INVALID);
     MK_CASE(DEFAULT);
     MK_CASE(READINVALIDATE);
     MK_CASE(CACHED);
@@ -348,6 +336,7 @@ std::string iga::ToSymbol(AddrType op)
 {
 #define MK_CASE(X) case AddrType::X: return #X
     switch (op) {
+    MK_CASE(INVALID);
     MK_CASE(FLAT);
     MK_CASE(BTI);
     default:
@@ -383,7 +372,7 @@ static void postProcessDecode(
     DecodeResult &result, DecodedDescFields *fields)
 {
     if (!result.errors.empty())
-        result.info.attributeSet |= MessageInfo::VALID;
+        result.info.attributeSet |= MessageInfo::Attr::VALID;
     if (fields) {
         std::sort(result.fields.begin(), result.fields.end(),
             [&] (const auto &f1, const auto &f2) {
@@ -483,7 +472,7 @@ DecodeResult iga::tryDecode(
     return result;
 }
 
-const SendOpInfo &iga::lookupSendOpInfo(SendOp op)
+const SendOpDefinition &iga::lookupSendOp(SendOp op)
 {
     for (int i = 0; i < sizeof(SEND_OPS)/sizeof(SEND_OPS[0]); i++) {
         if (op == SEND_OPS[i].op) {
@@ -491,72 +480,11 @@ const SendOpInfo &iga::lookupSendOpInfo(SendOp op)
         }
     }
 
-    static constexpr SendOpInfo INVALID(SendOp::INVALID, "?");
+    static constexpr SendOpDefinition INVALID(SendOp::INVALID, "?", "?");
     return INVALID;
-/*
-    SendOpInfo soi {false, -1, false};
-
-    switch (op) {
-    case SendOp::LOAD_STRIDED:
-    case SendOp::STORE_STRIDED:
-    case SendOp::READ_STATE:
-        soi.isSingleRegAddr = true;
-    default: break;
-    }
-
-    if (SendOpIsLoad(op)) {
-        soi.hasDst = true;
-        soi.src1Args = 0;
-    } else if (SendOpIsStore(op)) {
-        soi.hasDst = false;
-        soi.src1Args = 1;
-    } else {
-        auto atomic = [&](int args) {
-            soi.hasDst = true;
-            soi.src1Args = args;
-        };
-
-        switch (op) {
-        case SendOp::ATOMIC_LOAD:
-        case SendOp::ATOMIC_IINC:
-        case SendOp::ATOMIC_IDEC:
-        case SendOp::ATOMIC_IPDEC:
-            atomic(0);
-            break;
-        case SendOp::ATOMIC_STORE:
-        case SendOp::ATOMIC_AND:
-        case SendOp::ATOMIC_XOR:
-        case SendOp::ATOMIC_OR:
-        case SendOp::ATOMIC_IADD:
-        case SendOp::ATOMIC_ISUB:
-        case SendOp::ATOMIC_IRSUB:
-        case SendOp::ATOMIC_SMIN:
-        case SendOp::ATOMIC_SMAX:
-        case SendOp::ATOMIC_UMIN:
-        case SendOp::ATOMIC_UMAX:
-        case SendOp::ATOMIC_FADD:
-        case SendOp::ATOMIC_FSUB:
-        case SendOp::ATOMIC_FMIN:
-        case SendOp::ATOMIC_FMAX:
-            atomic(1);
-            break;
-        case SendOp::ATOMIC_ICAS:
-        case SendOp::ATOMIC_FCAS:
-            atomic(2);
-            break;
-        case SendOp::FENCE:
-            // some fences have dstinations...
-            soi.hasDst = false;
-            break;
-        default: break;
-        }
-    }
-
-    return soi;
-*/
 }
 
-const SendOpInfo &iga::lookupSendOpInfo(const char *mnemonic)
+const SendOpDefinition &iga::lookupSendOp(const char *mnemonic)
 {
     std::string mne = mnemonic;
     for (int i = 0; i < sizeof(SEND_OPS)/sizeof(SEND_OPS[0]); i++) {
@@ -565,7 +493,7 @@ const SendOpInfo &iga::lookupSendOpInfo(const char *mnemonic)
         }
     }
 
-    static constexpr SendOpInfo INVALID(SendOp::INVALID, "?");
+    static constexpr SendOpDefinition INVALID(SendOp::INVALID, "?", "?");
     return INVALID;
 }
 
@@ -580,7 +508,7 @@ bool iga::sendOpSupportsSyntax(Platform p, SendOp op, SFID sfid)
         op == SendOp::STORE ||
         op == SendOp::STORE_STRIDED ||
         op == SendOp::STORE_QUAD ||
-        lookupSendOpInfo(op).isAtomic();
+        lookupSendOp(op).isAtomic();
     return supported;
 }
 

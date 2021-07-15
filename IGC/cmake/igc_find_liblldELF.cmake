@@ -1,43 +1,61 @@
 #=========================== begin_copyright_notice ============================
 #
-# Copyright (c) 2021 Intel Corporation
+# Copyright (C) 2021 Intel Corporation
 #
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"),
-# to deal in the Software without restriction, including without limitation
-# the rights to use, copy, modify, merge, publish, distribute, sublicense,
-# and/or sell copies of the Software, and to permit persons to whom
-# the Software is furnished to do so, subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be included
-# in all copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-# IN THE SOFTWARE.
+# SPDX-License-Identifier: MIT
 #
 #============================ end_copyright_notice =============================
 
 #   IGC_OPTION__LLDELF_LIB_DIR - Specify additional directories for searching lldELF library
 #   IGC_OPTION__LLDELF_H_DIR - Specify additional directories for searching lldELF headers
 
+function(add_lld_library LIB_NAME)
+  find_library(${LIB_NAME}_PATH
+    ${LIB_NAME}
+    PATHS "${IGC_OPTION__LLDELF_LIB_DIR}"
+    PATH_SUFFIXES "llvm-${LLVM_VERSION_MAJOR}/lib")
+
+  if(${LIB_NAME}_PATH-NOTFOUND)
+    message(FATAL_ERROR
+    "Cannot find ${LIB_NAME} library, please install missing library or provide the path by IGC_OPTION__LLDELF_LIB_DIR")
+  endif()
+  add_library(${LIB_NAME} UNKNOWN IMPORTED GLOBAL)
+  set_target_properties(${LIB_NAME} PROPERTIES IMPORTED_LOCATION ${${LIB_NAME}_PATH})
+endfunction()
+
 if(IGC_BUILD__LLVM_SOURCES)
   get_target_property(lldELF_SRC_DIR lldELF SOURCE_DIR)
   set(LLD_INCLUDE_DIR "${lldELF_SRC_DIR}/../include")
 elseif(IGC_BUILD__LLVM_PREBUILDS)
-  find_library(lldELF
-    lldELF
-    PATHS "${IGC_OPTION__LLDELF_LIB_DIR}"
-    PATH_SUFFIXES "llvm-${LLVM_VERSION_MAJOR}/lib")
-
-  if(lldELF-NOTFOUND)
-    message(FATAL_ERROR
-    "Cannot find lldELF library, please install missing library or provide the path by IGC_OPTION__LLDELF_LIB_DIR")
-  endif()
+  add_lld_library(lldELF)
+  add_lld_library(lldCommon)
+  igc_get_llvm_targets(LLD_COMMON_LLVM_DEPS
+    Codegen
+    Core
+    DebugInfoDWARF
+    Demangle
+    MC
+    Option
+    Support
+    Target)
+  igc_get_llvm_targets(LLD_ELF_LLVM_DEPS
+    ${LLVM_TARGETS_TO_BUILD}
+    BinaryFormat
+    BitWriter
+    Core
+    DebugInfoDWARF
+    Demangle
+    LTO
+    MC
+    Object
+    Option
+    Passes
+    Support)
+  target_link_libraries(lldCommon INTERFACE
+    ${LLD_COMMON_LLVM_DEPS})
+  target_link_libraries(lldELF INTERFACE
+    ${LLD_ELF_LLVM_DEPS}
+    lldCommon)
 
   find_path(
     LLD_INCLUDE_DIR

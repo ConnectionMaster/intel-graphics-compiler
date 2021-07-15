@@ -1,28 +1,10 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2020-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
+============================= end_copyright_notice ===========================*/
 
 #include <cmath>
 #include "AccSubstitution.h"
@@ -51,8 +33,7 @@ struct AccInterval
         }
     }
 
-    double getSpillCost()
-    {
+    double getSpillCost() const {
         if (isPreAssigned)
         {
             // don't spill pre-assigned
@@ -60,7 +41,8 @@ struct AccInterval
         }
         int dist = lastUse - inst->getLocalId();
 
-        return std::pow((double)inst->use_size(), 3) / dist;
+        //Bundle conflict has higher priority than bank conflict. Because bundle conflict means bank conflict at the same time.
+        return (std::pow((double)(bundleConflictTimes + 1), 3) + std::pow((double)(bankConflictTimes + 1), 2) + std::pow((double)inst->use_size(), 3) / dist) / (suppressionTimes + 1);
     }
 
     // see if this interval needs both halves of the acc
@@ -71,6 +53,7 @@ struct AccInterval
         case Type_F:
             return inst->getExecSize() == G4_ExecSize(builder.getNativeExecSize() * 2);
         case Type_HF:
+        case Type_BF:
             return false;
         case Type_DF:
             return inst->getExecSize() > G4_ExecSize(builder.getNativeExecSize() / 2);
@@ -698,7 +681,18 @@ bool AccSubPass::replaceDstWithAcc(G4_INST* inst, int accNum)
         G4_SrcRegRegion* accSrc = builder.createSrcRegRegion(oldSrc->getModifier(), Direct,
             accReg, (short)accNum, 0, builder.getRegionStride1(), dst->getType());
         accSrc->setAccRegSel(oldSrc->getAccRegSel());
-        if (useInst->opcode() == G4_mad && srcId == 0 && !builder.canMadHaveSrc0Acc())
+
+        bool canReplaceToMac = useInst->opcode() == G4_mad && srcId == 0 && !builder.canMadHaveSrc0Acc();
+        if (canReplaceToMac && builder.noDFTypeMac()) {
+            // dst and all src cannot be DF
+            if ((useInst->getDst() && IS_DFTYPE(useInst->getDst()->getType())) ||
+                (useInst->getSrc(0) && IS_DFTYPE(useInst->getSrc(0)->getType())) ||
+                (useInst->getSrc(1) && IS_DFTYPE(useInst->getSrc(1)->getType())) ||
+                (useInst->getSrc(2) && IS_DFTYPE(useInst->getSrc(2)->getType())))
+                canReplaceToMac = false;
+        }
+
+        if (canReplaceToMac)
         {
             // change mad to mac as src0 of 3-src does not support acc
             auto updateDefSrcPos = [](G4_INST* useInst, Gen4_Operand_Number origPos)
@@ -869,6 +863,23 @@ void AccSubPass::multiAccSub(G4_BB* bb)
     std::vector<AccInterval*> spillIntervals;
 
     std::map<G4_INST*, unsigned int> BCInfo;
+
+    if (builder.getPlatform() == XeHP_SDV)
+    {
+        int suppressRegs[4];
+        for (int i = 0; i < 3; i++)
+        {
+            suppressRegs[i] = -1;
+        }
+        suppressRegs[3] = -1;
+
+        //Do bank conflict analysis for the BB
+        for (auto instIter = bb->begin(), instEnd = bb->end(); instIter != instEnd; ++instIter)
+        {
+            G4_INST* inst = *instIter;
+            bankConflictAnalysisTGL(inst, suppressRegs, &BCInfo);
+        }
+    }
 
     //build intervals for potential acc candidates as well as pre-existing acc uses from mac/mach/addc/etc
     for (auto instIter = bb->begin(), instEnd = bb->end(); instIter != instEnd; ++instIter)

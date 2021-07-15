@@ -1,28 +1,10 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2017-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
+============================= end_copyright_notice ===========================*/
 
 #ifndef __SPILLCODE_H__
 #define __SPILLCODE_H__
@@ -53,7 +35,7 @@ class SpillManager
     const LIVERANGE_LIST & spilledLRs;
 
     // id for newly created address or flag variables
-    uint32_t origTempDclId;
+    const uint32_t origTempDclId;
     uint32_t tempDclId;
 
     // The number of flag spill store inserted.
@@ -78,14 +60,12 @@ class SpillManager
     void replaceSpilledDst(G4_BB* bb,
                            INST_LIST_ITER it, // where new insts will be inserted
                            G4_INST*       inst,
-                           PointsToAnalysis& pointsToAnalysis,
                            G4_Operand ** operands_analyzed,
                            G4_Declare ** declares_created);
     void replaceSpilledSrc(G4_BB* bb,
                            INST_LIST_ITER it, // where new insts will be inserted
                            G4_INST*       inst,
                            unsigned       i,
-                           PointsToAnalysis& pointsToAnalysis,
                            G4_Operand ** operands_analyzed,
                            G4_Declare ** declares_created);
     void replaceSpilledPredicate(G4_BB* bb,
@@ -95,7 +75,7 @@ class SpillManager
                            INST_LIST_ITER it,
                            G4_INST*       inst);
 
-    void createSpillLocations(G4_Kernel& kernel);
+    void createSpillLocations(const G4_Kernel& kernel);
 
 public:
 

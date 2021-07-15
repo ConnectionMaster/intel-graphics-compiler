@@ -1,30 +1,13 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
+============================= end_copyright_notice ===========================*/
 
 #include "SplitAlignedScalars.h"
+#include "G4_Opcode.h"
 
 using namespace vISA;
 
@@ -39,7 +22,8 @@ bool SplitAlignedScalars::canReplaceDst(G4_INST* inst)
         inst->isMath() ||
         inst->isArithmetic() ||
         inst->isLogic() ||
-        inst->isCompare())
+        inst->isCompare() ||
+        inst->isPseudoKill())
     {
         return true;
     }
@@ -59,7 +43,8 @@ bool SplitAlignedScalars::canReplaceSrc(G4_INST* inst, unsigned int idx)
         inst->isArithmetic() ||
         inst->isLogic() ||
         inst->isCompare() ||
-        opcode == G4_mad)
+        opcode == G4_mad ||
+        inst->isPseudoUse())
     {
         return true;
     }
@@ -87,8 +72,53 @@ void SplitAlignedScalars::gatherCandidates()
                     Data.numDefs++;
                     if (Data.firstDef == 0)
                         Data.firstDef = lexId;
-                    if (inst->isSend())
-                        Data.isSendDst = true;
+
+                    // disallow cases where scalar def has predicate
+                    if (inst->getPredicate())
+                    {
+                        Data.allowed = false;
+                    }
+
+                    // send dst is scalar. disallow it's replacement
+                    // if bb has few instructions than threshold as
+                    // a copy after the send will cause stalls that
+                    // cannot be hidden by scheduler.
+                    if (inst->isSend() && bb->size() <= MinBBSize)
+                    {
+                        Data.allowed = false;
+                    }
+
+                    auto dstDcl = dst->asDstRegRegion()->getBase()->asRegVar()->getDeclare();
+                    if (dstDcl->getAliasDeclare())
+                    {
+                        // disallow case where topdcl is scalar, but alias dcl
+                        // is not a scalar as it may be smaller in size. for eg,
+                        // topdcl may be :uq and alias may be of type :ud.
+                        if (dstDcl->getByteSize() != dstTopDcl->getByteSize())
+                            Data.allowed = false;
+                    }
+
+                    if (dst->getHorzStride() != 1)
+                    {
+                        // dst hstride != 1 to accommodate some alignment restriction
+                        Data.allowed = false;
+                    }
+
+                    if (!inst->isSend())
+                    {
+                        // check whether dst type size >= src type size
+                        // disallow optimization if dst type is smaller
+                        // than src as that entails alignmment requirements
+                        // that this pass may not honor.
+                        for (unsigned int i = 0; i != inst->getNumSrc(); ++i)
+                        {
+                            auto src = inst->getSrc(i);
+                            if (!src->isSrcRegRegion())
+                                continue;
+                            if (dst->getTypeSize() < src->getTypeSize())
+                                Data.allowed = false;
+                        }
+                    }
                 }
             }
 
@@ -114,11 +144,16 @@ void SplitAlignedScalars::gatherCandidates()
 
 bool SplitAlignedScalars::isDclCandidate(G4_Declare* dcl)
 {
-    if (dcl->getNumElems() == 1 &&
+    if (dcl->getRegFile() == G4_RegFileKind::G4_GRF &&
+        dcl->getNumElems() == 1 &&
         !dcl->getAddressed() &&
         !dcl->getIsPartialDcl() &&
         !dcl->getRegVar()->isPhyRegAssigned() &&
         !dcl->getAliasDeclare() &&
+        !dcl->isInput() &&
+        !dcl->isOutput() &&
+        !dcl->isPayloadLiveOut() &&
+        !dcl->isDoNotSpill() &&
         gra.getSubRegAlign(dcl) == GRFALIGN)
         return true;
     return false;
@@ -129,11 +164,10 @@ bool SplitAlignedScalars::heuristic(G4_Declare* dcl, Data& d)
     if (d.getDUMaxDist() < MinOptDist)
         return false;
 
-    //if (d.isSendDst)
-    //{
-        // disallow send dst to be replaced as a mov immediately after it in small BBs can cause latency problems
-        //return false;
-    //}
+    if (!d.allowed)
+    {
+        return false;
+    }
 
     return true;
 }
@@ -153,7 +187,7 @@ G4_Declare* SplitAlignedScalars::getDclForRgn(T* rgn, G4_Declare* newTopDcl)
         return newTopDcl;
 
     auto newAliasDcl = kernel.fg.builder->createTempVar(rgnDcl->getNumElems(),
-        rgnDcl->getElemType(), rgnDcl->getSubRegAlign(), "SPLITSCALAR");
+        rgnDcl->getElemType(), rgnDcl->getSubRegAlign());
     newAliasDcl->setAliasDeclare(newTopDcl, rgnDcl->getOffsetFromBase());
 
     return newAliasDcl;
@@ -167,10 +201,21 @@ void SplitAlignedScalars::run()
         if (newTopDcl == nullptr)
         {
             newTopDcl = kernel.fg.builder->createTempVar(oldDcl->getNumElems(),
-                oldDcl->getElemType(), G4_SubReg_Align::Any, "SPLITSCALAR");
+                oldDcl->getElemType(), G4_SubReg_Align::Any);
             oldNewDcls[oldDcl] = newTopDcl;
         }
         return newTopDcl;
+    };
+
+    auto getTypeExecSize = [&](G4_Type type)
+    {
+        if (TypeSize(type) < 8)
+            return std::make_tuple(1, type);
+
+        if (kernel.fg.builder->noInt64())
+            return std::make_tuple(2, Type_UD);
+
+        return std::make_tuple(1, Type_UQ);
     };
 
     gatherCandidates();
@@ -195,6 +240,7 @@ void SplitAlignedScalars::run()
         {
             auto newInstIt = instIt;
             auto inst = (*instIt);
+
             auto dst = inst->getDst();
             if (dst &&
                 oldNewDcls.find(dst->getTopDcl()) != oldNewDcls.end())
@@ -222,21 +268,28 @@ void SplitAlignedScalars::run()
                     inst->setDest(dstRgn);
 
                     // emit copy to store data to original non-aligned scalar
+                    unsigned int execSize = 1;
+                    G4_Type typeToUse = Type_UD;
+                    std::tie(execSize, typeToUse) = getTypeExecSize(dst->getType());
+
                     auto src = kernel.fg.builder->createSrc(dstRgn->getBase(), dstRgn->getRegOff(),
-                        dstRgn->getSubRegOff(), inst->getExecSize() == g4::SIMD1 ? kernel.fg.builder->getRegionScalar() :
-                        kernel.fg.builder->createRegionDesc(dstRgn->getHorzStride() * inst->getExecSize(),
-                            dstRgn->getHorzStride(), inst->getExecSize()),
-                        dstRgn->getType());
+                        dstRgn->getSubRegOff(), execSize == g4::SIMD1 ? kernel.fg.builder->getRegionScalar() :
+                        kernel.fg.builder->getRegionStride1(), typeToUse);
                     auto dstRgnOfCopy = kernel.fg.builder->createDst(newDcl->getRegVar(),
-                        dst->getRegOff(), dst->getSubRegOff(), dst->getHorzStride(), dst->getType());
+                        dst->getRegOff(), dst->getSubRegOff(), dst->getHorzStride(), typeToUse);
 
                     G4_Predicate* dupPred = nullptr;
                     if(inst->getPredicate())
                         dupPred = kernel.fg.builder->createPredicate(*inst->getPredicate());
                     auto newInst = kernel.fg.builder->createInternalInst(dupPred, G4_mov, nullptr,
-                        g4::NOSAT, inst->getExecSize(), dstRgnOfCopy, src, nullptr, InstOpt_WriteEnable);
+                        g4::NOSAT, G4_ExecSize(execSize), dstRgnOfCopy, src, nullptr, InstOpt_WriteEnable);
                     newInstIt = bb->insertAfter(instIt, newInst);
+
+                    gra.addNoRemat(newInst);
+
+                    numMovsAdded++;
                 }
+                changesMade = true;
             }
 
             for (unsigned int i = 0; i != inst->getNumSrc(); ++i)
@@ -267,11 +320,16 @@ void SplitAlignedScalars::run()
                             oldTopDcl->getSubRegAlign());
                         newAlignedTmpTopDcl->copyAlign(oldTopDcl);
 
+                        unsigned int execSize = 1;
+                        G4_Type typeToUse = Type_UD;
+                        std::tie(execSize, typeToUse) = getTypeExecSize(srcRgn->getType());
+
                         // copy oldDcl in to newAlignedTmpTopDcl
-                        auto tmpDst = kernel.fg.builder->createDst(newAlignedTmpTopDcl->getRegVar(), oldTopDcl->getElemType());
-                        auto src = kernel.fg.builder->createSrc(newTopDcl->getRegVar(), 0, 0, kernel.fg.builder->getRegionScalar(),
-                            oldTopDcl->getElemType());
-                        auto copy = kernel.fg.builder->createMov(g4::SIMD1, tmpDst, src, InstOpt_WriteEnable, false);
+                        auto tmpDst = kernel.fg.builder->createDst(newAlignedTmpTopDcl->getRegVar(), typeToUse);
+                        auto src = kernel.fg.builder->createSrc(newTopDcl->getRegVar(), 0, 0,
+                            execSize == 1 ? kernel.fg.builder->getRegionScalar() : kernel.fg.builder->getRegionStride1(),
+                            typeToUse);
+                        auto copy = kernel.fg.builder->createMov(G4_ExecSize(execSize), tmpDst, src, InstOpt_WriteEnable, false);
 
                         // now create src out of tmpDst
                         auto dclToUse = getDclForRgn(srcRgn, newAlignedTmpTopDcl);
@@ -280,7 +338,13 @@ void SplitAlignedScalars::run()
                             dclToUse->getRegVar(), srcRgn->getRegOff(), srcRgn->getSubRegOff(), srcRgn->getRegion(), srcRgn->getType());
                         inst->setSrc(newAlignedSrc, i);
                         bb->insertBefore(instIt, copy);
+
+                        // this copy shouldnt be rematerialized
+                        gra.addNoRemat(copy);
+
+                        numMovsAdded++;
                     }
+                    changesMade = true;
                 }
             }
 
@@ -292,4 +356,5 @@ void SplitAlignedScalars::run()
 void SplitAlignedScalars::dump(std::ostream& os)
 {
     os << "# GRF aligned scalar dcls replaced: " << numDclsReplaced << std::endl;
+    os << "# movs added: " << numMovsAdded << std::endl;
 }

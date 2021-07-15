@@ -1,28 +1,10 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2017-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
+============================= end_copyright_notice ===========================*/
 
 #include "LocalRA.h"
 #include "RegAlloc.h"
@@ -184,7 +166,6 @@ void LocalRA::preLocalRAAnalysis()
         unsigned reserveSpillSize = 0;
         unsigned int spillRegSize = 0;
         unsigned int indrSpillRegSize = 0;
-        LivenessAnalysis liveAnalysis(gra, G4_GRF | G4_INPUT);
         gra.determineSpillRegSize(spillRegSize, indrSpillRegSize);
 
         reserveSpillSize = spillRegSize + indrSpillRegSize;
@@ -196,7 +177,7 @@ void LocalRA::preLocalRAAnalysis()
         }
         else
         {
-            numRegLRA = numGRF - numRowsReserved - reserveSpillSize - 1;
+            numRegLRA = numGRF - numRowsReserved - reserveSpillSize - 3; // spill Header, scratch offset, a0.2
         }
     }
     else
@@ -319,7 +300,7 @@ void LocalRA::trivialAssignRA(bool& needGlobalRA, bool threeSourceCandidate)
         std::cout << "\t--trivial RA\n";
     }
 
-    needGlobalRA = assignUniqueRegisters(threeSourceCandidate, builder.lowHighBundle());
+    needGlobalRA = assignUniqueRegisters(threeSourceCandidate, builder.lowHighBundle(), false);
 
     if (!needGlobalRA)
     {
@@ -421,7 +402,7 @@ bool LocalRA::localRAPass(bool doRoundRobin, bool doSplitLLR)
             twoBanksAssign = highInternalConflict;
         }
 
-        needGlobalRA = assignUniqueRegisters(doBCR, twoBanksAssign);
+        needGlobalRA = assignUniqueRegisters(doBCR, twoBanksAssign, builder.getOption(vISA_HybridRAWithSpill) && !doRoundRobin);
     }
 
     if (needGlobalRA && doRoundRobin)
@@ -524,6 +505,14 @@ bool LocalRA::localRA()
                 std::cout << "\t--first-fit " << "RA\n";
             }
             globalLRSize = 0;
+            if (builder.getOption(vISA_HybridRAWithSpill))
+            {
+                countLiveIntervals();
+            }
+            else
+            {
+                globalLRSize = 0;
+            }
             evenAlign();
             needGlobalRA = localRAPass(false, doSplitLLR);
         }
@@ -711,12 +700,20 @@ inline static unsigned short getOccupiedBundle(IR_Builder& builder, GlobalRA& gr
     unsigned int evenBankNum = 0;
     unsigned int oddBankNum = 0;
 
+    if (!builder.hasDPAS() || !builder.getOption(vISA_EnableDPASBundleConflictReduction))
+    {
+        return 0;
+    }
 
     for (const BundleConflict& conflict : gra.getBundleConflicts(dcl))
     {
         LocalLiveRange* lr = gra.getLocalLR(conflict.dcl);
         int  subregnum;
         G4_VarBase* preg = lr->getPhyReg(subregnum);
+        if (preg == NULL)
+        {
+            preg = lr->getTopDcl()->getRegVar()->getPhyReg();
+        }
 
         if (preg != NULL)
         {
@@ -754,7 +751,7 @@ inline static unsigned short getOccupiedBundle(IR_Builder& builder, GlobalRA& gr
     return occupiedBundles;
 }
 
-bool LocalRA::assignUniqueRegisters(bool twoBanksRA, bool twoDirectionsAssign)
+bool LocalRA::assignUniqueRegisters(bool twoBanksRA, bool twoDirectionsAssign, bool hybridWithSpill)
 {
     // Iterate over all dcls and calculate number of rows
     // required if each unallocated dcl had its own physical
@@ -820,12 +817,22 @@ bool LocalRA::assignUniqueRegisters(bool twoBanksRA, bool twoDirectionsAssign)
                     return true;
                 }
                 numRows += dcl->getNumRows();
-                unallocatedRanges.push_back(dcl);
+                if (hybridWithSpill)
+                {
+                    if (dcl->isDoNotSpill())
+                    {
+                        unallocatedRanges.push_back(dcl);
+                    }
+                }
+                else
+                {
+                    unallocatedRanges.push_back(dcl);
+                }
             }
         }
     }
 
-    if (numRows < numRegLRA)
+    if (numRows < numRegLRA || hybridWithSpill)
     {
         // Get superset of registers used by local RA
         // in all basic blocks.
@@ -847,7 +854,7 @@ bool LocalRA::assignUniqueRegisters(bool twoBanksRA, bool twoDirectionsAssign)
         }
 
 
-        needGlobalRA = false;
+        needGlobalRA = hybridWithSpill;
         bool assignFromFront = true;
 #ifdef DEBUG_VERBOSE_ON
         COUT_ERROR << "Trival RA: " << std::endl;
@@ -881,7 +888,6 @@ bool LocalRA::assignUniqueRegisters(bool twoBanksRA, bool twoDirectionsAssign)
             {
                 BankAlign preferBank = BankAlign::Either;
                 unsigned short occupiedBundles = getOccupiedBundle(builder, gra, dcl, preferBank);
-
                 nrows = phyRegMgr.findFreeRegs(sizeInWords, assignAlign,
                     subAlign, regNum, subregNum, 0, numRegLRA - 1, occupiedBundles, 0, false, emptyForbidden, false, 0);
             }
@@ -920,7 +926,14 @@ bool LocalRA::assignUniqueRegisters(bool twoBanksRA, bool twoDirectionsAssign)
         {
             for (auto dcl : unallocatedRanges)
             {
-                dcl->getRegVar()->resetPhyReg();
+                if (!hybridWithSpill)
+                {
+                    dcl->getRegVar()->resetPhyReg();
+                }
+                else if (!dcl->isDoNotSpill())
+                {
+                    dcl->getRegVar()->resetPhyReg();
+                }
             }
         }
         else
@@ -998,7 +1011,7 @@ void GlobalRA::removeUnreferencedDcls()
             getNumRefs(dcl) == 0 &&
             dcl->getRegVar()->isPhyRegAssigned() == false &&
             dcl != kernel.fg.builder->getBuiltinR0()
-            ;
+            && dcl != kernel.fg.builder->getSpillSurfaceOffset();
     };
 
     kernel.Declares.erase(
@@ -1645,6 +1658,7 @@ void LocalRA::calculateLiveIntervals(G4_BB* bb, std::vector<LocalLiveRange*>& li
                         if ((builder.WaDisableSendSrcDstOverlap() &&
                             ((curInst->isSend() && i == 0) ||
                             (curInst->isSplitSend() && i == 1)))
+                            || (curInst->isDpas() && i == 1)  //For DPAS, as part of same instruction, src1 should not have overlap with dst. Src0 and src2 are okay to have overlap
                             || (builder.avoidDstSrcOverlap() &&  curInst->getDst() != NULL && hasDstSrcOverlapPotential(curInst->getDst(), src->asSrcRegRegion()))
                             )
                         {
@@ -2979,8 +2993,8 @@ bool LinearScan::allocateRegs(LocalLiveRange* lr, G4_BB* bb, IR_Builder& builder
 
                                     // FIXME: The following code does not handle QWord variable spilling completely.
                                     // See the last condition of this if-stmt.
-                                    G4_DstRegRegion* dst = builder.Create_Dst_Opnd_From_Dcl(splitDcl, 1);
-                                    G4_SrcRegRegion* src = builder.Create_Src_Opnd_From_Dcl(oldDcl, builder.getRegionStride1());
+                                    G4_DstRegRegion* dst = builder.createDstRegRegion(splitDcl, 1);
+                                    G4_SrcRegRegion* src = builder.createSrcRegRegion(oldDcl, builder.getRegionStride1());
                                     G4_ExecSize splitInstExecSize (oldDcl->getTotalElems() > 16 ? 16 : oldDcl->getTotalElems());
                                     G4_INST* splitInst = builder.createMov(
                                         splitInstExecSize,
@@ -3010,8 +3024,8 @@ bool LinearScan::allocateRegs(LocalLiveRange* lr, G4_BB* bb, IR_Builder& builder
 
                                     iter = useIt;
 
-                                    dst = builder.Create_Dst_Opnd_From_Dcl(newDcl, 1);
-                                    src = builder.Create_Src_Opnd_From_Dcl(splitDcl, builder.getRegionStride1());
+                                    dst = builder.createDstRegRegion(newDcl, 1);
+                                    src = builder.createSrcRegRegion(splitDcl, builder.getRegionStride1());
                                     G4_INST* movInst = builder.createMov(
                                         G4_ExecSize(splitDcl->getTotalElems() > 16 ? 16 : splitDcl->getTotalElems()),
                                         dst, src, InstOpt_WriteEnable, false);

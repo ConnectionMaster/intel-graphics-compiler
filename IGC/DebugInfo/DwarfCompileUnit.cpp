@@ -58,28 +58,41 @@ public:
         uint64_t sizeBits;
         uint64_t offsetBits;
     };
-    PieceBuilder(uint64_t RegSizeBits, uint64_t VarSizeBits, uint64_t SubRegOffsetBits)
-        : RegSizeBits(RegSizeBits),
+    PieceBuilder(size_t NumGRFs, uint64_t RegSizeBits, uint64_t VarSizeBits, uint64_t SubRegOffsetBits)
+        : NumGRFs(NumGRFs),
+          RegSizeBits(RegSizeBits),
           VariableSizeInBits(VarSizeBits),
           SubRegOffsetInBits(SubRegOffsetBits) {
         IGC_ASSERT(SubRegOffsetInBits < RegSizeBits);
         IGC_ASSERT(RegSizeBits > 0);
+        IGC_ASSERT(NumGRFs > 0);
     }
     bool needsPieces () const {
         if (VariableSizeInBits == 0)
             return false;
         if (pieceCount() == 1 && SubRegOffsetInBits != 0)
             return true;
+        bool NoGRFOverflow = pieceCount() <= NumGRFs;
+        IGC_ASSERT_MESSAGE(NoGRFOverflow,
+                           "required number of pieces is greater than available GRF");
+        if (!NoGRFOverflow)
+            return false; // fallback
         if (pieceCount() > 1)
             return true;
         return false;
     }
-    uint64_t pieceCount () const {
+    unsigned pieceCount () const {
         auto AlignedSize = SubRegOffsetInBits + VariableSizeInBits;
         auto Count = AlignedSize / RegSizeBits;
         if (AlignedSize % RegSizeBits)
             ++Count;
-        return Count;
+        const auto MaxUint = std::numeric_limits<unsigned>::max();
+        bool NoOverflow = Count <= MaxUint;
+        IGC_ASSERT_MESSAGE(NoOverflow,
+                           "number of required pieces does not fit unsigned int");
+        if (!NoOverflow)
+          return 0; // fallback if overflow is detected
+        return static_cast<unsigned>(Count);
     }
     PieceInfo get(uint64_t index) const {
         assert(index < pieceCount());
@@ -100,6 +113,7 @@ public:
         return PieceInfo{AlignedSize - LastChunk, 0};
     }
 private:
+    size_t   NumGRFs;
     uint64_t RegSizeBits;
     uint64_t VariableSizeInBits;
     uint64_t SubRegOffsetInBits;
@@ -181,15 +195,10 @@ int64_t CompileUnit::getDefaultLowerBound() const
 }
 
 static bool HasImplicitLocation(const DbgVariable& var) {
-#if LLVM_VERSION_MAJOR >= 9
     if (auto* dbgInst = dyn_cast_or_null<IGCLLVM::DbgVariableIntrinsic>(var.getDbgInst()))
         if (auto* expr = dbgInst->getExpression())
             return expr->isImplicit();
     return false;
-#else
-    // We don't support implicit locations for LLVM less than 9
-    return false;
-#endif
 }
 /// Check whether the DIE for this MDNode can be shared across CUs.
 static bool isShareableAcrossCUs(llvm::MDNode* D)
@@ -290,21 +299,11 @@ void CompileUnit::addSInt(IGC::DIEBlock* Die, Optional<dwarf::Form> Form, int64_
 /// table.
 void CompileUnit::addString(DIE* Die, dwarf::Attribute Attribute, StringRef String)
 {
-    if (DD->IsDirectElfInput())
-    {
-        // Emit string inlined
-        auto Str = new (DIEValueAllocator) DIEInlinedString(String);
-        // Collect all inlined string DIEs to later call dtor
-        DIEInlinedStrings.push_back(Str);
-        Die->addValue(Attribute, dwarf::DW_FORM_string, Str);
-    }
-    else
-    {
-        MCSymbol* Symb = DD->getStringPoolEntry(String);
-        DIEValue* Value = new (DIEValueAllocator)DIELabel(Symb);
-        DIEValue* Str = new (DIEValueAllocator)DIEString(Value, String);
-        Die->addValue(Attribute, dwarf::DW_FORM_strp, Str);
-    }
+    // Emit string inlined
+    auto Str = new (DIEValueAllocator) DIEInlinedString(String);
+    // Collect all inlined string DIEs to later call dtor
+    DIEInlinedStrings.push_back(Str);
+    Die->addValue(Attribute, dwarf::DW_FORM_string, Str);
 }
 
 /// addExpr - Add a Dwarf expression attribute data and value.
@@ -468,18 +467,6 @@ void CompileUnit::addSourceLine(DIE* Die, DIType* Ty)
 
     addSourceLine(Die, Ty, Ty->getLine());
 }
-
-#if LLVM_VERSION_MAJOR == 4
-/// addSourceLine - Add location information to specified debug information
-/// entry.
-void CompileUnit::addSourceLine(DIE * Die, DINamespace * NS)
-{
-    // Verify namespace.
-    if (!isa<DINamespace>(NS)) return;
-
-    addSourceLine(Die, NS, NS->getLine());
-}
-#endif
 
 void CompileUnit::addRegisterLoc(IGC::DIEBlock* TheDie, unsigned DWReg, int64_t Offset, const llvm::Instruction* dbgInst)
 {
@@ -860,6 +847,15 @@ void CompileUnit::addGTRelativeLocation(IGC::DIEBlock* Block, const VISAVariable
                 addBindlessSurfaceLocation(Block, Loc);
             }
         }
+        else if (bti == 251) // Missing define for 251
+        {
+            // On XeHP_SDV, the Scratch Buffer is a bindless surface specified in the message header payload,
+            // with the base address calculated using the physical thread ID and the Pitch in the surface state.
+            // The bindless surface is relative to the Surface State Base Address heap (BTS 251).
+            // The HWord offset into the Scratch Buffer memory is provided in the message descriptor and
+            // communicated to the data port on the Sideband.
+            addBindlessScratchSpaceLocation(Block, Loc);
+        }
         else if ((bti >= 0) && (bti <= 240))
         {
             // BTI surface
@@ -1088,6 +1084,102 @@ void CompileUnit::addBindlessSurfaceLocation(IGC::DIEBlock* Block, const VISAVar
     }
 }
 
+// addBindlessScratchSpaceLocation - add a sequence of attributes to calculate bindless scratch space location of variable
+void CompileUnit::addBindlessScratchSpaceLocation(IGC::DIEBlock* Block, const VISAVariableLocation* Loc)
+{
+    if (EmitSettings.EnableGTLocationDebugging)
+    {
+        IGC_ASSERT(EmitSettings.UseNewRegisterEncoding);
+        // Use virtual debug register with Surface State Base Address
+        uint32_t surfStateBaseAddrEncoded = GetEncodedRegNum<RegisterNumbering::SurfStateBase>(
+            dwarf::DW_OP_breg0, EmitSettings.UseNewRegisterEncoding);
+
+        IGC_ASSERT_MESSAGE(Loc->HasSurface(), "Missing surface for variable location");
+
+        // Note: Bindless scratch space offset aka Scratch Space Pointer is located in preserved r0 GRF register,
+        // on bits 31:10 of r0.5 subregister.
+        //
+        // Bindless Surface addressing using bindless offset stored in a register r0,
+        // while surface offset is literal:
+        // 1 DW_OP_reg16
+        // 2 DW_OP_const1u 5*32          , Offset in bits to r0.5
+        // 3 DW_OP_const1u 32            , 32-bit long bindless offset
+        // 4 DW_OP_const4u 0xffffffc0    , which is 1K-byte aligned
+        // 5 DW_OP_and
+        // 6 DW_OP_push_bit_piece_stack
+        // 7 DW_OP_breg8 32              , we add the surface state base address plus the field offset
+        // 8 DW_OP_plus                  , to fetch the surface base address inside the RENDER_SURFACE_STATE object
+        // 9 DW_OP_deref
+        // 10 DW_OP_plus_uconst <offset>
+        // or
+        // Bindless Surface addressing using bindless offset (r0.5 [31:10]) and surface offset both stored in a register
+        // while r1 (for example) contains surface offset.
+        // 1 DW_OP_reg16
+        // 2 DW_OP_const1u 5*32          , Offset in bits to r0.5
+        // 3 DW_OP_const1u 32            , 32-bit long bindless offset
+        // 4 DW_OP_const4u 0xffffffc0    , which is 1K-byte aligned
+        // 5 DW_OP_and
+        // 6 DW_OP_push_bit_piece_stack
+        // 7 DW_OP_breg8 32
+        // 8 DW_OP_plus
+        // 9 DW_OP_deref
+        // 10 DW_OP_reg17
+        // 11 DW_OP_const1u <bit-offset to reg1>
+        // 12 DW_OP_const1u 32
+        // 13 DW_OP_push_bit_piece_stack
+
+        uint16_t regNumWithBindlessOffset = 0;  // TBD Bindless offset in GRF
+
+        addRegisterOp(Block, regNumWithBindlessOffset);  // Bindless offset to base address
+        addUInt(Block, dwarf::DW_FORM_data1, dwarf::DW_OP_const1u);
+        addUInt(Block, dwarf::DW_FORM_data1, 5*32);   // bit offset to Scratch Space Pointer in r0.5
+        addUInt(Block, dwarf::DW_FORM_data1, dwarf::DW_OP_const1u);
+        addUInt(Block, dwarf::DW_FORM_data1, 32);
+        addUInt(Block, dwarf::DW_FORM_data1, dwarf::DW_OP_const4u);
+        addUInt(Block, dwarf::DW_FORM_data4, 0xffffffc0);
+        addUInt(Block, dwarf::DW_FORM_data1, dwarf::DW_OP_and);
+        addUInt(Block, dwarf::DW_FORM_data1, DW_OP_INTEL_push_bit_piece_stack);
+        addUInt(Block, dwarf::DW_FORM_data1, surfStateBaseAddrEncoded);  // Bindless Surface Base Address
+        addUInt(Block, dwarf::DW_FORM_udata, 32);
+        addUInt(Block, dwarf::DW_FORM_data1, dwarf::DW_OP_plus);
+        addUInt(Block, dwarf::DW_FORM_data1, dwarf::DW_OP_deref);
+
+        if (Loc->HasLocation())  // Is surface offset available as literal?
+        {
+            uint32_t offset = Loc->GetOffset();     // Surface offset
+
+            addUInt(Block, dwarf::DW_FORM_data1, dwarf::DW_OP_plus_uconst);
+            addUInt(Block, dwarf::DW_FORM_udata, offset);
+        }
+        else if (Loc->IsRegister())  // Is surface offset available as register?
+        {
+            auto regNum = Loc->GetRegister();
+            const auto* VISAMod = Loc->GetVISAModule();
+
+            DbgDecoder::VarInfo varInfo;
+            if (!VISAMod->getVarInfo(*DD->getDecodedDbg(), "V", regNum, varInfo)) {
+                LLVM_DEBUG(dbgs() << "warning: could not build bindless scratch offset (V" << regNum << ")");
+                return;
+            }
+
+            uint16_t regNumWithSurfOffset = varInfo.lrs.front().getGRF().regNum;
+            unsigned int subReg = varInfo.lrs.front().getGRF().subRegNum;
+            auto bitOffsetToSurfReg = subReg * 8;  // Bit-offset to GRF with surface offset
+            // auto sizeInBits = (VISAMod->m_pShader->getGRFSize() * 8) - offsetInBits;
+
+            addRegisterOp(Block, regNumWithSurfOffset);  // Surface offset (in GRF) to base address
+            addUInt(Block, dwarf::DW_FORM_data1, dwarf::DW_OP_const1u);
+            addUInt(Block, dwarf::DW_FORM_data1, bitOffsetToSurfReg);
+            addUInt(Block, dwarf::DW_FORM_data1, dwarf::DW_OP_const1u);
+            addUInt(Block, dwarf::DW_FORM_data1, 32);
+            addUInt(Block, dwarf::DW_FORM_data1, DW_OP_INTEL_push_bit_piece_stack);
+        }
+        else
+        {
+            IGC_ASSERT_MESSAGE(0, "Unexpected bindless variable - offset neither literal nor in register");
+        }
+    }
+}
 
 // addBindlessSamplerLocation - add a sequence of attributes to calculate bindless sampler location of variable
 void CompileUnit::addBindlessSamplerLocation(IGC::DIEBlock* Block, const VISAVariableLocation* Loc)
@@ -1452,6 +1544,26 @@ void CompileUnit::addSimdLane(IGC::DIEBlock* Block, DbgVariable& DV, const VISAV
     }
 }
 
+
+bool CompileUnit::emitBitPiecesForRegVal(IGC::DIEBlock* Block, const VISAModule& VM,
+                                         DbgVariable& DV,
+                                         const DbgDecoder::LiveIntervalsVISA& lr,
+                                         uint64_t varSizeInBits, uint64_t offsetInBits)
+{
+    const auto registerSizeInBits = VM.getGRFSize() * 8;
+    const auto numGRFs = VM.getNumGRFs();
+
+    PieceBuilder PieceBuilder(numGRFs, registerSizeInBits, varSizeInBits, offsetInBits);
+    if (!PieceBuilder.needsPieces())
+        return false;
+    for (unsigned i = 0, e = PieceBuilder.pieceCount(); i < e; ++i) {
+        auto Piece = PieceBuilder.get(i);
+        if (i != 0) // RegisterLoc is already emitted for the first Piece
+            addRegisterLoc(Block, lr.getGRF().regNum + i, 0, DV.getDbgInst());
+        addBitPiece(Block, Piece.sizeBits, Piece.offsetBits);
+    }
+    return true;
+}
 // addSimdLaneScalar - add a sequence of attributes to calculate location of scalar variable
 // e.g. a GRF subregister.
 void CompileUnit::addSimdLaneScalar(IGC::DIEBlock* Block, DbgVariable& DV, const VISAVariableLocation* Loc, DbgDecoder::LiveIntervalsVISA* lr, uint16_t subRegInBytes)
@@ -1478,16 +1590,7 @@ void CompileUnit::addSimdLaneScalar(IGC::DIEBlock* Block, DbgVariable& DV, const
         }
         else
         {
-            const auto* VISAMod = Loc->GetVISAModule();
-            const auto registerSizeInBits = VISAMod->getGRFSize() * 8;
-
-            PieceBuilder PieceBuilder(registerSizeInBits, varSizeInBits, offsetInBits);
-            for (unsigned i = 0; i < PieceBuilder.pieceCount(); ++i) {
-                auto Piece = PieceBuilder.get(i);
-                if (i != 0) // RegisterLoc is already emitted for the first Piece
-                    addRegisterLoc(Block, lr->getGRF().regNum + i, 0, DV.getDbgInst());
-                addBitPiece(Block, Piece.sizeBits, Piece.offsetBits);
-            }
+            emitBitPiecesForRegVal(Block, *Loc->GetVISAModule(), DV, *lr, varSizeInBits, offsetInBits);
         }
     }
 }
@@ -1910,9 +2013,6 @@ IGC::DIE* CompileUnit::getOrCreateNameSpace(DINamespace* NS)
     {
         addString(NDie, dwarf::DW_AT_name, NS->getName());
     }
-#if LLVM_VERSION_MAJOR == 4
-    addSourceLine(NDie, NS);
-#endif
     return NDie;
 }
 
@@ -2069,11 +2169,7 @@ void CompileUnit::constructSubrangeDIE(DIE& Buffer, DISubrange* SR, DIE* IndexTy
     int64_t LowerBound = SR->getLowerBound();
 #endif
     int64_t DefaultLowerBound = getDefaultLowerBound();
-    int64_t Count = SR->getCount()
-#if LLVM_VERSION_MAJOR >= 7
-        .dyn_cast<ConstantInt*>()->getSExtValue()
-#endif
-        ;
+    int64_t Count = SR->getCount().dyn_cast<ConstantInt*>()->getSExtValue();
 
 #if LLVM_VERSION_MAJOR >= 11
     auto addBoundTypeEntry = [&](dwarf::Attribute Attr,
@@ -2250,32 +2346,23 @@ IGC::DIE* CompileUnit::constructVariableDIE(DbgVariable& DV, bool isScopeAbstrac
     unsigned Offset = DV.getDotDebugLocOffset();
     if (Offset != ~0U)
     {
-        if (DD->IsDirectElfInput())
+        // Copy over references ranges to DotLocDebugEntries
+        if (EmitSettings.EnableRelocation)
         {
-            // Copy over references ranges to DotLocDebugEntries
-            if (EmitSettings.EnableRelocation)
-            {
-                // Retrieve correct location value based on Offset.
-                // Then attach label corresponding to this offset
-                // to DW_AT_location attribute.
-                auto LocLabel = DD->CopyDebugLoc(Offset);
-                addLabelLoc(VariableDie, dwarf::DW_AT_location, LocLabel);
-            }
-            else
-            {
-                Offset = DD->CopyDebugLocNoReloc(Offset);
-                addUInt(VariableDie, dwarf::DW_AT_location, dwarf::DW_FORM_sec_offset, Offset);
-            }
-            if (DV.getDecorations().size() > 0)
-            {
-                addString(VariableDie, dwarf::DW_AT_description, DV.getDecorations());
-            }
+            // Retrieve correct location value based on Offset.
+            // Then attach label corresponding to this offset
+            // to DW_AT_location attribute.
+            auto LocLabel = DD->CopyDebugLoc(Offset);
+            addLabelLoc(VariableDie, dwarf::DW_AT_location, LocLabel);
         }
         else
         {
-            addLabel(VariableDie, dwarf::DW_AT_location,
-                DD->getDwarfVersion() >= 4 ? dwarf::DW_FORM_sec_offset : dwarf::DW_FORM_data4,
-                Asm->GetTempSymbol("debug_loc", Offset));
+            Offset = DD->CopyDebugLocNoReloc(Offset);
+            addUInt(VariableDie, dwarf::DW_AT_location, dwarf::DW_FORM_sec_offset, Offset);
+        }
+        if (DV.getDecorations().size() > 0)
+        {
+            addString(VariableDie, dwarf::DW_AT_description, DV.getDecorations());
         }
         DV.setDIE(VariableDie);
         return VariableDie;
@@ -2323,94 +2410,27 @@ void CompileUnit::buildLocation(const llvm::Instruction* pDbgInst, DbgVariable& 
         return;
     }
 
-    bool addDecoration = false;
-    if (VISAModule->isDirectElfInput)
+    if (FirstLoc.HasSurface())
     {
-        if (FirstLoc.HasSurface())
-        {
-            IGC::DIEBlock* Block = new (DIEValueAllocator)IGC::DIEBlock();
-            addRegisterOp(Block, FirstLoc.GetSurface());
-            // Now attach the surface information to the DIE.
-            addBlock(VariableDie, dwarf::DW_AT_segment, Block);
-        }
-
-        IGC::DIEBlock* locationAT = nullptr;
-        if (FirstLoc.IsSLM())
-            locationAT = buildSLM(DV, &FirstLoc);
-        else if (FirstLoc.IsSampler())
-            locationAT = buildSampler(DV, &FirstLoc);
-        else if (FirstLoc.HasSurface() &&
-            (DV.getType() && DV.getType()->getTag() == dwarf::DW_TAG_pointer_type))
-            locationAT = buildPointer(DV, &FirstLoc);
-        else
-            locationAT = buildGeneral(DV, &Locs, nullptr);
-
-        if (locationAT)
-            addBlock(VariableDie, dwarf::DW_AT_location, locationAT);
-        addDecoration = true;
+        IGC::DIEBlock* Block = new (DIEValueAllocator)IGC::DIEBlock();
+        addRegisterOp(Block, FirstLoc.GetSurface());
+        // Now attach the surface information to the DIE.
+        addBlock(VariableDie, dwarf::DW_AT_segment, Block);
     }
+
+    IGC::DIEBlock* locationAT = nullptr;
+    if (FirstLoc.IsSLM())
+        locationAT = buildSLM(DV, &FirstLoc);
+    else if (FirstLoc.IsSampler())
+        locationAT = buildSampler(DV, &FirstLoc);
+    else if (FirstLoc.HasSurface() &&
+             (DV.getType() && DV.getType()->getTag() == dwarf::DW_TAG_pointer_type))
+        locationAT = buildPointer(DV, &FirstLoc);
     else
-    {
-        // Variable which is not immediate can have surface, location or both.
-        if (FirstLoc.HasSurface())
-        {
-            IGC::DIEBlock* Block = new (DIEValueAllocator)IGC::DIEBlock();
-            addRegisterOp(Block, FirstLoc.GetSurface());
-            // Now attach the surface information to the DIE.
-            addBlock(VariableDie, dwarf::DW_AT_segment, Block);
-            if (!FirstLoc.HasLocation())
-            {
-                // Make sure there is always a location attribute when there is a surface attribute.
-                // In this case, attach an zero address opcode location information to the DIE.
-                IGC::DIEBlock* nBlock = new (DIEValueAllocator)IGC::DIEBlock();
-                addUInt(nBlock, dwarf::DW_FORM_data1, dwarf::DW_OP_addr);
-                dwarf::Form form = (Asm->GetPointerSize() == 8) ? dwarf::DW_FORM_data8 : dwarf::DW_FORM_data4;
-                addUInt(nBlock, form, 0);
+        locationAT = buildGeneral(DV, &Locs, nullptr);
 
-                addBlock(VariableDie, dwarf::DW_AT_location, nBlock);
-            }
-        }
-
-        if (FirstLoc.HasLocation())
-        {
-#if 0
-            /* This has been disabled because of following kind of metadata node generated:
-            !98 = metadata !{i32 786688, metadata !11, metadata !"adder", metadata !6, i32 4, metadata !14, i32 0, metadata !56, i64
-            2, i64 1, i64 32}
-
-            numOperands here indicates complex addressing is used. But for complex addressing,
-            9th operand should be a metadata node whereas here integer nodes are added.
-            */
-            IGC_ASSERT_MESSAGE(!(DV.variableHasComplexAddress() || DV.isBlockByrefVariable()), "Should handle complex address");
-#endif
-            IGC::DIEBlock* Block = new (DIEValueAllocator)IGC::DIEBlock();
-
-            if (!FirstLoc.IsInMemory())
-            {
-                IGC_ASSERT_MESSAGE(FirstLoc.IsRegister(), "Direct location must be register");
-                addRegisterOp(Block, FirstLoc.GetRegister());
-            }
-            else
-            {
-                if (FirstLoc.IsRegister())
-                {
-                    addRegisterOffset(Block, FirstLoc.GetRegister(), FirstLoc.GetOffset());
-                }
-                else
-                {
-                    addUInt(Block, dwarf::DW_FORM_data1, dwarf::DW_OP_constu);
-                    addSInt(Block, dwarf::DW_FORM_udata, FirstLoc.GetOffset());
-                }
-            }
-
-            // Now attach the location information to the DIE.
-            addBlock(VariableDie, dwarf::DW_AT_location, Block);
-
-            addDecoration = true;
-        }
-
-        DV.setDIE(VariableDie);
-    }
+    if (locationAT)
+        addBlock(VariableDie, dwarf::DW_AT_location, locationAT);
 }
 
 IGC::DIEBlock* CompileUnit::buildPointer(DbgVariable& var, const VISAVariableLocation* loc)
@@ -2832,23 +2852,16 @@ IGC::DIEBlock* CompileUnit::buildGeneral(DbgVariable& var, std::vector<VISAVaria
 
                     addRegisterLoc(Block, lrToUse.getGRF().regNum, offset, var.getDbgInst());
 
-                    if (HasImplicitLocation(var)) {
+                    if (HasImplicitLocation(var))
+                    {
                         addConstantUValue(Block, offsetInBits);
                         addConstantUValue(Block, varSizeInBits);
                         IGC_ASSERT_MESSAGE(varSizeInBits <= 64, "Entries pushed onto DWARF stack are limited to 8 bytes");
                         addUInt(Block, dwarf::DW_FORM_data1, DW_OP_INTEL_push_bit_piece_stack);
-                    } else {
-                        const auto registerSizeInBits = VISAMod->getGRFSize() * 8;
-                        PieceBuilder PieceBuilder(registerSizeInBits, varSizeInBits, offsetInBits);
-                        // Note: if no pieces are required - we are done, since RegisterLoc was emitted
-                        if (PieceBuilder.needsPieces()) {
-                            for (unsigned i = 0; i < PieceBuilder.pieceCount(); ++i) {
-                                auto Piece = PieceBuilder.get(i);
-                                if (i != 0) // RegisterLoc is already emitted for the first Piece
-                                    addRegisterLoc(Block, lrToUse.getGRF().regNum + i, offset, var.getDbgInst());
-                                addBitPiece(Block, Piece.sizeBits, Piece.offsetBits);
-                            }
-                        }
+                    }
+                    else
+                    {
+                        emitBitPiecesForRegVal(Block, *VISAMod, var, lrToUse, varSizeInBits, offsetInBits);
                     }
                 }
                 else

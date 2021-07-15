@@ -1,28 +1,11 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2017-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
+============================= end_copyright_notice ===========================*/
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
 %{
 #include <string.h>
 #include <stdio.h>
@@ -55,6 +38,7 @@ static VISA_Type               str2type(const char *str, int str_len);
 static VISA_Cond_Mod           str2cond(const char *str);
 static VISAAtomicOps           str2atomic_opcode(const char *op_str);
 static ISA_Opcode              str2opcode(const char* op_str);
+static GenPrecision            str2Precision(const char *str, int str_len);
 static VISASampler3DSubOpCode  str2SampleOpcode(const char* str);
 static int64_t                 hexToInt(const char *hex_str, int str_len);
 static MEDIA_LD_mod            mediaMode(const char* str);
@@ -257,7 +241,7 @@ add|avg|dp2|dp3|dp4|dph|line|mul|pow|mulh|sad2|plane {
         return ARITH3_OP;
     }
 
-mad|lrp|sad2add {
+mad|lrp|sad2add|madw {
         TRACE("** ARITH4_OP");
         CISAlval.opcode = str2opcode(yytext);
         return ARITH4_OP;
@@ -276,6 +260,61 @@ rol|ror {
     }
 
 
+dp4a {
+        TRACE("** ARITH4_OP");
+        CISAlval.opcode = str2opcode(yytext);
+        return ARITH4_OP;
+    }
+
+dpas"."[sSuUbBHh][1248fF]"."[sSuUbBHh][1248fF]"."[1248]"."[12345678] {
+        TRACE("** DPAS");
+        CISAlval.opcode = ISA_DPAS;
+        CISAlval.dpas_info.src1Precision = str2Precision(yytext + 5, 2);
+        CISAlval.dpas_info.src2Precision = str2Precision(yytext + 8, 2);
+        CISAlval.dpas_info.depth = (yytext[11] - '0');
+        CISAlval.dpas_info.count = (yytext[13] - '0');
+        return DPAS_OP;
+    }
+
+dpasw"."[sSuUbBhH][1248fF]"."[sSuUbBhH][1248fF]"."[1248]"."[12345678] {
+        TRACE("** DPASW");
+        CISAlval.opcode = ISA_DPASW;
+        CISAlval.dpas_info.src1Precision = str2Precision(yytext + 6, 2);
+        CISAlval.dpas_info.src2Precision = str2Precision(yytext + 9, 2);
+        CISAlval.dpas_info.depth = (yytext[12] - '0');
+        CISAlval.dpas_info.count = (yytext[14] - '0');
+        return DPAS_OP;
+    }
+
+add3 {
+        TRACE("** ADD3 INST");
+        CISAlval.opcode = str2opcode(yytext);
+        return ARITH4_OP;
+    }
+
+bfn"."x[[:xdigit:]]+ {
+        TRACE("** BFN INST");
+        CISAlval.bfn_info.func_ctrl = (uint8_t)hexToInt(yytext+5, yyleng-5);
+        return BFN_OP;
+    }
+
+qw_gather|qw_scatter {
+        TRACE("** qword gather/scatter INST");
+        CISAlval.opcode = str2opcode(yytext);
+        return QW_SCATTER_OP;
+    }
+
+bf_cvt {
+        TRACE("** bfloat16 conversion INST");
+        CISAlval.opcode = str2opcode(yytext);
+        return BF_CVT_OP;
+    }
+
+"."(fadd|fsub) {
+        TRACE("** Float Atomic add/sub");
+        CISAlval.atomic_op = str2atomic_opcode(yytext + 1);
+        return ATOMIC_SUB_OP;
+}
 
 
 
@@ -582,6 +621,7 @@ sample_3d|sample_b|sample_l|sample_c|sample_d|sample_b_c|sample_l_c|sample_d_c|s
         CISAlval.sample3DOp = str2SampleOpcode(yytext);
         return SAMPLE_3D_OP;
     }
+
 
 load_3d|load_mcs|load_2dms_w|load_lz {
         TRACE("** LOAD_3D");
@@ -905,6 +945,47 @@ static VISA_Type str2type(const char *str, int str_len)
 }
 
 
+static GenPrecision str2Precision(const char *str, int str_len)
+{
+    if (str_len == 2)
+    {
+        char c0 = tolower(str[0]);
+        char c1 = str[1];
+        if (c0 == 's')
+        {
+            switch (c1) {
+            default: break; // fall-thru
+            case '1' : return GenPrecision::S1;
+            case '2' : return GenPrecision::S2;
+            case '4' : return GenPrecision::S4;
+            case '8' : return GenPrecision::S8;
+            }
+        } else if (c0 == 'u') {
+            switch (c1) {
+            default: break; // fall-thru
+            case '1' : return GenPrecision::U1;
+            case '2' : return GenPrecision::U2;
+            case '4' : return GenPrecision::U4;
+            case '8' : return GenPrecision::U8;
+            }
+        } else if (c0 == 'b') {
+            c1 = tolower(c1);
+            if (c1 == 'f') {
+               return GenPrecision::BF16;
+            }
+        } else if (c0 == 'h') {
+            c1 = tolower(c1);
+            if (c1 == 'f') {
+                return GenPrecision::FP16;
+            }
+        }
+    }
+
+    YY_FATAL_ERROR("Invalid Gen Precision");
+
+    return GenPrecision::INVALID;
+}
+
 
 // convert "z" to Mod_z
 static VISA_Cond_Mod str2cond(const char *str)
@@ -963,7 +1044,7 @@ static ISA_Opcode str2opcode(const char *op_str)
 static VISASampler3DSubOpCode str2SampleOpcode(const char *str)
 {
     for (int i = 0; i < ISA_NUM_OPCODE; i++)
-        if (strcmp(SAMPLE_OP_3D_NAME[i], str) == 0)
+        if (strcmp(getSampleOp3DName(i), str) == 0)
             return (VISASampler3DSubOpCode) i;
 
     YY_FATAL_ERROR("Invalid 3D Sample OpCode");

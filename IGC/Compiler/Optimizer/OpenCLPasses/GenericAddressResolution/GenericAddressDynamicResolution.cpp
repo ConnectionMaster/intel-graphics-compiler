@@ -209,10 +209,9 @@ bool GenericAddressDynamicResolution::visitLoadStoreInst(Instruction& I)
         IGC_ASSERT_EXIT_MESSAGE(0, "Unable to resolve generic address space pointer");
     }
 
-    m_ctx->m_instrTypes.hasDynamicGenericLoadStore = true;
-
     if (pointerAddressSpace == ADDRESS_SPACE_GENERIC) {
-        if ((m_ctx->forceGlobalMemoryAllocation() || m_ctx->platform.canForcePrivateToGlobal()) && m_ctx->hasNoLocalToGenericCast())
+        if((m_ctx->allocatePrivateAsGlobalBuffer() || m_ctx->hasNoPrivateToGenericCast()) &&
+            m_ctx->hasNoLocalToGenericCast())
         {
             resolveGASWithoutBranches(I, pointerOperand);
         }
@@ -258,7 +257,10 @@ void GenericAddressDynamicResolution::resolveGAS(Instruction& I, Value* pointerO
     Value* privateLoad = nullptr;
     Value* globalLoad = nullptr;
 
-    bool hasPrivate = !m_ctx->platform.canForcePrivateToGlobal();
+    // GAS needs to resolve to private only if
+    //     1) private is NOT allocated in global space; and
+    //     2) there is a cast from private to GAS.
+    bool hasPrivate = !(m_ctx->allocatePrivateAsGlobalBuffer() || m_ctx->hasNoPrivateToGenericCast());
     bool hasLocal = !m_ctx->hasNoLocalToGenericCast();
 
     auto createBlock = [&](const Twine& BlockName, const Twine& LoadName, IGC::ADDRESS_SPACE addressSpace, Value*& load)
@@ -493,7 +495,7 @@ bool GenericAddressDynamicResolution::allowArithmeticOnGenericAddressSpace(Funct
                 PtrToIntInst* ptiInst = dyn_cast<PtrToIntInst>(useInst);
                 if (ptiInst && ptiInst->getPointerAddressSpace() == ADDRESS_SPACE_GENERIC)
                 {
-                    if (ptiInst->getNumUses() > 0)
+                    if (!ptiInst->use_empty())
                     {
                         Instruction* ptiUser = ptiInst->user_back();
                         // We only skip tags on generic pointers if there is an arithmetic operation

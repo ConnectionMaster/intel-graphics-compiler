@@ -16,6 +16,9 @@ SPDX-License-Identifier: MIT
 #include <array>
 #include <optional>
 #include <climits>
+#include "common/LLVMWarningsPush.hpp"
+#include <llvm/ADT/MapVector.h>
+#include "common/LLVMWarningsPop.hpp"
 
 namespace llvm
 {
@@ -174,6 +177,15 @@ namespace IGC
     };
 
 
+    struct ConstantAddress
+    {
+        unsigned int bufId = 0;
+        unsigned int eltId = 0;
+        unsigned int size = 0;
+    };
+
+    bool operator < (const ConstantAddress &a, const ConstantAddress &b);
+
     //to hold metadata of every function
     struct FunctionMetaData
     {
@@ -181,12 +193,12 @@ namespace IGC
         WorkGroupWalkOrderMD workGroupWalkOrder;
         std::vector<FuncArgMD> funcArgs;
         FunctionTypeMD functionType = KernelFunction;
+        std::map<ConstantAddress, uint32_t> inlineDynConstants;
         ResourceAllocMD resAllocMD;
         std::vector<unsigned> maxByteOffsets;
         bool IsInitializer = false;
         bool IsFinalizer = false;
         unsigned CompiledSubGroupsNumber = 0;
-        bool isCloned = false;
         bool hasInlineVmeSamplers = false;
         int localSize = 0;
         bool localIDPresent = false;
@@ -258,7 +270,12 @@ namespace IGC
         bool disablePartialVertexComponentPacking       = false;
         bool PreferBindlessImages                       = false;
         bool UseBindlessMode                            = false;
+        bool UseLegacyBindlessMode                      = true;
         bool disableMathRefactoring                     = false;
+        //if PTSS is enabled and if PrivateData is too large (>256k in XeHP_SDV+),
+        //we might use stateless memory to hold privatedata instead of using PTSS.
+        //this flag is for this scenario.
+        bool UseStatelessforPrivateMemory               = false;
         bool EnableTakeGlobalAddress                    = false;
         bool IsLibraryCompilation                       = false;
         bool FastVISACompile                            = false;
@@ -341,15 +358,6 @@ namespace IGC
         // std::map<offset, argumentIndex>
         std::map<unsigned int, int> simplePushLoads;
     };
-
-    struct ConstantAddress
-    {
-        unsigned int bufId = 0;
-        unsigned int eltId = 0;
-        unsigned int size = 0;
-    };
-
-    bool operator < (const ConstantAddress &a, const ConstantAddress &b);
 
     struct StatelessPushInfo
     {
@@ -437,12 +445,11 @@ namespace IGC
     {
         bool isPrecise = false;
         CompOptions compOpt;
-        std::map<llvm::Function*, IGC::FunctionMetaData>   FuncMD;
+        llvm::MapVector<llvm::Function*, IGC::FunctionMetaData> FuncMD;
         PushInfo pushInfo;
         PixelShaderInfo psInfo;
         ComputeShaderInfo csInfo;
         uint32_t CurUniqueIndirectIdx = DefaultIndirectIdx;
-        std::map<ConstantAddress, uint32_t>   inlineDynConstants;
         std::map<uint32_t, std::array<uint32_t, 4>> inlineDynTextures;
         std::vector<InlineResInfo> inlineResInfoData;
         ImmConstantInfo immConstant;
@@ -453,7 +460,7 @@ namespace IGC
         std::vector<PointerAddressRelocInfo> GlobalBufferAddressRelocInfo;
         std::vector<PointerAddressRelocInfo> ConstantBufferAddressRelocInfo;
         unsigned int MinNOSPushConstantSize = 0;
-        std::map<llvm::GlobalVariable*, int> inlineProgramScopeOffsets;
+        llvm::MapVector<llvm::GlobalVariable*, int> inlineProgramScopeOffsets;
         ShaderData shaderData;
         URBLayoutInfo URBInfo;
         bool UseBindlessImage = false;
@@ -467,7 +474,9 @@ namespace IGC
         unsigned int privateMemoryPerWI = 0;
         std::array<uint64_t, NUM_SHADER_RESOURCE_VIEW_SIZE> m_ShaderResourceViewMcsMask{};
         unsigned int computedDepthMode = 0; //Defaults to 0 meaning depth mode is off
-        bool hasNoLocalToGenericCast = false;  // This is programmed by ResolveGAS pass later.
+        // set by LowerGPCallArg pass
+        bool hasNoLocalToGenericCast = false;
+        bool hasNoPrivateToGenericCast = false;
     };
     void serialize(const IGC::ModuleMetaData &moduleMD, llvm::Module* module);
     void deserialize(IGC::ModuleMetaData &deserializedMD, const llvm::Module* module);

@@ -1,28 +1,10 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2017-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
+============================= end_copyright_notice ===========================*/
 
 #include "IGC/common/StringMacros.hpp"
 #include "visa_igc_common_header.h"
@@ -66,6 +48,8 @@ static const PlatformInfo ALL_PLATFORMS[] {
     PlatformInfo(GENX_TGLLP, PlatformGen::XE, 12,
         "TGLLP", "DG1", "GEN12LP"
     ),
+    PlatformInfo(XeHP_SDV, PlatformGen::XE, 11,
+        "XeHP_SDV"),
 }; // ALL_PLATFORMS
 
 static const PlatformInfo *LookupPlatformInfo(TARGET_PLATFORM p)
@@ -178,6 +162,7 @@ unsigned char getGRFSize()
 // 8 ICL
 // 10 ICLLP
 // 12 TGLLP
+// 11 XeHP_SDV
 // Note that encoding is not linearized.
 int getGenxPlatformEncoding()
 {
@@ -188,5 +173,3 @@ int getGenxPlatformEncoding()
         return -1;
     }
 }
-
-

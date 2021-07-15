@@ -1,28 +1,11 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2017-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
+============================= end_copyright_notice ===========================*/
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
 #include "BitSet.h"
 #include "BuildIR.h"
 #include "CFGStructurizer.h"
@@ -306,7 +289,7 @@ G4_BB* FlowGraph::beginBB(Label_BB_Map& map, G4_INST* first)
     else
     {
         // no label for this BB, create one!
-        std::string name = "_AUTO_LABEL_" + std::to_string(autoLabelId++);
+        std::string name = "_auto_" + std::to_string(autoLabelId++);
         G4_Label* label = builder->createLabel(name, LABEL_BLOCK);
         labelInst = createNewLabelInst(label);
         newLabelInst = true;
@@ -674,6 +657,12 @@ void FlowGraph::constructFlowGraph(INST_LIST& instlist)
 {
     MUST_BE_TRUE(!instlist.empty(), ERROR_SYNTAX("empty instruction list"));
 
+    if (builder->hasScratchSurface() && (isStackCallFunc || hasStackCalls))
+    {
+        // unfortunately we can't put this in stack call prolog since this has to be done before RA
+        // ToDo: just hard-wire the scratch-surface offset register?
+        builder->initScratchSurfaceOffset();
+    }
     if (builder->hasFusedEU() &&
         getKernel()->getInt32KernelAttr(Attributes::ATTR_Target) == VISA_CM)
     {
@@ -1054,7 +1043,7 @@ void IR_Builder::materializeGlobalImm(G4_BB* entryBB)
         auto dcl = immPool.getImmDcl(i);
         G4_INST* inst = createMov(
             G4_ExecSize((unsigned)immVal.numElt),
-            Create_Dst_Opnd_From_Dcl(dcl, 1), immVal.imm, InstOpt_WriteEnable, false);
+            createDstRegRegion(dcl, 1), immVal.imm, InstOpt_WriteEnable, false);
         auto iter = std::find_if(entryBB->begin(), entryBB->end(),
             [](G4_INST* inst) { return !inst->isLabel(); });
         INST_LIST_ITER newMov = entryBB->insertBefore(iter, inst);
@@ -3065,7 +3054,7 @@ G4_Label* FlowGraph::insertEndif(G4_BB* bb, G4_ExecSize execSize, bool createLab
     // endifs a new label will be created for each of them.
     if (createLabel)
     {
-        std::string name = "_AUTO_LABEL_%d" + std::to_string(autoLabelId++);
+        std::string name = "_auto" + std::to_string(autoLabelId++);
         G4_Label* label = builder->createLabel(name, LABEL_BLOCK);
         endifWithLabels.emplace(endifInst, label);
         return label;
@@ -3118,7 +3107,7 @@ void FlowGraph::setJIPForEndif(G4_INST* endif, G4_INST* target, G4_BB* targetBB)
 
         if (label == NULL)
         {
-            std::string name = "_AUTO_LABEL_" + std::to_string(autoLabelId++);
+            std::string name = "_auto" + std::to_string(autoLabelId++);
             label = builder->createLabel(name, LABEL_BLOCK);
             endifWithLabels.emplace(target, label);
         }
@@ -3505,6 +3494,85 @@ void FlowGraph::findNestedDivergentBBs(std::unordered_map<G4_BB*, int>& nestedDi
         }
     };
 
+    // For loop with backedge Tail->Head, if Tail is divergent, its divergence should be
+    // propagated to the entire loop as Tail jumps to head, which could go all BBs in the loop.
+    //
+    // In another word, the whole loop's divergence level is the same as Tail's. Once the
+    // entire loop has been handled and Tail's divergence is known, invoking this lambda func
+    // to carry out propagation.
+    //
+    // An example to show WA is needed (nested divergence for Tail):
+    //      Head:                   // initial fuseMask = 11;  2nd iter: fuseMask = 11 (should be 10)
+    //         if (...) goto Tail;  // fuseMask = 11
+    //                              // After if, fusedMask = 01 (bigEU is Off)
+    //         ...
+    //         goto out             // fuseMask = 01 (BigEU off, SmallEU on)
+    //                              // after goto, fuseMask = 00, but HW remains 01
+    //      Tail:
+    //           goto Head          // fuseMask should 10, but HW remains 11, and jump to Head at 2nd iter
+    //      out:
+    auto propLoopDivergence = [&](G4_BB* LoopTail)
+    {
+        // LoopTail must be divergent.
+        std::vector<G4_BB*> workset;
+        workset.push_back(LoopTail);
+        while (!workset.empty())
+        {
+            std::vector<G4_BB*> newWorkset;
+            for (auto iter : workset)
+            {
+                G4_BB* Tail = iter;
+                G4_InstCF* cfInst = Tail->back()->asCFInst();
+
+                assert(nestedDivergentBBs.count(Tail) > 0 &&
+                       "Only divergent Tail shall invoke this func!");
+
+                // Find loop head
+                G4_BB* Head = nullptr;
+                for (G4_BB* succBB : Tail->Succs)
+                {
+                    if ((cfInst->opcode() == G4_goto && cfInst->getUip() == succBB->getLabel()) ||
+                        (cfInst->opcode() == G4_while && cfInst->getJip() == succBB->getLabel()) ||
+                        (cfInst->opcode() == G4_jmpi && cfInst->getSrc(0) == succBB->getLabel()))
+                    {
+                        Head = succBB;
+                        break;
+                    }
+                }
+                assert(Head != nullptr);
+
+                // If Head's divergence level is already higher than Tail, no propagation needed
+                // as Head's divergence has been propagated already.
+                if (nestedDivergentBBs.count(Head) > 0 &&
+                    nestedDivergentBBs[Head] >= nestedDivergentBBs[Tail])
+                {
+                    continue;
+                }
+
+                // Follow physical succs to visit all BBs in this loop
+                for (G4_BB* tBB = Head; tBB != nullptr && tBB != Tail; tBB = tBB->getPhysicalSucc())
+                {
+                    auto miter = nestedDivergentBBs.find(tBB);
+                    if (miter == nestedDivergentBBs.end() || miter->second < nestedDivergentBBs[Tail])
+                    {
+                        // Propagate Tail's divergence. If the new BB is a tail (another loop),
+                        // add it to workset for the further propagation.
+                        nestedDivergentBBs[tBB] = nestedDivergentBBs[Tail];
+                        auto lastOp = tBB->getLastOpcode();
+                        if (lastOp == G4_while ||
+                            ((lastOp == G4_goto || lastOp == G4_jmpi) &&
+                             tBB->back()->asCFInst()->isBackward()))
+                        {
+                            newWorkset.push_back(tBB);
+                        }
+                    }
+                }
+            }
+
+            workset = newWorkset;
+        }
+    };
+
     if (BBs.empty())
     {
         // Sanity check
@@ -3623,6 +3691,20 @@ void FlowGraph::findNestedDivergentBBs(std::unordered_map<G4_BB*, int>& nestedDi
             }
 
             G4_INST* lastInst = BB->back();
+
+            // Need to check whether to propagate WA marking to entire loop!
+            // Do it for CM now, need to apply to all!
+            if (nestedDivergentBBs.count(BB) > 0 && nestedDivergentBBs[BB] >= 2 &&
+                getKernel()->getInt32KernelAttr(Attributes::ATTR_Target) == VISA_CM)
+            {
+                if (lastInst->opcode() == G4_while ||
+                    ((lastInst->opcode() == G4_goto || lastInst->opcode() == G4_jmpi) &&
+                     lastInst->asCFInst()->isBackward()))
+                {
+                    propLoopDivergence(BB);
+                }
+            }
+
             if ((lastInst->opcode() == G4_goto && !lastInst->asCFInst()->isBackward()) ||
                 lastInst->opcode() == G4_break)
             {
@@ -3659,6 +3741,15 @@ void FlowGraph::findNestedDivergentBBs(std::unordered_map<G4_BB*, int>& nestedDi
         // Once all BBs are precessed, cfs should be clear
         assert((!cfs.isInDivergentBranch()) &&
                "ICE(vISA): there is an error in divergence tracking!");
+    }
+
+    for (auto MI : nestedDivergentBBs)
+    {
+        G4_BB* bb = MI.first;
+        if (MI.second >= 2)
+        {
+            bb->setBBType(G4_BB_NM_WA_TYPE);
+        }
     }
     return;
 }
@@ -3720,9 +3811,9 @@ void FlowGraph::addSaveRestorePseudoDeclares(IR_Builder& builder)
     unsigned i = 0;
     for (auto callSite : callSites)
     {
-        const char* nameBase = "VCA_SAVE";
+        const char* nameBase = "VCA_SAVE";  // sizeof(nameBase) = 9, including ending 0
         const int maxIdLen = 3;
-        const char* name = builder.getNameString(mem, strlen(nameBase) + maxIdLen + 1, "%s_%d", nameBase, i);
+        const char* name = builder.getNameString(mem, sizeof(nameBase) + maxIdLen, "%s_%d", nameBase, i);
         G4_Declare* VCA = builder.createDeclareNoLookup(name, G4_GRF, numEltPerGRF<Type_UD>(), builder.kernel.getCallerSaveLastGRF(), Type_UD);
         name = builder.getNameString(mem, 50, "SA0_%d", i);
         G4_Declare* saveA0 = builder.createDeclareNoLookup(name, G4_ADDRESS, (uint16_t)getNumAddrRegisters(), 1, Type_UW);
@@ -3893,7 +3984,9 @@ void vISA::FlowGraph::markStale()
     // mark analysis passes as stale so getters lazily re-run
     // analysis when queried.
     dom.setStale();
+    immDom.setStale();
     pDom.setStale();
+    loops.setStale();
 
     // any other analysis that becomes stale when FlowGraph changes
     // should be marked as stale here.

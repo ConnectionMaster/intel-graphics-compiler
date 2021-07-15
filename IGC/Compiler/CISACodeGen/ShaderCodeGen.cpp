@@ -89,7 +89,7 @@ SPDX-License-Identifier: MIT
 #include "Compiler/GenUpdateCB.h"
 #include "Compiler/PromoteResourceToDirectAS.h"
 #include "Compiler/PromoteStatelessToBindless.h"
-#if defined( _DEBUG ) && !defined( ANDROID )
+#if defined(_DEBUG) && !defined(ANDROID)
 #include "Compiler/VerificationPass.hpp"
 #endif
 #include "Compiler/LegalizationPass.hpp"
@@ -177,28 +177,28 @@ static void AddURBWriteRelatedPass(CodeGenContext& ctx, IGCPassManager& mpm)
 {
 // 3D MergeURBWrite pass
     switch (ctx.type)
-{
-case ShaderType::GEOMETRY_SHADER:
-case ShaderType::VERTEX_SHADER:
-case ShaderType::HULL_SHADER:
-case ShaderType::DOMAIN_SHADER:
-    if (IGC_IS_FLAG_DISABLED(DisableURBWriteMerge))
     {
-        mpm.add(createMergeURBWritesPass());
-
-        if (IGC_IS_FLAG_ENABLED(EnableTEFactorsClear) && (ctx.type == ShaderType::HULL_SHADER))
+    case ShaderType::GEOMETRY_SHADER:
+    case ShaderType::VERTEX_SHADER:
+    case ShaderType::HULL_SHADER:
+    case ShaderType::DOMAIN_SHADER:
+        if (IGC_IS_FLAG_DISABLED(DisableURBWriteMerge))
         {
-            mpm.add(createClearTessFactorsPass());
+            mpm.add(createMergeURBWritesPass());
+
+            if (IGC_IS_FLAG_ENABLED(EnableTEFactorsClear) && (ctx.type == ShaderType::HULL_SHADER))
+            {
+                mpm.add(createClearTessFactorsPass());
+            }
         }
+        if (IGC_IS_FLAG_DISABLED(DisableCodeHoisting))
+        {
+            mpm.add(new CodeHoisting());
+        }
+        break;
+    default:
+        break;
     }
-    if (IGC_IS_FLAG_DISABLED(DisableCodeHoisting))
-    {
-        mpm.add(new CodeHoisting());
-    }
-    break;
-default:
-    break;
-}
 }
 
 static void AddAnalysisPasses(CodeGenContext& ctx, IGCPassManager& mpm)
@@ -363,7 +363,13 @@ static void AddLegalizationPasses(CodeGenContext& ctx, IGCPassManager& mpm, PSSi
     if (highAllocaPressure || isPotentialHPCKernel)
     {
         IGC_SET_FLAG_VALUE(FastCompileRA, 1);
-        //IGC_SET_FLAG_VALUE(HybridRAWithSpill, 1);
+        IGC_SET_FLAG_VALUE(HybridRAWithSpill, 1);
+    }
+    // Disable loop invariant motion after Unmasked functions are inlined
+    // at optimization phase
+    if (IGC_IS_FLAG_ENABLED(EnableUnmaskedFunctions) &&
+        IGC_IS_FLAG_DISABLED(LateInlineUnmaskedFunc)) {
+        IGC_SET_FLAG_VALUE(allowLICM, false);
     }
 
     if (IGC_IS_FLAG_ENABLED(ForceAllPrivateMemoryToSLM) ||
@@ -505,9 +511,9 @@ static void AddLegalizationPasses(CodeGenContext& ctx, IGCPassManager& mpm, PSSi
         if (!isOptDisabled &&
             IGC_IS_FLAG_ENABLED(EnableGASResolver))
         {
+            mpm.add(createSROAPass());
             mpm.add(createFixAddrSpaceCastPass());
             mpm.add(createResolveGASPass());
-            mpm.add(createSROAPass());
         }
         mpm.add(createGenericAddressDynamicResolutionPass());
     }
@@ -692,7 +698,7 @@ static void AddLegalizationPasses(CodeGenContext& ctx, IGCPassManager& mpm, PSSi
         {
             mpm.add(createEarlyCSEPass());
         }
-        else
+        else if (highAllocaPressure || isPotentialHPCKernel)
         {
             mpm.add(createSinkingPass());
         }
@@ -789,6 +795,10 @@ static void AddLegalizationPasses(CodeGenContext& ctx, IGCPassManager& mpm, PSSi
         mpm.add(llvm::createDeadCodeEliminationPass());
         mpm.add(createEmu64OpsPass());
         ctx.m_hasEmu64BitInsts = true;
+        if (!isOptDisabled)
+        {
+            mpm.add(new GenSpecificPattern());
+        }
     }
 
     mpm.add(createInstSimplifyLegacyPass());
@@ -1165,7 +1175,8 @@ void CodeGen(ComputeShaderContext* ctx, CShaderProgram::KernelShaderMap& shaders
     }
     // csInfo.forcedSIMDSize == 8 means force least SIMD.
     // If the SIMD8 is not allowed, it will return higher SIMD
-    else if (IGC_IS_FLAG_ENABLED(ForceCSLeastSIMD) || ctx->getModuleMetaData()->csInfo.forcedSIMDSize == 8 || waveSize == 8)
+    else if (IGC_IS_FLAG_ENABLED(ForceCSLeastSIMD)
+        || ctx->getModuleMetaData()->csInfo.forcedSIMDSize == 8 || waveSize == 8)
     {
         AddCodeGenPasses(*ctx, shaders, PassMgr, simdModeAllowed, false);
     }
@@ -1517,7 +1528,7 @@ void OptimizeIR(CodeGenContext* const pContext)
         });
 
         mpm.add(new TargetTransformInfoWrapperPass(GenTTgetIIRAnalysis));
-#if defined( _DEBUG ) && !defined( ANDROID )
+#if defined(_DEBUG) && !defined(ANDROID)
         // IGC IR Verification pass checks that we get a correct IR after the Unification.
         mpm.add(new VerificationPass());
 #endif
@@ -1543,7 +1554,8 @@ void OptimizeIR(CodeGenContext* const pContext)
              IGC_IS_FLAG_ENABLED(EnableForceGroupSize)) &&
             (pContext->type == ShaderType::COMPUTE_SHADER) &&
             !pContext->platform.supportPooledEU() &&
-            pContext->platform.supportsThreadCombining())
+            pContext->platform.supportsThreadCombining()&&
+            SimdEarlyCheck(pContext))
         {
             initializePostDominatorTreeWrapperPassPass(*PassRegistry::getPassRegistry());
             mpm.add(new ThreadCombining());
@@ -1608,9 +1620,9 @@ void OptimizeIR(CodeGenContext* const pContext)
         if (pContext->m_instrTypes.hasGenericAddressSpacePointers &&
             IGC_IS_FLAG_ENABLED(EnableGASResolver))
         {
+            mpm.add(createSROAPass());
             mpm.add(createFixAddrSpaceCastPass());
             mpm.add(createResolveGASPass());
-            mpm.add(createSROAPass());
         }
 
         if (IGC_IS_FLAG_ENABLED(SampleMultiversioning) || pContext->m_enableSampleMultiversioning)
@@ -1619,9 +1631,9 @@ void OptimizeIR(CodeGenContext* const pContext)
                 mpm.add(new SampleMultiversioning(pContext));
         }
 
-        bool disableGOPT = ( ( IsStage1FastestCompile( pContext->m_CgFlag, pContext->m_StagingCtx ) ||
-                               IGC_GET_FLAG_VALUE( ForceFastestSIMD ) ) &&
-                             ( IGC_GET_FLAG_VALUE( FastestS1Experiments ) & FCEXP_DISABLE_GOPT ) );
+        bool disableGOPT = ((IsStage1FastestCompile(pContext->m_CgFlag, pContext->m_StagingCtx) ||
+                               IGC_GET_FLAG_VALUE(ForceFastestSIMD)) &&
+                             (IGC_GET_FLAG_VALUE(FastestS1Experiments) & FCEXP_DISABLE_GOPT));
 
         if (pContext->m_instrTypes.hasMultipleBB && !disableGOPT)
         {

@@ -314,6 +314,14 @@ namespace IGC
         void SubPair(CVariable* Lo, CVariable* Hi, CVariable* L0, CVariable* H0, CVariable* L1, CVariable* H1);
         inline void dp4a(CVariable* dst, CVariable* src0, CVariable* src1, CVariable* src2);
         void Lifetime(VISAVarLifetime StartOrEnd, CVariable* dst);
+        void dpas(CVariable* dst, CVariable* input, CVariable* weight, PrecisionType weight_precision,
+            CVariable* actication, PrecisionType activation_precision, uint8_t systolicDepth,
+            uint8_t repeatCount, bool IsDpasw);
+        void bf_cvt(CVariable* dst, CVariable* src);
+        void fcvt(CVariable* dst, CVariable* src);
+        void Bfn(uint8_t booleanFuncCtrl, CVariable* dst, CVariable* src0, CVariable* src1, CVariable* src2);
+        void QWGather(CVariable* dst, const ResourceDescriptor& resource, CVariable* offset, unsigned elementSize, unsigned numElems);
+        void QWScatter(CVariable* src, const ResourceDescriptor& resource, CVariable* offset, unsigned elementSize, unsigned numElems);
         // VME
         void SendVmeIme(
             CVariable* bindingTableIndex,
@@ -533,9 +541,12 @@ namespace IGC
         // input/output: symbols: for ZEBinary foramt
         // FIXME: Currently we will fill both structures for patch-token-based and ZEBinary format. Can refactor the code
         // to do only one based on produced binary format (regkey: EnableZEBinary)
-        void CreateSymbolTable(void*& buffer, unsigned& bufferSize, unsigned& tableEntries, SProgramOutput::SymbolLists& symbols);
+        // Note that this function should be called only once even if there are multiple kernels in a program. Current IGC
+        // flow will create all symbols in the first kernel and all the other kernels won't contain symbols
+        void CreateSymbolTable(void*& buffer, unsigned& bufferSize, unsigned& tableEntries,
+            SProgramOutput::ZEBinFuncSymbolTable& funcSyms, SOpenCLProgramInfo::ZEBinProgramSymbolTable& programSyms);
         // Create function symbols for kernels. This is ZEBinary foramt only.
-        void CreateKernelSymbol(const std::string& kernelName, const VISAKernel& visaKernel, SProgramOutput::SymbolLists& symbols);
+        void CreateKernelSymbol(const std::string& kernelName, const VISAKernel& visaKernel, SProgramOutput::ZEBinFuncSymbolTable& symbols);
 
         // CreateRelocationTable
         // input/output: buffer, bufferSize, tableEntries: for patch-token-based format.
@@ -1002,6 +1013,7 @@ namespace IGC
     inline void CEncoder::BeginForcedNoMaskRegion()
     {
         ++m_nestLevelForcedNoMaskRegion;
+        // Start submitting insts with NoMask control
         m_encoderState.m_noMask = true;
     }
 
@@ -1009,6 +1021,10 @@ namespace IGC
     {
         --m_nestLevelForcedNoMaskRegion;
         IGC_ASSERT_MESSAGE(m_nestLevelForcedNoMaskRegion >= 0, "Invalid nesting of Unmasked regions");
+        // Out of unmasked region, return to submitting insts
+        // with Mask control
+        if (m_nestLevelForcedNoMaskRegion == 0)
+            m_encoderState.m_noMask = false;
     }
 
     inline void CEncoder::SetNoMask()
@@ -1072,4 +1088,6 @@ namespace IGC
     VISAChannelMask ConvertChannelMaskToVisaType(uint mask);
     VISASourceSingleChannel ConvertSingleSourceChannel(uint srcChannel);
 
+
+    GenPrecision ConvertPrecisionToVisaType(PrecisionType P);
 }

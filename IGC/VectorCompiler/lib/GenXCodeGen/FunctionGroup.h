@@ -1,24 +1,8 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (c) 2000-2021 Intel Corporation
+Copyright (C) 2017-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"),
-to deal in the Software without restriction, including without limitation
-the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom
-the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-IN THE SOFTWARE.
+SPDX-License-Identifier: MIT
 
 ============================= end_copyright_notice ===========================*/
 
@@ -128,12 +112,17 @@ private:
   SmallVector<FunctionGroup *, 8> NonMainGroups;
 
   class FGMap {
-    using ElementType = std::map<Function *, FunctionGroup *>;
-    ElementType data[static_cast<size_t>(FGType::MAX)];
-
+    using ElementType = std::map<const Function *, FunctionGroup *>;
+    std::array<ElementType, static_cast<size_t>(FGType::MAX)> data = {};
   public:
     ElementType &operator[](FGType type) {
       auto index = static_cast<size_t>(type);
+      IGC_ASSERT(index < data.size());
+      return data[index];
+    }
+    const ElementType &operator[](FGType type) const {
+      auto index = static_cast<size_t>(type);
+      IGC_ASSERT(index < data.size());
       return data[index];
     }
   };
@@ -161,12 +150,12 @@ public:
   // clear : clear out the FunctionGroupAnalysis
   void clear();
   // getGroup : get the FunctionGroup containing Function F, else 0
-  FunctionGroup *getGroup(Function *F, FGType Type);
-  FunctionGroup *getGroup(Function *F);
-  FunctionGroup *getSubGroup(Function *F);
+  FunctionGroup *getGroup(const Function *F, FGType Type) const;
+  FunctionGroup *getGroup(const Function *F) const;
+  FunctionGroup *getSubGroup(const Function *F) const;
   // getGroupForHead : get the FunctionGroup for which Function F is the
   // head, else 0
-  FunctionGroup *getGroupForHead(Function *F);
+  FunctionGroup *getGroupForHead(const Function *F) const;
   // replaceFunction : replace a Function in a FunctionGroup
   void replaceFunction(Function *OldF, Function *NewF);
   // iterator for FunctionGroups in the analysis

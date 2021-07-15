@@ -1,24 +1,8 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017-2021 Intel Corporation
+Copyright (C) 2017-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"),
-to deal in the Software without restriction, including without limitation
-the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom
-the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-IN THE SOFTWARE.
+SPDX-License-Identifier: MIT
 
 ============================= end_copyright_notice ===========================*/
 
@@ -74,15 +58,16 @@ protected:
     ansi_esc ANSI_SUBFUNCTION;
     ansi_esc ANSI_COMMENT;
 
-
     void formatDstOp(const Instruction &i);
     void formatSrcOp(SourceIndex ix, const Instruction &i);
+    void formatSyncAllSrc0(const Instruction &i);
     void formatBareRegisterUnescaped(RegName regName, int regNum);
     void formatRegister(
         RegName rnm,
         RegRef reg,
         bool emitSubReg = true,
         bool isSIMT = false);
+    void formatSendSrcWithLength(const Operand &src, int srcLen);
     void formatDstType(const OpSpec &os, Type type);
     void formatSrcBare(const Operand &src);
 
@@ -344,6 +329,13 @@ public:
 
     bool formatLoadStoreSyntax(const Instruction& i);
 
+    static bool useSyncAllSetSyntax(const Instruction &i)
+    {
+        return i.is(Op::SYNC) &&
+            (i.getSubfunction().sync == SyncFC::ALLRD ||
+                i.getSubfunction().sync == SyncFC::ALLWR);
+    }
+
     void formatNormalInstructionBody(
         const Instruction& i,
         const std::string& debugSendDecode)
@@ -377,7 +369,11 @@ public:
         } else {
             if (nSrcs >= 1) {
                 emit("  ");
-                formatSrcOp(SourceIndex::SRC0, i);
+                if (useSyncAllSetSyntax(i)) {
+                    formatSyncAllSrc0(i);
+                } else {
+                    formatSrcOp(SourceIndex::SRC0, i);
+                }
             }
             if (nSrcs >= 2) {
                 emit("  ");
@@ -515,6 +511,26 @@ private:
             } // else part of ex_desc
             break;
         case Op::SYNC:   subfunc = ToSyntax(i.getSyncFc()); break;
+        case Op::BFN:
+            if (opts.syntaxBfnSymbolicFunctions) {
+                // decode binary function names to symbolic
+                // bfn.(s0&s1|~s2)
+                subfunc += "(";
+                subfunc += i.getBfnFc().c_str();
+                subfunc += ")";
+            } else {
+                // use a raw value
+                // emit<uint32_t>(i.getBfnFc().value);
+                std::stringstream ss;
+                ss << "0x" << std::hex << std::setw(2) << std::setfill('0') <<
+                    std::uppercase << i.getBfnFc().value;
+                subfunc = ss.str();
+            }
+            break;
+        case Op::DPAS:
+        case Op::DPASW:
+            subfunc = ToSyntax(i.getDpasFc());
+            break;
         default:
             if (os.supportsBranchCtrl() &&
                 i.getBranchCtrl() == BranchCntrl::ON)
@@ -784,6 +800,9 @@ private:
                 semiColon.insert();
                 ss << debugSendDecode;
             }
+        } else if (i.is(Op::BFN) && !opts.syntaxBfnSymbolicFunctions) {
+            semiColon.insert();
+            ss << i.getBfnFc().c_str();
         }
 
         if (ss.tellp() > 0) {
@@ -870,8 +889,26 @@ void Formatter::formatDstType(const OpSpec &os, Type type)
     }
 }
 
+void Formatter::formatSendSrcWithLength(const Operand &src, int srcLen)
+{
+    emit(ANSI_REGISTER(src.getDirRegName()));
 
+    const RegInfo *ri = model.lookupRegInfoByRegName(src.getDirRegName());
+    if (ri == nullptr) {
+        emit("???");
+        return;
+    }
+    emit(ri->syntax);
+    int regNum = (int)src.getDirRegRef().regNum;
+    if (regNum != 0 || ri->hasRegNum()) {
+        emit(regNum);
+    }
 
+    // src register format: r10:4 means r10-r13 (used to be r10#4)
+    emit(":"); emit(srcLen);
+
+    emit(ANSI_RESET);
+}
 
 void Formatter::formatBareRegisterUnescaped(RegName regName, int regNum)
 {
@@ -918,6 +955,7 @@ void Formatter::formatRegister(
 
     emit(ANSI_RESET);
 }
+
 
 void Formatter::formatDstOp(const Instruction &i)
 {
@@ -984,7 +1022,23 @@ void Formatter::formatSrcOp(
 
     switch (src.getKind()) {
     case Operand::Kind::DIRECT: {
+        // If Src1.Length is not encoded in the ExDesc (but rather in EU ISA)
+        // then we need to emit Src1.Length somewhere else.  We've chosen
+        // to the suffix the source register.
+        //   e.g. r1:4
+        // This holds for XeHP with ExBSO
+        auto exDesc = i.getExtMsgDescriptor();
+        const bool isSendSrc1 = srcIx == SourceIndex::SRC1 &&
+            os.isSendOrSendsFamily();
+        auto src1NeedsLenSuffix =
+            isSendSrc1 && i.hasInstOpt(InstOpt::EXBSO);
         //
+        if (src1NeedsLenSuffix) {
+            formatSendSrcWithLength(
+                src,
+                i.getSrc1Length());
+            break;
+        }
         bool hasSubreg =
             os.hasSrcSubregister(static_cast<int>(srcIx), i.isMacro());
         bool isSimt =
@@ -1044,6 +1098,9 @@ void Formatter::formatSrcOp(
         case Type::UQ:
             emitHex(src.getImmediateValue().u64);
             break;
+        case Type::BF:
+            emitHex(src.getImmediateValue().u16);
+            break;
         case Type::HF:
             if (opts.hexFloats) {
                 emitHex(src.getImmediateValue().u16);
@@ -1097,11 +1154,37 @@ void Formatter::formatSrcOp(
     if (!model.supportsSimplifiedBranches() ||
         src.getKind() != Operand::Kind::LABEL)
     {
-        formatSourceType(static_cast<int>(srcIx), os, src);
+        formatSourceType(int(srcIx), os, src);
     }
     finishColumn();
 } // end formatSrcOp()
 
+// e.g. formats: sync.allrd ($1,$3,$7)
+void Formatter::formatSyncAllSrc0(const Instruction &i)
+{
+    const auto &src0 = i.getSource(0);
+    if (src0.getKind() != Operand::Kind::IMMEDIATE) {
+        // e.g.  sync.allrd  null
+        formatSrcOp(SourceIndex::SRC0, i);
+    } else {
+        // e.g.  sync.allrd  ($1,$3,$7,$13)
+        emit(ANSI_IMMEDIATE);
+        auto sbids = src0.getImmediateValue().u32;
+        bool first = true;
+        emit("(");
+        for (int i = 0; i < 32; i++) {
+            if ((1 << i) & sbids) {
+                if (first)
+                    first = false;
+                else
+                    emit(",");
+                emit("$", i);
+            }
+        }
+        emit(")");
+        emit(ANSI_RESET);
+    }
+}
 
 void Formatter::formatInstOpts(
     const Instruction &i,
@@ -1141,6 +1224,22 @@ void Formatter::formatInstOpts(
             emit("@");
             emit((int)di.minDist);
             break;
+        case SWSB::DistType::REG_DIST_ALL:
+            emit("A@");
+            emit((int)di.minDist);
+            break;
+        case SWSB::DistType::REG_DIST_FLOAT:
+            emit("F@");
+            emit((int)di.minDist);
+            break;
+        case SWSB::DistType::REG_DIST_INT:
+            emit("I@");
+            emit((int)di.minDist);
+            break;
+        case SWSB::DistType::REG_DIST_LONG:
+            emit("L@");
+            emit((int)di.minDist);
+            break;
         default:
             break;
         }
@@ -1169,7 +1268,6 @@ void Formatter::formatInstOpts(
     }
     emit('}');
 } // end formatInstOpts
-
 
 bool Formatter::formatLoadStoreSyntax(const Instruction& i) {
     const auto desc = i.getMsgDescriptor();
@@ -1325,6 +1423,8 @@ void FormatOpts::addApiOpts(uint32_t fmtOpts)
         (fmtOpts & IGA_FORMATTING_OPT_PRINT_DEPS) != 0;
     printLdSt =
         (fmtOpts & IGA_FORMATTING_OPT_PRINT_LDST) != 0;
+    syntaxBfnSymbolicFunctions =
+        (fmtOpts & IGA_FORMATTING_OPT_PRINT_BFNEXPRS) != 0;
     printAnsi =
         (fmtOpts & IGA_FORMATTING_OPT_PRINT_ANSI) != 0;
     printJson =

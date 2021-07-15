@@ -1,24 +1,8 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (c) 2020-2021 Intel Corporation
+Copyright (C) 2017-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"),
-to deal in the Software without restriction, including without limitation
-the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom
-the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-IN THE SOFTWARE.
+SPDX-License-Identifier: MIT
 
 ============================= end_copyright_notice ===========================*/
 
@@ -44,6 +28,8 @@ def DumpRegAlloc: SubtargetFeature<"dump_regalloc", "DumpRegAlloc",
 
 def FeatureLongLong : SubtargetFeature<"longlong", "HasLongLong", "true",
                                        "supports long long">;
+def FeatureFP64: SubtargetFeature<"fp64", "HasFP64", "true",
+                                  "support for double types">;
 
 def FeatureUseMulDDQ : SubtargetFeature<"mul_ddq",
                                         "UseMulDDQ",
@@ -68,6 +54,11 @@ def FeatureNoJumpTables : SubtargetFeature<"disable_jump_tables", "DisableJumpTa
 
 def FeatureSwitchjmp : SubtargetFeature<"switchjmp", "HasSwitchjmp", "true",
                                         "supports switchjmp visa instruction">;
+
+def FeatureWAFusedEUNoMask : SubtargetFeature<
+    "wa_nomask_fusedEU", "WaNoMaskFusedEU", "true",
+    "needs workaround for nomask operations under divergent control-flow">;
+
 def FeatureIntDivRem32: SubtargetFeature<"divrem32",
                                          "HasIntDivRem32",
                                          "true",
@@ -96,37 +87,51 @@ def : Proc<"HSW",             [FeatureLongLongEmulation, FeatureSwitchjmp,
                                FeatureIntDivRem32]>;
 def : Proc<"BDW",             [FeatureLongLong, FeatureSwitchjmp,
                                FeatureIntDivRem32,
-                               FeatureInstrAdd64]>;
+                               FeatureInstrAdd64,
+                               FeatureFP64]>;
 def : Proc<"CHV",             [FeatureLongLong, FeatureSwitchjmp,
                                FeatureIntDivRem32,
-                               FeatureInstrAdd64]>;
+                               FeatureInstrAdd64,
+                               FeatureFP64]>;
 def : Proc<"SKL",             [FeatureLongLong, FeatureSwitchjmp,
                                FeatureIntDivRem32,
                                FeatureUseMulDDQ,
-                               FeatureInstrAdd64]>;
+                               FeatureInstrAdd64,
+                               FeatureFP64]>;
 def : Proc<"BXT",             [FeatureLongLong, FeatureSwitchjmp,
                                FeatureIntDivRem32,
                                FeatureUseMulDDQ,
-                               FeatureInstrAdd64]>;
+                               FeatureInstrAdd64,
+                               FeatureFP64]>;
 def : Proc<"KBL",             [FeatureLongLong, FeatureSwitchjmp,
                                FeatureIntDivRem32,
                                FeatureUseMulDDQ,
-                               FeatureInstrAdd64]>;
+                               FeatureInstrAdd64,
+                               FeatureFP64]>;
 def : Proc<"GLK",             [FeatureLongLong, FeatureSwitchjmp,
                                FeatureIntDivRem32,
                                FeatureUseMulDDQ,
-                               FeatureInstrAdd64]>;
+                               FeatureInstrAdd64,
+                               FeatureFP64]>;
 def : Proc<"CNL",             [FeatureLongLong, FeatureSwitchjmp,
                                FeatureIntDivRem32,
                                FeatureUseMulDDQ,
-                               FeatureInstrAdd64]>;
+                               FeatureInstrAdd64,
+                               FeatureFP64]>;
 def : Proc<"ICL",             [FeatureLongLong, FeatureSwitchjmp,
                                FeatureIntDivRem32,
                                FeatureUseMulDDQ,
-                               FeatureInstrAdd64]>;
+                               FeatureInstrAdd64,
+                               FeatureFP64]>;
 def : Proc<"ICLLP",           [FeatureLongLongEmulation, FeatureSwitchjmp,
                                FeatureIntDivRem32]>;
-def : Proc<"TGLLP",           [FeatureLongLongEmulation, FeatureIntDivRem32]>;
+def : Proc<"TGLLP",           [FeatureLongLongEmulation, FeatureIntDivRem32,
+                               FeatureWAFusedEUNoMask]>;
+def : Proc<"DG1",             [FeatureLongLongEmulation, FeatureIntDivRem32,
+                               FeatureWAFusedEUNoMask]>;
+def : Proc<"XEHP",            [FeatureLongLong,
+                               FeatureInstrAdd64,
+                               FeatureFP64]>;
 
 def GenX : Target {
   // Nothing here (yet?)

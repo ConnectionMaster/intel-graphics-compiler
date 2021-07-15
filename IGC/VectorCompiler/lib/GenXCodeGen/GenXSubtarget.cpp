@@ -1,24 +1,8 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (c) 2000-2021 Intel Corporation
+Copyright (C) 2017-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"),
-to deal in the Software without restriction, including without limitation
-the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom
-the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-IN THE SOFTWARE.
+SPDX-License-Identifier: MIT
 
 ============================= end_copyright_notice ===========================*/
 
@@ -59,6 +43,7 @@ void GenXSubtarget::resetSubtargetFeatures(StringRef CPU, StringRef FS) {
   DumpRegAlloc = false;
   EmitCisa = false;
   HasLongLong = false;
+  HasFP64 = false;
   DisableJmpi = false;
   DisableVectorDecomposition = false;
   DisableJumpTables = false;
@@ -68,6 +53,7 @@ void GenXSubtarget::resetSubtargetFeatures(StringRef CPU, StringRef FS) {
   UseMulDDQ = false;
   OCLRuntime = false;
   HasSwitchjmp = false;
+  WaNoMaskFusedEU = false;
   HasIntDivRem32 = false;
 
   if (StackScratchMem)
@@ -87,8 +73,8 @@ void GenXSubtarget::resetSubtargetFeatures(StringRef CPU, StringRef FS) {
     .Case("ICLLP", GENX_ICLLP)
     .Case("TGLLP", GENX_TGLLP)
     .Case("DG1", GENX_DG1)
+    .Case("XEHP", XE_HP_SDV)
     .Default(GENX_SKL);
-
 
   std::string CPUName(CPU);
   if (CPUName.empty())

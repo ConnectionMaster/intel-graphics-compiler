@@ -12,6 +12,7 @@ SPDX-License-Identifier: MIT
 
 #include "common/LLVMWarningsPush.hpp"
 #include <llvm/Pass.h>
+#include <llvm/IR/Operator.h>
 #include "common/LLVMWarningsPop.hpp"
 
 namespace IGC
@@ -28,6 +29,8 @@ namespace IGC
         static char ID;
 
         SetFastMathFlags();
+
+        SetFastMathFlags(llvm::FastMathFlags Mask);
 
         ~SetFastMathFlags() {}
 
@@ -46,10 +49,12 @@ namespace IGC
 
     private:
         /// @brief  sets the given flags to all instruction supporting fast math flags in the given module.
-        /// @param  M - the module
+        /// @param  F - the function
         /// @param  fmfs - the fast math flags
         /// @return true if made any changes to the module.
-        static bool setFlags(llvm::Module& M, llvm::FastMathFlags fmfs);
+        static bool setFlags(llvm::Function& F, llvm::FastMathFlags fmfs);
+
+        llvm::FastMathFlags m_Mask;
     };
 
 } // namespace IGC

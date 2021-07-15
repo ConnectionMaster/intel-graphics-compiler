@@ -1,28 +1,10 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2017-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
+============================= end_copyright_notice ===========================*/
 
 #ifndef __OPTIMIZER_H__
 #define __OPTIMIZER_H__
@@ -169,8 +151,16 @@ class Optimizer
     void evalAddrExp() { kernel.evalAddrExp(); }
     void preRA_Schedule()
     {
-        preRA_Scheduler Sched(kernel, mem, /*rpe*/ nullptr);
-        Sched.run();
+        if (kernel.useRegSharingHeuristics())
+        {
+            preRA_RegSharing Sched(kernel, mem, /*rpe*/ nullptr);
+            Sched.run();
+        }
+        else
+        {
+            preRA_Scheduler Sched(kernel, mem, /*rpe*/ nullptr);
+            Sched.run();
+        }
     }
     void localSchedule()
     {
@@ -178,7 +168,7 @@ class Optimizer
         lSched.localScheduling();
     }
 
-    void adjustIndirectCallOffset();
+    void adjustIndirectCallOffsetAfterSWSBSet();
 
     void addSWSBInfo();
 
@@ -195,6 +185,8 @@ class Optimizer
     void dce();
 
     void accSubPostSchedule();
+
+    void accSubBeforeRA();
 
     // return true if BuiltInR0 gets a different allocation than r0
     bool R0CopyNeeded();
@@ -248,22 +240,31 @@ private:
     void setA0toTdrForSendc();
     void replaceRetWithJmpi();
     void doNoMaskWA();
+    void doNoMaskWA_postRA();
     void insertFenceAtEntry();
     void expandMulPostSchedule();
+    void expandMadwPostSchedule();
 
     typedef std::vector<vISA::G4_INST*> InstListType;
+    // create instruction sequence to calculate call offset from ip
     void expandIndirectCallWithRegTarget();
+    // a helper function to create instruction sequence to replace indirect call with jmpi
     void createInstForJmpiSequence(InstListType& insts, G4_INST* fcall);
-    // create the instructions to calculate the jump target offset, return G4_Declare of the
-    // new created jmp target
+    // a hlper function to create the instructions to calculate the jump target offset,
+    // return G4_Declare of the new created jmp target
     G4_Declare* createInstsForCallTargetOffset(
         InstListType& insts, G4_INST* fcall, int64_t adjust_off);
+    // a helper function to create the instructions to get ip from call's dst
+    // This is a WA for platforms can't support ip register
+    // The give add_with_ip must be an add instruction with ip register as its src0
+    void replaceIPWithCall(InstListType& insts, G4_INST* add_with_ip);
 
     void insertDummyMad(G4_BB* bb, INST_LIST_ITER inst_it);
 
     void insertDummyCsel(G4_BB* bb, INST_LIST_ITER inst_it, bool newBB);
 
     void insertDummyMov(G4_BB* bb, INST_LIST_ITER inst_it, G4_Operand* opnd);
+    void insertDummyMovForHWRSWADPAS(G4_BB* bb);
     void insertDummyMovForHWRSWA();
     void insertHashMovs();
     void insertDummyCompactInst();
@@ -348,6 +349,7 @@ public:
         PI_countGRFUsage,
         PI_changeMoveType,
         PI_reRAPostSchedule,
+        PI_accSubBeforeRA,
         PI_accSubPostSchedule,
         PI_dce,
         PI_reassociateConst,
@@ -363,6 +365,7 @@ public:
         PI_removeInstrinsics,
         PI_expandMulPostSchedule,
         PI_addSWSBInfo,
+        PI_expandMadwPostSchedule,
         PI_NUM_PASSES
     };
 

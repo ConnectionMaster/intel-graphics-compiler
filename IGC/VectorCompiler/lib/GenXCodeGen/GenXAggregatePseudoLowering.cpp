@@ -1,24 +1,8 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (c) 2000-2021 Intel Corporation
+Copyright (C) 2020-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"),
-to deal in the Software without restriction, including without limitation
-the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom
-the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-IN THE SOFTWARE.
+SPDX-License-Identifier: MIT
 
 ============================= end_copyright_notice ===========================*/
 
@@ -206,7 +190,8 @@ static Instruction *getInsertionPtForSplitOp(Use &Op, Instruction &Inst) {
   auto &OpVal = *Op.get();
   if (isa<Instruction>(OpVal))
     return getFirstInsertionPtAfter(cast<Instruction>(OpVal));
-  IGC_ASSERT_MESSAGE(isa<Constant>(OpVal), "only instruction or constant are expected");
+  IGC_ASSERT_MESSAGE(isa<Constant>(OpVal) || isa<Argument>(OpVal),
+    "only instruction, constant or argument are expected");
   return getFirstInsertionPtBefore(Op, Inst);
 }
 
@@ -335,9 +320,20 @@ public:
     auto *GEP = IRB.CreateInBoundsGEP(OrigLoad.getPointerOperand(),
                                       {IRB.getInt32(0), IRB.getInt32(Idx)},
                                       OrigLoad.getName() + "aggr.gep");
+    // FIXME: replace a structure alignment with an element alignment
     return IRB.CreateAlignedLoad(GEP, IGCLLVM::getAlign(OrigLoad),
                                  OrigLoad.isVolatile(),
                                  OrigLoad.getName() + ".split.aggr");
+  }
+
+  Instruction *visitStoreInst(StoreInst &OrigStore) const {
+    IRBuilder<> IRB{&OrigStore};
+    auto *GEP = IRB.CreateInBoundsGEP(OrigStore.getPointerOperand(),
+                                      {IRB.getInt32(0), IRB.getInt32(Idx)},
+                                      OrigStore.getName() + "aggr.gep");
+    // FIXME: replace a structure alignment with an element alignment
+    return IRB.CreateAlignedStore(NewOps[0], GEP, IGCLLVM::getAlign(OrigStore),
+                                  OrigStore.isVolatile());
   }
 };
 
@@ -356,6 +352,25 @@ static Instruction *createSplitInst(Instruction &Inst,
 
 // Arguments:
 //    \p Inst - original instruction
+//
+// Returns the aggregate's elements number.
+// An aggregate can be an operand or a return value.
+static int getAggregateElementsNum(const Instruction &Inst) {
+  if (Inst.getType()->isAggregateType()) {
+    auto &InstTy = *cast<StructType>(Inst.getType());
+    return InstTy.getNumElements();
+  }
+  IGC_ASSERT_MESSAGE(hasAggregateOperand(Inst),
+    "expected an aggregate as either an operand, or a return value");
+  auto AggrOperandIt = llvm::find_if(Inst.operand_values(), [](const Value *V) {
+    return V->getType()->isAggregateType();
+  });
+  auto &AggrOperandTy = *cast<StructType>(AggrOperandIt->getType());
+  return AggrOperandTy.getNumElements();
+}
+
+// Arguments:
+//    \p Inst - original instruction
 //    \p SplitOps - map between original aggregate operands and corresponding
 //                  elementary operands
 //
@@ -364,9 +379,8 @@ static Instruction *createSplitInst(Instruction &Inst,
 static std::vector<Instruction *>
 createSplitInsts(Instruction &Inst, const SplitOpsMap &SplitOps) {
   // TODO: support ArrayType
-  auto &InstTy = *cast<StructType>(Inst.getType());
-  int NumNewInsts = InstTy.getNumElements();
   std::vector<Instruction *> NewInsts;
+  int NumNewInsts = getAggregateElementsNum(Inst);
   NewInsts.reserve(NumNewInsts);
   for (int Idx = 0; Idx < NumNewInsts; ++Idx) {
     auto NewOps = createSplitInstOperands(Idx, Inst.operands(), SplitOps);
@@ -403,9 +417,11 @@ void GenXAggregatePseudoLowering::processInst(Instruction &Inst) {
   if (hasAggregateOperand(Inst))
     NewOperands = createSplitOperands(Inst);
   auto NewInsts = createSplitInsts(Inst, NewOperands);
-  auto *JoinInst =
-      joinSplitInsts(NewInsts, Inst.getType(), getFirstInsertionPtAfter(Inst));
-  Inst.replaceAllUsesWith(JoinInst);
-  JoinInst->takeName(&Inst);
+  if (Inst.getType()->isAggregateType()) {
+    auto *JoinInst =
+        joinSplitInsts(NewInsts, Inst.getType(), getFirstInsertionPtAfter(Inst));
+    Inst.replaceAllUsesWith(JoinInst);
+    JoinInst->takeName(&Inst);
+  }
   ToErase.push_back(&Inst);
 }

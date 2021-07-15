@@ -84,6 +84,18 @@ bool ImplicitGlobalId::runOnFunction(Function& F)
 {
     IGC_ASSERT_MESSAGE(!F.isDeclaration(), "Expect kernel functions, which must be defined");
 
+    // When stack calls are enabled, default behavior is to skip these in all functions
+    if (F.getCallingConv() != llvm::CallingConv::SPIR_KERNEL &&
+        IGC_GET_FLAG_VALUE(FunctionControl) != FLAG_FCALL_FORCE_INLINE &&
+        IGC_IS_FLAG_ENABLED(ForceInlineStackCallWithImplArg))
+    {
+        // Insert in functions only when reg key is set
+        if (IGC_IS_FLAG_DISABLED(EmitPreDefinedForAllFunctions))
+        {
+            return false;
+        }
+    }
+
     insertComputeIds(&F);
     return true;
 }
@@ -369,7 +381,7 @@ bool CleanImplicitIds::processFunc(Function& F)
                 }
                 Top->eraseFromParent();
             }
-            else if (Top->getNumUses() == 1)
+            else if (Top->hasOneUse())
             {
                 // Catch specific case:
                 // %localIdX49 = zext i16 %localIdX to i32
@@ -381,7 +393,7 @@ bool CleanImplicitIds::processFunc(Function& F)
                     if (CmpI->getOperand(0) == Top &&
                         isa<ConstantInt>(CmpI->getOperand(1)))
                     {
-                        if (CmpI->getNumUses() == 1)
+                        if (CmpI->hasOneUse())
                         {
                             if (auto IntrinsicI = dyn_cast_or_null<IntrinsicInst>(*CmpI->user_begin()))
                             {

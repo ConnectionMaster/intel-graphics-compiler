@@ -33,16 +33,6 @@ CVariable* CPixelShader::GetR1()
     return m_R1;
 }
 
-std::vector<CVariable*>& CPixelShader::GetR1Lo()
-{
-    return m_R1Lo;
-}
-
-void CPixelShader::AppendR1Lo(CVariable* var)
-{
-    m_R1Lo.push_back(var);
-}
-
 CVariable* CPixelShader::GetCoarseR1()
 {
     IGC_ASSERT(m_phase == PSPHASE_PIXEL);
@@ -145,10 +135,6 @@ void CPixelShader::AllocatePSPayload()
         for (uint i = 0; i < GetR1()->GetNumberInstance(); i++)
         {
             AllocateInput(GetR1(), offset, i, forceLiveOut);
-            for (auto R1Lo: GetR1Lo()) {
-                AllocateInput(R1Lo, offset, i, forceLiveOut);
-            }
-
             offset += getGRFSize();
         }
     }
@@ -274,7 +260,6 @@ void CPixelShader::AllocatePSPayload()
     unsigned int payloadEnd = offset;
     for (uint i = 0; i < setup.size(); i++)
     {
-
         if (setup[i] && setup[i]->GetAlias() == NULL)
         {
             uint subRegOffset = 0;
@@ -285,6 +270,7 @@ void CPixelShader::AllocatePSPayload()
                     subRegOffset = 3 * SIZE_DWORD;
                 }
             }
+
             AllocateInput(setup[i], offset + subRegOffset);
 
             if (m_Signature)
@@ -849,7 +835,7 @@ void CPixelShader::FillProgram(SPixelShaderKernelProgram* pKernelProgram)
     pKernelProgram->RenderTargetLoaded = m_renderTargetLoaded;
 
     pKernelProgram->hasControlFlow = m_numBlocks > 1 ? true : false;
-    pKernelProgram->MaxNumberOfThreads = m_Platform->getMaxPixelShaderThreads();
+    pKernelProgram->MaxNumberOfThreads = m_Platform->getMaxPixelShaderThreads() / GetShaderThreadUsageRate();
     pKernelProgram->needPerspectiveBary = m_PerspectivePixel ? true : false;
     pKernelProgram->needPerspectiveCentroidBary = m_PerspectiveCentroid ? true : false;
     pKernelProgram->needPerspectiveSampleBary = m_PerspectiveSample ? true : false;
@@ -891,10 +877,8 @@ void CPixelShader::FillProgram(SPixelShaderKernelProgram* pKernelProgram)
     pKernelProgram->BindingTableEntryBitmap = this->GetBindingTableEntryBitmap();
 
     // PS packed attributes
-    for (uint i = 0; i < setup.size(); i = i + 4)
+    for (uint attribute = 0; attribute <= m_MaxSetupIndex / 4; ++attribute)
     {
-        const uint attribute = i / 4;
-
         pKernelProgram->attributeActiveComponent[attribute] = GetActiveComponents(attribute);
 
         const bool useComponent = pKernelProgram->attributeActiveComponent[attribute] !=
@@ -946,6 +930,7 @@ void CPixelShader::ParseShaderSpecificOpcode(llvm::Instruction* inst)
     }
     if (GenIntrinsicInst * genIntr = dyn_cast<GenIntrinsicInst>(inst))
     {
+        uint setupIndex;
         switch (genIntr->getIntrinsicID())
         {
         case GenISAIntrinsic::GenISA_RenderTargetRead:
@@ -982,8 +967,10 @@ void CPixelShader::ParseShaderSpecificOpcode(llvm::Instruction* inst)
         {
             IGC_ASSERT(llvm::isa<llvm::ConstantInt>(inst->getOperand(0)));
             IGC_ASSERT(llvm::isa<llvm::ConstantInt>(inst->getOperand(1)));
-            uint setupIndex = int_cast<uint>(llvm::cast<llvm::ConstantInt>(inst->getOperand(0))->getZExtValue());
+            setupIndex = int_cast<uint>(llvm::cast<llvm::ConstantInt>(inst->getOperand(0))->getZExtValue());
             m_MaxSetupIndex = std::max(setupIndex, m_MaxSetupIndex);
+            // attribute packing
+            m_SetupIndicesUsed.insert(setupIndex);
 
             e_interpolation mode = static_cast<e_interpolation>(llvm::cast<llvm::ConstantInt>(inst->getOperand(1))->getZExtValue());
             if (mode != EINTERPOLATION_CONSTANT)
@@ -1006,6 +993,13 @@ void CPixelShader::ParseShaderSpecificOpcode(llvm::Instruction* inst)
         case GenISAIntrinsic::GenISA_PullSnappedBarys:
         case GenISAIntrinsic::GenISA_PullCentroidBarys:
             m_HasPullBary = true;
+            break;
+        case GenISAIntrinsic::GenISA_Interpolate:
+            IGC_ASSERT(llvm::isa<llvm::ConstantInt>(inst->getOperand(0)));
+            setupIndex = int_cast<uint>(llvm::cast<llvm::ConstantInt>(inst->getOperand(0))->getZExtValue());
+            m_MaxSetupIndex = std::max(setupIndex, m_MaxSetupIndex);
+            // attribute packing
+            m_SetupIndicesUsed.insert(setupIndex);
             break;
         default:
             break;
@@ -1772,23 +1766,56 @@ void CPixelShader::MarkConstantInterpolation(unsigned int index)
 // Take PS attribute and return active components within, encoded as HW expects.
 USC::GFX3DSTATE_SF_ATTRIBUTE_ACTIVE_COMPONENT CPixelShader::GetActiveComponents(uint attribute) const
 {
-    // First component in the attrib
-    const uint component = 4 * attribute;
-    IGC_ASSERT(component < setup.size());
+    USC::GFX3DSTATE_SF_ATTRIBUTE_ACTIVE_COMPONENT result =
+        USC::GFX3DSTATE_SF_ATTRIBUTE_ACTIVE_COMPONENT_DISABLED;
+    for (auto it = m_SetupIndicesUsed.lower_bound(attribute * 4);
+        it != m_SetupIndicesUsed.end(); ++it)
+    {
+        if (attribute != (*it / 4)) break;
+        switch (*it % 4)
+        {
+        case 0:
+        case 1:
+            result = USC::GFX3DSTATE_SF_ATTRIBUTE_ACTIVE_COMPONENT_XY;
+            break;
+        case 2:
+            result = USC::GFX3DSTATE_SF_ATTRIBUTE_ACTIVE_COMPONENT_XYZ;
+            break;
+        case 3:
+            result = USC::GFX3DSTATE_SF_ATTRIBUTE_ACTIVE_COMPONENT_XYZW;
+            break;
+        }
+    }
+    return result;
+}
 
-    if (((component + 3) < setup.size()) && setup[component + 3])
+// this method must be run only after CShader::PreAnalysisPass() was run
+void CPixelShader::MapPushedInputs()
+{
+    // first gather setup index info
+    for (auto I = pushInfo.inputs.begin(), E = pushInfo.inputs.end(); I != E; I++)
     {
-        return USC::GFX3DSTATE_SF_ATTRIBUTE_ACTIVE_COMPONENT_XYZW;
+        m_SetupIndicesUsed.insert(I->second.index);
+        m_MaxSetupIndex = std::max(I->second.index, m_MaxSetupIndex);
     }
-    else if (((component + 2) < setup.size()) && setup[component + 2])
+    // then map using proper indexing
+    for (auto I = pushInfo.inputs.begin(), E = pushInfo.inputs.end(); I != E; I++)
     {
-        return USC::GFX3DSTATE_SF_ATTRIBUTE_ACTIVE_COMPONENT_XYZ;
+        // We need to map the value associated with the value pushed to a physical register
+        if (I->second.interpolationMode == EINTERPOLATION_CONSTANT)
+        {
+            this->MarkConstantInterpolation(I->second.index);
+        }
+        CVariable* var = GetSymbol(m_argListCache[I->second.argIndex]);
+        AddSetup(getSetupIndex(I->second.index), var);
     }
-    else if ((((component + 1) < setup.size()) && setup[component + 1]) || setup[component])
+}
+
+int CPixelShader::getSetupIndex(uint inputIndex)
+{
     {
-        return USC::GFX3DSTATE_SF_ATTRIBUTE_ACTIVE_COMPONENT_XY;
+        return inputIndex;
     }
-    return USC::GFX3DSTATE_SF_ATTRIBUTE_ACTIVE_COMPONENT_DISABLED;
 }
 
 } // namespace IGC

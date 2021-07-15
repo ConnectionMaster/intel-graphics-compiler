@@ -1,28 +1,10 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2017-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
+============================= end_copyright_notice ===========================*/
 
 #ifndef _VISA_IGC_COMMON_HEADER_H_
 #define _VISA_IGC_COMMON_HEADER_H_
@@ -63,6 +45,7 @@ typedef enum
     // FIXME: why not expose PREDEF_SURF_0 etc. directly?
     PREDEFINED_SURFACE_SLM = 0,
     PREDEFINED_SURFACE_STACK = 1,
+    PREDEFINED_SURFACE_SCRATCH = 3,
     PREDEFINED_SURFACE_T252 = 4,
     PREDEFINED_SURFACE_T255 = 5,
     PREDEFINED_SURFACE_LAST = PREDEFINED_SURFACE_T255
@@ -86,6 +69,8 @@ typedef enum {
     ATOMIC_FMAX                    = 0x10,
     ATOMIC_FMIN                    = 0x11,
     ATOMIC_FCMPWR                  = 0x12,
+    ATOMIC_FADD                    = 0x13,
+    ATOMIC_FSUB                    = 0x14,
     ATOMIC_UNDEF
 } VISAAtomicOps;
 
@@ -290,7 +275,7 @@ typedef enum {
     ISA_SQRT               = 0x19,
     ISA_RSQRT              = 0x1A,
     ISA_INV                = 0x1B,
-    ISA_RESERVED_1C        = 0x1C,
+    ISA_DPASW              = 0x1C,
     ISA_RESERVED_1D        = 0x1D,
     ISA_RESERVED_1E        = 0x1E,
     ISA_LZD                = 0x1F,
@@ -393,6 +378,21 @@ typedef enum {
     ISA_ROL                = 0x80,
     ISA_ROR                = 0x81,
     ISA_DP4A               = 0x82,
+    ISA_DPAS               = 0x83,
+    ISA_ADD3               = 0x84,
+    ISA_BFN                = 0x85,
+    ISA_QW_GATHER          = 0x86,
+    ISA_QW_SCATTER         = 0x87,
+    ISA_BF_CVT             = 0x88,
+    ISA_RESERVED_89        = 0x89,
+    ISA_RESERVED_8A        = 0x8A,
+    ISA_RESERVED_8B        = 0x8B,
+    ISA_RESERVED_8C        = 0x8C,
+    ISA_RESERVED_8D        = 0x8D,
+    ISA_RESERVED_8E        = 0x8E,
+    ISA_RESERVED_8F        = 0x8F,
+    ISA_RESERVED_90        = 0x90,
+    ISA_MADW               = 0x91,
     ISA_NUM_OPCODE,
     ISA_OPCODE_ENUM_SIZE   = 0xFF
 } ISA_Opcode;
@@ -469,6 +469,7 @@ typedef enum {
     GENX_CNL,
     GENX_ICLLP,
     GENX_TGLLP,
+    XeHP_SDV,
     ALL
 } TARGET_PLATFORM;
 
@@ -622,6 +623,22 @@ typedef enum
     LIFETIME_END = 1
 } VISAVarLifetime;
 
+enum class GenPrecision : unsigned char
+{
+    INVALID = 0,
+
+    U1 = 1,
+    S1 = 2,
+    U2 = 3,
+    S2 = 4,
+    U4 = 5,
+    S4 = 6,
+    U8 = 7,
+    S8 = 8,
+    BF16 = 9,   // bfloat16 (1, 8, 7)
+    FP16 = 10,  // half (1, 5, 10)
+    TOTAL_NUM
+};
 
 
 // FixedFunctionID: these are hardware FFID values

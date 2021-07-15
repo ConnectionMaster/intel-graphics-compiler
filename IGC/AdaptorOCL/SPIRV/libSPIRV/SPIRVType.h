@@ -191,34 +191,35 @@ public:
   SPIRVTypePointer(SPIRVModule *M, SPIRVId TheId,
       SPIRVStorageClassKind TheStorageClass,
       SPIRVType *ElementType)
-    :SPIRVType(M, 4, OpTypePointer, TheId), StorageClass(TheStorageClass),
-     ElemType(ElementType){
+    :SPIRVType(M, 4, OpTypePointer, TheId), ElemStorageClass(TheStorageClass),
+     ElemTypeId(0){
     validate();
   }
   // Incomplete constructor
   SPIRVTypePointer():SPIRVType(OpTypePointer),
-      StorageClass(SPIRVStorageClassKind::StorageClassPrivateGlobal),
-      ElemType(NULL){}
+      ElemStorageClass(SPIRVStorageClassKind::StorageClassPrivateGlobal),
+      ElemTypeId(0){}
 
-  SPIRVType *getElementType() const { return ElemType;}
-  SPIRVStorageClassKind getStorageClass() const { return StorageClass;}
+  SPIRVType *getElementType() const {
+    return static_cast<SPIRVType*>(getEntry(ElemTypeId));
+  }
+  SPIRVStorageClassKind getStorageClass() const { return ElemStorageClass;}
   CapVec getRequiredCapability() const {
     auto Cap = getVec(SPIRVCapabilityKind::CapabilityAddresses);
-    if (ElemType->isTypeFloat(16))
+    if (getElementType()->isTypeFloat(16))
        Cap.push_back(SPIRVCapabilityKind::CapabilityFloat16Buffer);
-    Cap.push_back(getCapability(StorageClass));
+    Cap.push_back(getCapability(ElemStorageClass));
     return Cap;
   }
 protected:
-  _SPIRV_DEF_DEC3(Id, StorageClass, ElemType)
+  _SPIRV_DEF_DEC3(Id, ElemStorageClass, ElemTypeId)
   void validate()const {
     SPIRVEntry::validate();
-    ElemType->validate();
-    IGC_ASSERT(isValid(StorageClass));
+    IGC_ASSERT(isValid(ElemStorageClass));
   }
 private:
-  SPIRVStorageClassKind StorageClass;     // Storage Class
-  SPIRVType *ElemType;                    // Element Type
+  SPIRVStorageClassKind ElemStorageClass;   // Storage Class
+  SPIRVId ElemTypeId;                       // Element Type
 };
 
 class SPIRVTypeForwardPointer : public SPIRVEntryNoId<OpTypeForwardPointer> {
@@ -541,31 +542,36 @@ public:
   SPIRVTypeFunction(SPIRVModule *M, SPIRVId TheId, SPIRVType *TheReturnType,
       const std::vector<SPIRVType *> &TheParameterTypes)
     :SPIRVType(M, 3 + TheParameterTypes.size(), OpTypeFunction, TheId),
-     ReturnType(TheReturnType), ParamTypeVec(TheParameterTypes){
+     ReturnType(TheReturnType) {
+     for (const SPIRVType *T : TheParameterTypes) {
+       ParamTypeIdVec.push_back(T->getId());
+     }
      validate();
   }
   // Incomplete constructor
   SPIRVTypeFunction():SPIRVType(OpTypeFunction), ReturnType(NULL){}
 
   SPIRVType *getReturnType() const { return ReturnType;}
-  SPIRVWord getNumParameters() const { return ParamTypeVec.size();}
-  SPIRVType *getParameterType(unsigned I) const { return ParamTypeVec[I];}
+  SPIRVWord getNumParameters() const { return ParamTypeIdVec.size();}
+  SPIRVType *getParameterType(unsigned I) const {
+    return static_cast<SPIRVType *>(getEntry(ParamTypeIdVec[I]));
+  }
 
 protected:
-  _SPIRV_DEF_DEC3(Id, ReturnType, ParamTypeVec)
+  _SPIRV_DEF_DEC3(Id, ReturnType, ParamTypeIdVec)
   void setWordCount(SPIRVWord WordCount) {
     SPIRVType::setWordCount(WordCount);
-    ParamTypeVec.resize(WordCount - 3);
+    ParamTypeIdVec.resize(WordCount - 3);
   }
   void validate()const {
     SPIRVEntry::validate();
     ReturnType->validate();
-    for (auto T:ParamTypeVec)
-      T->validate();
+    for (auto I : ParamTypeIdVec)
+      getEntry(I)->validate();
   }
 private:
   SPIRVType *ReturnType;                      // Return Type
-  std::vector<SPIRVType *> ParamTypeVec;      // Parameter Types
+  std::vector<SPIRVId> ParamTypeIdVec;        // Parameter Type Ids
 };
 
 class SPIRVTypeOpaqueGeneric:public SPIRVType {
@@ -818,6 +824,22 @@ _SPIRV_OP(AvcImeDualReferenceStreamin)
 _SPIRV_OP(AvcRefResult)
 _SPIRV_OP(AvcSicResult)
 #undef _SPIRV_OP
+
+class SPIRVTypeTokenINTEL : public SPIRVType {
+public:
+    // Complete constructor
+    SPIRVTypeTokenINTEL(SPIRVModule* M, SPIRVId TheId)
+        : SPIRVType(M, 2, OpTypeTokenINTEL, TheId) {}
+    // Incomplete constructor
+    SPIRVTypeTokenINTEL() : SPIRVType(OpTypeTokenINTEL) {}
+
+    CapVec getRequiredCapability() const {
+        return getVec(CapabilityTokenTypeINTEL);
+    }
+
+protected:
+    _SPIRV_DEF_DEC1(Id)
+};
 
 }
 #endif // SPIRVTYPE_HPP_

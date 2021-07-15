@@ -120,6 +120,87 @@ void CustomSafeOptPass::visitInstruction(Instruction& I)
     // nothing
 }
 
+//  Searches the following pattern
+//      %1 = icmp eq i32 %cmpop1, %cmpop2
+//      %2 = xor i1 %1, true
+//      ...
+//      %3 = select i1 %1, i8 0, i8 1
+//
+//  And changes it to:
+//      %1 = icmp ne i32 %cmpop1, %cmpop2
+//      ...
+//      %3 = select i1 %1, i8 1, i8 0
+//
+//  and
+//
+//  Searches the following pattern
+//      %1 = icmp ule i32 %cmpop1, %cmpop2
+//      %2 = xor i1 %1, true
+//      br i1 %1, label %3, label %4
+//
+//  And changes it to:
+//      %1 = icmp ugt i32 %cmpop1, %cmpop2
+//      br i1 %1, label %4, label %3
+//
+//  This optimization combines statements regardless of the predicate.
+//  It will also work if the icmp instruction does not have users, except for the xor, select or branch instruction.
+void CustomSafeOptPass::visitXor(Instruction& XorInstr) {
+    using namespace llvm::PatternMatch;
+
+    CmpInst::Predicate Pred;
+    auto XorPattern = m_c_Xor(m_ICmp(Pred, m_Value(), m_Value()), m_SpecificInt(1));
+    if (!match(&XorInstr, XorPattern)) {
+        return;
+    }
+
+    Value* XorOp0 = XorInstr.getOperand(0);
+    Value* XorOp1 = XorInstr.getOperand(1);
+    auto ICmpInstr = cast<Instruction>(isa<ICmpInst>(XorOp0) ? XorOp0 : XorOp1);
+
+    llvm::SmallVector<Instruction*, 4> UsersList;
+
+    for (auto U : ICmpInstr->users()) {
+        if (isa<BranchInst>(U)) {
+            UsersList.push_back(cast<Instruction>(U));
+        }
+        else if (SelectInst* S = dyn_cast<SelectInst>(U)) {
+            if (S->getCondition() == ICmpInstr) {
+                UsersList.push_back(cast<Instruction>(S));
+            }
+            else {
+                return;
+            }
+        }
+        else if (U != &XorInstr) {
+            return;
+        }
+    }
+
+    IRBuilder<> builder(ICmpInstr);
+    auto NegatedCmpPred = cast<ICmpInst>(ICmpInstr)->getInversePredicate();
+    auto NewCmp = cast<ICmpInst>(builder.CreateICmp(NegatedCmpPred, ICmpInstr->getOperand(0), ICmpInstr->getOperand(1)));
+
+    for (auto I : UsersList) {
+        if (SelectInst* S = dyn_cast<SelectInst>(I)) {
+            S->swapProfMetadata();
+            Value* TrueVal = S->getTrueValue();
+            Value* FalseVal = S->getFalseValue();
+            S->setTrueValue(FalseVal);
+            S->setFalseValue(TrueVal);
+        }
+        else {
+            IGC_ASSERT(isa<BranchInst>(I));
+            BranchInst* B = cast<BranchInst>(I);
+            B->swapSuccessors();
+        }
+    }
+
+    XorInstr.replaceAllUsesWith(NewCmp);
+    ICmpInstr->replaceAllUsesWith(NewCmp);
+    XorInstr.eraseFromParent();
+    ICmpInstr->eraseFromParent();
+}
+
 //  Searches for following pattern:
 //    %cmp = icmp slt i32 %x, %y
 //    %cond.not = xor i1 %cond, true
@@ -156,6 +237,60 @@ void CustomSafeOptPass::visitAnd(BinaryOperator& I) {
     I.eraseFromParent();
 }
 
+/*
+Optimizing from
+% 377 = call i32 @llvm.genx.GenISA.simdSize()
+% .rhs.trunc = trunc i32 % 377 to i8
+% .lhs.trunc = trunc i32 % 26 to i8
+% 383 = udiv i8 % .lhs.trunc, % .rhs.trunc
+to
+% 377 = call i32 @llvm.genx.GenISA.simdSize()
+% .rhs.trunc = trunc i32 % 377 to i8
+% .lhs.trunc = trunc i32 % 26 to i8
+% a = shr i8 % rhs.trunc, 4
+% b = shr i8 % .lhs.trunc, 3
+% 382 = shr i8 % b, % a
+or
+% 377 = call i32 @llvm.genx.GenISA.simdSize()
+% 383 = udiv i32 %382, %377
+to
+% 377 = call i32 @llvm.genx.GenISA.simdSize()
+% a = shr i32 %377, 4
+% b = shr i32 %382, 3
+% 382 = shr i32 % b, % a
+*/
+void CustomSafeOptPass::visitUDiv(llvm::BinaryOperator& I)
+{
+    bool isPatternfound = false;
+
+    if (TruncInst* trunc = dyn_cast<TruncInst>(I.getOperand(1)))
+    {
+        if (CallInst* Inst = dyn_cast<CallInst>(trunc->getOperand(0)))
+        {
+            if (GenIntrinsicInst* SimdInst = dyn_cast<GenIntrinsicInst>(Inst))
+                if (SimdInst->getIntrinsicID() == GenISAIntrinsic::GenISA_simdSize)
+                    isPatternfound = true;
+        }
+    }
+    else
+    {
+        if (CallInst* Inst = dyn_cast<CallInst>(I.getOperand(1)))
+        {
+            if (GenIntrinsicInst* SimdInst = dyn_cast<GenIntrinsicInst>(Inst))
+                if (SimdInst->getIntrinsicID() == GenISAIntrinsic::GenISA_simdSize)
+                    isPatternfound = true;
+        }
+    }
+    if (isPatternfound)
+    {
+        IRBuilder<> builder(&I);
+        Value* Shift1 = builder.CreateLShr(I.getOperand(1), ConstantInt::get(I.getOperand(1)->getType(), 4));
+        Value* Shift2 = builder.CreateLShr(I.getOperand(0), ConstantInt::get(I.getOperand(0)->getType(), 3));
+        Value* Shift3 = builder.CreateLShr(Shift2, Shift1);
+        I.replaceAllUsesWith(Shift3);
+        I.eraseFromParent();
+    }
+}
 
 void CustomSafeOptPass::visitAllocaInst(AllocaInst& I)
 {
@@ -358,11 +493,11 @@ void CustomSafeOptPass::visitLoadInst(LoadInst& load)
             result->setDebugLoc(load.getDebugLoc());
             load.replaceAllUsesWith(result);
             load.eraseFromParent();
-            if (gep->getNumUses() == 0)
+            if (gep->use_empty())
             {
                 gep->eraseFromParent();
             }
-            if (sel->getNumUses() == 0)
+            if (sel->use_empty())
             {
                 sel->eraseFromParent();
             }
@@ -460,7 +595,6 @@ void CustomSafeOptPass::visitCallInst(CallInst& C)
             visitLdRawVec(inst);
             break;
         }
-
         default:
             break;
         }
@@ -1508,7 +1642,7 @@ void CustomSafeOptPass::dp4WithIdentityMatrix(ExtractElementInst& I)
 
         if (BinaryOperator * orInst = dyn_cast<BinaryOperator>(*iter))
         {
-            if (orInst->getOpcode() == BinaryOperator::Or && orInst->getNumUses() == 1)
+            if (orInst->getOpcode() == BinaryOperator::Or && orInst->hasOneUse())
             {
                 if (ConstantInt * orSrc1 = dyn_cast<ConstantInt>(orInst->getOperand(1)))
                 {
@@ -2616,6 +2750,12 @@ void GenSpecificPattern::visitSelectInst(SelectInst& I)
 void GenSpecificPattern::visitCastInst(CastInst& I)
 {
     Instruction* srcVal = nullptr;
+    // Intrinsic::trunc call is handled by 'rndz' hardware instruction which
+    // does not support double precision floating point type
+    if (I.getType()->isDoubleTy())
+    {
+        return;
+    }
     if (isa<SIToFPInst>(&I))
     {
         srcVal = dyn_cast<FPToSIInst>(I.getOperand(0));
@@ -2689,6 +2829,76 @@ void GenSpecificPattern::visitBitCastInst(BitCastInst& I)
             }
         }
     }
+}
+
+/*
+    Matches a pattern where pointer to load instruction is fetched by other load instruction.
+    On targets that do not support 64 bit operations, Emu64OpsPass will insert pair_to_ptr intrinsic
+    between the loads and InstructionCombining will not optimize this case.
+
+    This function changes following pattern:
+    %3 = load <2 x i32>, <2 x i32> addrspace(1)* %2, align 64
+    %4 = extractelement <2 x i32> %3, i32 0
+    %5 = extractelement <2 x i32> %3, i32 1
+    %6 = call %union._XReq addrspace(1)* addrspace(1)* addrspace(1)* addrspace(1)* addrspace(1)* addrspace(1)* addrspace(1)* addrspace(1)* @llvm.genx.GenISA.pair.to.ptr.p1p1p1p1p1p1p1p1union._XReq(i32 %4, i32 %5)
+    %7 = bitcast %union._XReq addrspace(1)* addrspace(1)* addrspace(1)* addrspace(1)* addrspace(1)* addrspace(1)* addrspace(1)* addrspace(1)* %6 to i64 addrspace(1)*
+    %8 = bitcast i64 addrspace(1)* %7 to <2 x i32> addrspace(1)*
+    %9 = load <2 x i32>, <2 x i32> addrspace(1)* %8, align 64
+
+    to:
+    %3 = bitcast <2 x i32> addrspace(1)* %2 to <2 x i32> addrspace(1)* addrspace(1)*
+    %4 = load <2 x i32> addrspace(1)*, <2 x i32> addrspace(1)* addrspace(1)* %3, align 64
+    ... dead code
+    %11 = load <2 x i32>, <2 x i32> addrspace(1)* %4, align 64
+*/
+void GenSpecificPattern::visitLoadInst(LoadInst &LI) {
+    Value* PO = LI.getPointerOperand();
+    std::vector<Value*> OneUseValues = { PO };
+    while (isa<BitCastInst>(PO)) {
+        PO = cast<BitCastInst>(PO)->getOperand(0);
+        OneUseValues.push_back(PO);
+    }
+
+    bool IsPairToPtrInst = (isa<GenIntrinsicInst>(PO) &&
+        cast<GenIntrinsicInst>(PO)->getIntrinsicID() ==
+        GenISAIntrinsic::GenISA_pair_to_ptr);
+
+    if (!IsPairToPtrInst)
+        return;
+
+    // check if this pointer comes from a load.
+    auto CallInst = cast<GenIntrinsicInst>(PO);
+    auto Op0 = dyn_cast<ExtractElementInst>(CallInst->getArgOperand(0));
+    auto Op1 = dyn_cast<ExtractElementInst>(CallInst->getArgOperand(1));
+    bool PointerComesFromALoad = (Op0 && Op1 && isa<ConstantInt>(Op0->getIndexOperand()) &&
+        isa<ConstantInt>(Op1->getIndexOperand()) &&
+        cast<ConstantInt>(Op0->getIndexOperand())->getZExtValue() == 0 &&
+        cast<ConstantInt>(Op1->getIndexOperand())->getZExtValue() == 1 &&
+        isa<LoadInst>(Op0->getVectorOperand()) &&
+        isa<LoadInst>(Op1->getVectorOperand()) &&
+        Op0->getVectorOperand() == Op1->getVectorOperand());
+
+    if (!PointerComesFromALoad)
+        return;
+
+    OneUseValues.insert(OneUseValues.end(), { Op0, Op1 });
+
+    if (!std::all_of(OneUseValues.begin(), OneUseValues.end(), [](auto v) { return v->hasOneUse(); }))
+        return;
+
+    auto VectorLoadInst = cast<LoadInst>(Op0->getVectorOperand());
+    if (VectorLoadInst->getNumUses() != 2)
+        return;
+
+    auto PointerOperand = VectorLoadInst->getPointerOperand();
+    PointerType* newLoadPointerType = PointerType::get(
+        LI.getPointerOperand()->getType(), PointerOperand->getType()->getPointerAddressSpace());
+    IRBuilder<> builder(VectorLoadInst);
+    auto CastedPointer =
+        builder.CreateBitCast(PointerOperand, newLoadPointerType);
+    auto NewLoadInst = IGC::cloneLoad(VectorLoadInst, CastedPointer);
+
+    LI.setOperand(0, NewLoadInst);
 }
 
 void GenSpecificPattern::visitZExtInst(ZExtInst& ZEI)
@@ -4360,6 +4570,25 @@ bool FlattenSmallSwitch::processSwitchInst(SwitchInst* SI)
         return true;
     };
 
+    // Are all Phi incomming blocks from SI switch?
+    auto checkPhiPredecessorBlocks = [](const SwitchInst* SI, const PHINode* Phi, bool DefaultMergeBlock)
+    {
+        for (auto* BB : Phi->blocks())
+        {
+            if (BB == SI->getDefaultDest())
+                continue;
+            bool successorFound = false;
+            for (auto Case : SI->cases()) {
+                if (Case.getCaseSuccessor() == BB)
+                    successorFound = true;
+            }
+            if (successorFound)
+                continue;
+            return false;
+        }
+        return true;
+    };
+
     for (auto& I : SI->cases())
     {
         BasicBlock* CaseDest = I.getCaseSuccessor();
@@ -4387,7 +4616,7 @@ bool FlattenSmallSwitch::processSwitchInst(SwitchInst* SI)
         if (!Phi)
             break;
 
-        if (Phi->getNumIncomingValues() != SI->getNumCases() + 1)
+        if (!checkPhiPredecessorBlocks(SI, Phi, DefaultMergeBlock))
             return false;
 
         PhiNodes.push_back(Phi);
@@ -4440,6 +4669,7 @@ bool FlattenSmallSwitch::processSwitchInst(SwitchInst* SI)
         }
 
         Phi->replaceAllUsesWith(vTemp);
+        Phi->removeFromParent();
     }
 
     // connect the original block and the phi node block with a pass through branch
@@ -5001,7 +5231,7 @@ bool LogicalAndToBranch::runOnFunction(Function& F)
                 Instruction* s1 = dyn_cast<Instruction>(inst->getOperand(1));
                 if (s0 && s1 &&
                     !isa<PHINode>(s0) && !isa<PHINode>(s1) &&
-                    s0->getNumUses() == 1 && s1->getNumUses() == 1 &&
+                    s0->hasOneUse() && s1->hasOneUse() &&
                     s0->getParent() == bb && s1->getParent() == bb)
                 {
                     if (isInstPrecede(s1, s0))

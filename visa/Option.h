@@ -1,28 +1,10 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2017-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
+============================= end_copyright_notice ===========================*/
 
 #ifndef _OPTION_H_
 #define _OPTION_H_
@@ -130,9 +112,7 @@ class Options {
 
 public:
     Options();
-    ~Options();
 
-public:
     const char *get_vISAOptionsToStr(vISAOptions opt) {
         return vISAOptionsToStr[opt];
     }
@@ -141,12 +121,14 @@ public:
     // It is useful for Cstr or Int arguments because getOption() will give us
     // the value, not whether they are set or not.
     bool isOptionSetByUser(vISAOptions option) const;
+
     void getOption(vISAOptions option, bool &value) const;
     bool getOption(vISAOptions option) const;
     void getOption(vISAOptions option, const char*& buf) const;
     const char *getOptionCstr(vISAOptions option) const;
     uint32_t getuInt32Option(vISAOptions option) const;
     uint64_t getuInt64Option(vISAOptions option) const;
+
     void setTarget(VISATarget tTarget) { target = tTarget;}
     VISATarget getTarget() const { return target; }
 
@@ -165,13 +147,13 @@ public:
     std::stringstream& getUserArgString();
     std::string getFullArgString();
     std::string getEncoderOutputFile();
-    void dump(void) const;
 
     Stepping GetStepping() const { return stepping; }
 
+    void dump() const;
+
 private:
     void setGTPin();
-    bool get_isaasm(int argc, const char *argv[]);
 
     // This holds the data of a single vISAOptions entry
     struct VISAOptionsLine {

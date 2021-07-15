@@ -1,24 +1,8 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (c) 2000-2021 Intel Corporation
+Copyright (C) 2019-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"),
-to deal in the Software without restriction, including without limitation
-the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom
-the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-IN THE SOFTWARE.
+SPDX-License-Identifier: MIT
 
 ============================= end_copyright_notice ===========================*/
 
@@ -39,8 +23,8 @@ IN THE SOFTWARE.
 #include "GenXUtil.h"
 #include "GenXVisa.h"
 
-#include "vc/GenXOpts/Utils/GenXSTLExtras.h"
 #include "vc/Support/BackendConfig.h"
+#include "vc/Utils/General/STLExtras.h"
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/DiagnosticInfo.h"
@@ -501,10 +485,14 @@ static bool CheckAllocaUsesInternal(Instruction *I) {
                    llvm::dyn_cast<llvm::BitCastInst>(*use_it)) {
       if (pBitCast->use_empty())
         continue;
-      Type *baseT =
-          GetBaseType(pBitCast->getType()->getPointerElementType(), nullptr);
-      Type *sourceType = GetBaseType(
-          pBitCast->getOperand(0)->getType()->getPointerElementType(), nullptr);
+      Type *baseT = GetBaseType(
+          pBitCast->getType()->getScalarType()->getPointerElementType(),
+          nullptr);
+      Type *sourceType = GetBaseType(pBitCast->getOperand(0)
+                                         ->getType()
+                                         ->getScalarType()
+                                         ->getPointerElementType(),
+                                     nullptr);
       IGC_ASSERT(sourceType);
       // either the point-to-element-type is the same or
       // the point-to-element-type is the byte or a function pointer
@@ -618,7 +606,7 @@ void TransformPrivMem::selectAllocasToHandle() {
               return LHS->getAllocationSizeInBits(*m_pDL).getValue() <
                      RHS->getAllocationSizeInBits(*m_pDL).getValue();
             });
-  auto LastIt = genx::upper_partial_sum_bound(
+  auto LastIt = vc::upper_partial_sum_bound(
       m_allocasToPrivMem.begin(), m_allocasToPrivMem.end(),
       TotalAllocaLimitOpt.getValue(),
       [this](std::size_t PrevSum, const AllocaInst *CurAlloca) {
@@ -664,10 +652,11 @@ void TransposeHelper::EraseDeadCode() {
 
 void TransposeHelper::handleBCInst(BitCastInst &BC, GenericVectorIndex Idx) {
   m_toBeRemoved.push_back(&BC);
-  Type *DstDerefTy =
-      GetBaseType(BC.getType()->getPointerElementType(), nullptr);
+  Type *DstDerefTy = GetBaseType(
+      BC.getType()->getScalarType()->getPointerElementType(), nullptr);
   Type *SrcDerefTy = GetBaseType(
-      BC.getOperand(0)->getType()->getPointerElementType(), nullptr);
+      BC.getOperand(0)->getType()->getScalarType()->getPointerElementType(),
+      nullptr);
   IGC_ASSERT(DstDerefTy);
   IGC_ASSERT(SrcDerefTy);
   // either the point-to-element-type is the same or
@@ -871,27 +860,52 @@ void TransposeHelper::handlePHINode(PHINode *pPhi, GenericVectorIndex Idx,
   handleAllocaSources(*pPhi, {NewPhi, Idx.ElementSizeInBits});
 }
 
+// Loads vector and casts it if necessary.
+// \p CastTo describes vector element type to cast to.
+template <typename FolderT = ConstantFolder>
+Instruction *loadAndCastVector(AllocaInst &VecAlloca, Type &CastTo,
+                               IRBuilder<FolderT> &IRB) {
+  auto *LoadVecAlloca = IRB.CreateLoad(&VecAlloca);
+  auto *AllocatedElemTy = LoadVecAlloca->getType()->getScalarType();
+  bool IsFuncPointer =
+      CastTo.isPointerTy() && CastTo.getPointerElementType()->isFunctionTy();
+  if (AllocatedElemTy == &CastTo || IsFuncPointer)
+    return LoadVecAlloca;
+  auto AllocatedWidth = cast<IGCLLVM::FixedVectorType>(LoadVecAlloca->getType())
+                            ->getNumElements();
+  IGC_ASSERT(AllocatedElemTy->getScalarSizeInBits() >=
+             CastTo.getScalarSizeInBits());
+  IGC_ASSERT(CastTo.getScalarSizeInBits());
+  IGC_ASSERT((AllocatedElemTy->getScalarSizeInBits() %
+              CastTo.getScalarSizeInBits()) == 0);
+  auto CastedWidth = AllocatedWidth * (AllocatedElemTy->getScalarSizeInBits() /
+                                       CastTo.getScalarSizeInBits());
+  return cast<Instruction>(IRB.CreateBitCast(
+      LoadVecAlloca, IGCLLVM::FixedVectorType::get(&CastTo, CastedWidth),
+      "post.load.bc"));
+}
+
+// Casts \p NewValue if its type doesn't correspond to allocated vector type,
+// then stores the value.
+template <typename FolderT = ConstantFolder>
+Instruction *castAndStoreVector(AllocaInst &VecAlloca, Value &NewValue,
+                                IRBuilder<FolderT> &IRB) {
+  auto *CastedValue = &NewValue;
+  if (VecAlloca.getAllocatedType() != NewValue.getType())
+    CastedValue = IRB.CreateBitCast(&NewValue, VecAlloca.getAllocatedType(),
+                                    NewValue.getName() + ".pre.store.bc");
+  return IRB.CreateStore(CastedValue, &VecAlloca);
+}
+
 void TransposeHelperPromote::handleLoadInst(LoadInst *pLoad,
                                             Value *pScalarizedIdx) {
   IGC_ASSERT(pLoad->isSimple());
   IRBuilder<> IRB(pLoad);
-  Value *pLoadVecAlloca = IRB.CreateLoad(pVecAlloca);
   auto LdTy = pLoad->getType()->getScalarType();
-  auto VETy = pLoadVecAlloca->getType()->getScalarType();
-  auto ReadIn = pLoadVecAlloca;
+  auto *ReadIn = loadAndCastVector(*pVecAlloca, *LdTy, IRB);
   bool IsFuncPointer = pLoad->getPointerOperandType()->isPointerTy() &&
     pLoad->getPointerOperandType()->getPointerElementType()->isPointerTy() &&
     pLoad->getPointerOperandType()->getPointerElementType()->getPointerElementType()->isFunctionTy();
-  // do the type-casting if necessary
-  if (VETy != LdTy && !IsFuncPointer) {
-    auto VLen = cast<VectorType>(pLoadVecAlloca->getType())->getNumElements();
-    IGC_ASSERT(VETy->getScalarSizeInBits() >= LdTy->getScalarSizeInBits());
-    IGC_ASSERT(LdTy->getScalarSizeInBits());
-    IGC_ASSERT((VETy->getScalarSizeInBits() % LdTy->getScalarSizeInBits()) == 0);
-    VLen = VLen * (VETy->getScalarSizeInBits() / LdTy->getScalarSizeInBits());
-    ReadIn =
-        IRB.CreateBitCast(ReadIn, IGCLLVM::FixedVectorType::get(LdTy, VLen));
-  }
   if (IsFuncPointer) {
     Region R(
         IGCLLVM::FixedVectorType::get(
@@ -907,7 +921,7 @@ void TransposeHelperPromote::handleLoadInst(LoadInst *pLoad,
       pScalarizedIdx = IRB.CreateZExtOrTrunc(pScalarizedIdx, Type::getInt16Ty(pLoad->getContext()));
     }
     R.Indirect = pScalarizedIdx;
-    auto *Result = R.createRdRegion(pLoadVecAlloca, pLoad->getName(), pLoad,
+    auto *Result = R.createRdRegion(ReadIn, pLoad->getName(), pLoad,
                                     pLoad->getDebugLoc(), true);
     if (!Result->getType()->isPointerTy()) {
       auto *BC =
@@ -947,25 +961,13 @@ void TransposeHelperPromote::handleStoreInst(StoreInst *pStore,
   IGC_ASSERT(pStore->isSimple());
   IRBuilder<> IRB(pStore);
   llvm::Value *pStoreVal = pStore->getValueOperand();
-  llvm::Value *pLoadVecAlloca = IRB.CreateLoad(pVecAlloca);
-  llvm::Value *WriteOut = pLoadVecAlloca;
   auto *StTy = pStoreVal->getType()->getScalarType();
-  auto *VETy = pLoadVecAlloca->getType()->getScalarType();
-  // do the type-casting if necessary
+  Value *WriteOut = loadAndCastVector(*pVecAlloca, *StTy, IRB);
 
   bool IsFuncPointerStore =
       (isFuncPointerVec(pStoreVal) ||
        (pStoreVal->getType()->isPointerTy() &&
         pStoreVal->getType()->getPointerElementType()->isFunctionTy()));
-  if (VETy != StTy && !IsFuncPointerStore) {
-    auto VLen = cast<VectorType>(pLoadVecAlloca->getType())->getNumElements();
-    IGC_ASSERT(VETy->getScalarSizeInBits() >= StTy->getScalarSizeInBits());
-    IGC_ASSERT(StTy->getScalarSizeInBits());
-    IGC_ASSERT((VETy->getScalarSizeInBits() % StTy->getScalarSizeInBits()) == 0);
-    VLen = VLen * (VETy->getScalarSizeInBits() / StTy->getScalarSizeInBits());
-    WriteOut =
-        IRB.CreateBitCast(WriteOut, IGCLLVM::FixedVectorType::get(StTy, VLen));
-  }
   if (IsFuncPointerStore) {
     auto *NewStoreVal = pStoreVal;
     IGC_ASSERT(cast<VectorType>(pVecAlloca->getType()->getPointerElementType())->getElementType()->isIntegerTy(64));
@@ -1016,10 +1018,7 @@ void TransposeHelperPromote::handleStoreInst(StoreInst *pStore,
     WriteOut =
         IRB.CreateInsertElement(WriteOut, pStoreVal, ScalarizedIdx.Index);
   }
-  // cast the vector type back if necessary
-  if (VETy != StTy)
-    WriteOut = IRB.CreateBitCast(WriteOut, pLoadVecAlloca->getType());
-  IRB.CreateStore(WriteOut, pVecAlloca);
+  castAndStoreVector(*pVecAlloca, *WriteOut, IRB);
   pStore->eraseFromParent();
 }
 
@@ -1168,9 +1167,9 @@ void TransposeHelperPromote::handleLLVMGather(IntrinsicInst *pInst,
   Value *pScalarizedIdx) {
   IRBuilder<> IRB(pInst);
   IGC_ASSERT(pInst->getType()->isVectorTy());
-  Value *pLoadVecAlloca = IRB.CreateLoad(pVecAlloca);
   auto N = cast<VectorType>(pInst->getType())->getNumElements();
   auto ElemType = cast<VectorType>(pInst->getType())->getElementType();
+  Value *LoadVecAlloca = loadAndCastVector(*pVecAlloca, *ElemType, IRB);
 
   // A vector load
   // %v = <2 x float> gather %pred, %vector_of_ptr, %old_value
@@ -1208,8 +1207,8 @@ void TransposeHelperPromote::handleLLVMGather(IntrinsicInst *pInst,
     R.VStride = 0;
   }
   Value *Result =
-    R.createRdRegion(pLoadVecAlloca, pInst->getName(), pInst /*InsertBefore*/,
-      pInst->getDebugLoc(), true /*AllowScalar*/);
+      R.createRdRegion(LoadVecAlloca, pInst->getName(), pInst /*InsertBefore*/,
+                       pInst->getDebugLoc(), true /*AllowScalar*/);
 
   // if old-value is not undefined and predicate is not all-one,
   // create a select  auto OldVal = pInst->getArgOperand(3);
@@ -1232,20 +1231,22 @@ void TransposeHelperPromote::handleLLVMScatter(llvm::IntrinsicInst *pInst,
   llvm::Value *pScalarizedIdx) {
   // Add Store instruction to remove list
   IRBuilder<> IRB(pInst);
-  llvm::Value *pStoreVal = pInst->getArgOperand(3);
-  llvm::Value *pLoadVecAlloca = IRB.CreateLoad(pVecAlloca);
-  IGC_ASSERT(pStoreVal->getType()->isVectorTy());
-  auto N = cast<VectorType>(pStoreVal->getType())->getNumElements();
-  auto ElemType = cast<VectorType>(pStoreVal->getType())->getElementType();
+  Value *StoredValue = pInst->getArgOperand(0);
+  IGC_ASSERT(StoredValue->getType()->isVectorTy());
+  auto N =
+      cast<IGCLLVM::FixedVectorType>(StoredValue->getType())->getNumElements();
+  auto *ElemType =
+      cast<IGCLLVM::FixedVectorType>(StoredValue->getType())->getElementType();
+  Value *LoadVecAlloca = loadAndCastVector(*pVecAlloca, *ElemType, IRB);
   // A vector scatter
-  // scatter %pred, %ptr, %offset, %newvalue
+  // scatter %newvalue, %ptr, i32 align, %pred
   // becomes
-  // %w = load <32 x float> *%ptr1
-  // %w1 = <32 x float> wrregion %w, newvalue, %offset, %pred
-  // store <32 x float> %w1, <32 x float>* %ptr1
+  // %w = load %vec.alloca
+  // %w1 = wrregion %w, %newvalue, %indexed.ptr, %pred
+  // store %w1, %vec.alloca
 
   // Create the new wrregion
-  Region R(pStoreVal);
+  Region R{StoredValue};
   int64_t v0 = 0;
   int64_t diff = 0;
   // pScalarizedIdx is an indice of element, so
@@ -1275,12 +1276,12 @@ void TransposeHelperPromote::handleLLVMScatter(llvm::IntrinsicInst *pInst,
     R.Stride = 0;
     R.VStride = 0;
   }
-  R.Mask = pInst->getArgOperand(0);
+  R.Mask = pInst->getArgOperand(3);
   auto NewInst = cast<Instruction>(
-    R.createWrRegion(pLoadVecAlloca, pStoreVal, pInst->getName(),
-      pInst /*InsertBefore*/, pInst->getDebugLoc()));
+      R.createWrRegion(LoadVecAlloca, StoredValue, pInst->getName(),
+                       pInst /*InsertBefore*/, pInst->getDebugLoc()));
 
-  IRB.CreateStore(NewInst, pVecAlloca);
+  castAndStoreVector(*pVecAlloca, *NewInst, IRB);
   pInst->eraseFromParent();
 }
 

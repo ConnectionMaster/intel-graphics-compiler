@@ -1,28 +1,11 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
+============================= end_copyright_notice ===========================*/
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
 #include "G4_BB.hpp"
 #include "BuildIR.h"
 #include "LocalRA.h" // SECOND_HALF_BANK_START_GRF
@@ -81,6 +64,15 @@ G4_opcode G4_BB::getLastOpcode() const
         return G4_illegal;
     }
 }
+
+void G4_BB::setId(unsigned i)
+{
+    // some analysis passes rely on G4_BB id
+    if (id != i)
+        getParent().markStale();
+    id = i;
+}
+
 
 void G4_BB::removePredEdge(G4_BB* pred)
 {
@@ -202,9 +194,9 @@ void G4_BB::emit(std::ostream& output)
 void G4_BB::emitInstruction(std::ostream& output, INST_LIST_ITER &it)
 {
     // prints out instruction line
-    if (!(parent->getKernel()->getOptions()->getOption(vISA_disableInstDebugInfo)))
+    if (!parent->getKernel()->getOptions()->getOption(vISA_disableInstDebugInfo))
     {
-        emitInstructionInfo(output, it);
+        emitInstructionSourceLineMapping(output, it);
     }
 
     emitBasicInstruction(output, it);
@@ -221,8 +213,8 @@ void G4_BB::emitBasicInstruction(std::ostream& output, INST_LIST_ITER &it)
         G4_InstSend* SendInst = (*it)->asSendInst();
         if( SendInst )
         {
-            SendInst->emit_send( output );
-            SendInst->emit_send_desc( output );
+            SendInst->emit_send(output);
+            SendInst->emit_send_desc(output);
         }
     }
     else
@@ -239,8 +231,7 @@ void G4_BB::emitBasicInstruction(std::ostream& output, INST_LIST_ITER &it)
     }
 
 }
-void G4_BB::emitBasicInstructionIga(
-    char* instSyntax,
+void G4_BB::emitBasicInstructionComment(
     std::ostream& output,
     INST_LIST_ITER &it,
     int *suppressRegs, int *lastRegs)
@@ -249,16 +240,32 @@ void G4_BB::emitBasicInstructionIga(
 
     auto platform = inst->getPlatform();
 
-    output << instSyntax;
     if (!inst->isLabel() && inst->opcode() < G4_NUM_OPCODE)
     {
         output << " // ";
 
         auto comments = inst->getComments();
         if (!comments.empty()) {
-            output << " " << comments << ", ";
+            output << " " << comments << "; ";
         }
-        inst->emitInstIds(output);
+        int vISAId = inst->getCISAOff();
+        if (vISAId != -1) {
+            output << "$" << vISAId;
+        }
+
+        if (getParent().getKernel()->getOption(vISA_DumpSBID))
+        {
+            int lexicalId = inst->getLexicalId();
+            if (lexicalId != -1) {
+                output << "&" << lexicalId;
+            }
+        }
+
+        if (getParent().getKernel()->getOption(vISA_DumpGenOffset) &&
+            inst->getBinInst())
+        {
+            output << ":%" << inst->getGenOffset();
+        }
 
         if (getPlatformGeneration(platform) < PlatformGen::XE)
         {
@@ -295,7 +302,7 @@ void G4_BB::emitBasicInstructionIga(
 _THREAD const char* g4_prevFilename;
 _THREAD int g4_prevSrcLineNo;
 
-void G4_BB::emitInstructionInfo(std::ostream& output, INST_LIST_ITER &it)
+void G4_BB::emitInstructionSourceLineMapping(std::ostream& output, INST_LIST_ITER &it)
 {
     bool emitFile = false, emitLineNo = false;
     const char* curFilename = (*it)->getSrcFilename();
@@ -323,15 +330,18 @@ void G4_BB::emitInstructionInfo(std::ostream& output, INST_LIST_ITER &it)
 
     if (emitLineNo)
     {
-        output << "\n// Line " << curSrcLineNo << ":\t";
+        output << "\n// Line " << curSrcLineNo;
         if (curFilename)
         {
-            std::string curLine = parent->getKernel()->getDebugSrcLine(std::string(curFilename), curSrcLineNo);
-            auto isNotSpace = [](int ch) { return !std::isspace(ch); };
-            curLine.erase(curLine.begin(), std::find_if(curLine.begin(), curLine.end(), isNotSpace));
-            curLine.erase(std::find_if(curLine.rbegin(), curLine.rend(), isNotSpace).base(), curLine.end());
-            output << curLine << "\n";
+            std::string curLine = parent->getKernel()->getDebugSrcLine(curFilename, curSrcLineNo);
+            if (!curLine.empty()) {
+                auto isNotSpace = [](int ch) { return !std::isspace(ch); };
+                curLine.erase(curLine.begin(), std::find_if(curLine.begin(), curLine.end(), isNotSpace));
+                curLine.erase(std::find_if(curLine.rbegin(), curLine.rend(), isNotSpace).base(), curLine.end());
+                output << ":  " << curLine;
+            }
         }
+        output << "\n";
     }
 
     if (emitFile)
@@ -351,6 +361,9 @@ void G4_BB::emitBankConflict(std::ostream& output, const G4_INST *inst)
     int execSize[G4_MAX_SRCS];
     int regSrcNum = 0;
 
+    if (inst->isDpas()) {
+        return;
+    }
 
     if (inst->getNumSrc() == 3 && !inst->isSend())
     {
@@ -1343,7 +1356,7 @@ uint32_t G4_BB::emitBankConflictXeLP(
 uint32_t G4_BB::countReadModifyWrite(std::ostream& output, const G4_INST *inst)
 {
     if (!inst->getDst() || inst->getDst()->isNullReg() ||
-        inst->isSend())
+        inst->isSend() || inst->isDpas())
     {
         return 0;
     }
@@ -1394,8 +1407,8 @@ void G4_BB::addEOTSend(G4_INST* lastInst)
     // send (8) null r1 0x27 desc
     IR_Builder* builder = parent->builder;
     G4_Declare *dcl = builder->createSendPayloadDcl(numEltPerGRF<Type_UD>(), Type_UD);
-    G4_DstRegRegion* movDst = builder->Create_Dst_Opnd_From_Dcl(dcl, 1);
-    G4_SrcRegRegion* r0Src = builder->Create_Src_Opnd_From_Dcl(
+    G4_DstRegRegion* movDst = builder->createDstRegRegion(dcl, 1);
+    G4_SrcRegRegion* r0Src = builder->createSrcRegRegion(
         builder->getBuiltinR0(), builder->getRegionStride1());
     G4_INST *movInst = builder->createMov(
         G4_ExecSize(numEltPerGRF<Type_UD>()), movDst, r0Src, InstOpt_WriteEnable, false);
@@ -1411,7 +1424,7 @@ void G4_BB::addEOTSend(G4_INST* lastInst)
     // response len = 0, msg len = 1
     int desc = (0x1 << 25) + (0x1 << 4);
 
-    G4_SrcRegRegion* sendSrc = builder->Create_Src_Opnd_From_Dcl(
+    G4_SrcRegRegion* sendSrc = builder->createSrcRegRegion(
         dcl, builder->getRegionStride1());
 
     G4_DstRegRegion *sendDst = builder->createNullDst(Type_UD);
@@ -1449,6 +1462,8 @@ const char* G4_BB::getBBTypeStr() const
         return "INIT";
     case G4_BB_EXIT_TYPE:
         return "EXIT";
+    case G4_BB_NM_WA_TYPE:
+        return "NoMaskWA";
     }
     return " ";
 }
@@ -1458,27 +1473,48 @@ void G4_BB::dump() const
     print(std::cerr);
 }
 
-void G4_BB::print(std::ostream& OS) const
-{
-    OS << "BB" << getId() << ":";
+void G4_BB::emitBbInfo(std::ostream& os) const {
+    // mustn't exceed a single line because it could be in asm output
+    auto fmtBbId = [&](int bb) {
+        std::stringstream ss;
+        ss << "B" << std::setw(3) << std::setfill('0') << bb;
+        return ss.str();
+    };
+    os << fmtBbId(getId()) << ":";
+    bool first = true;
+    auto maybeComma = [&]() {
+        if (first)
+            first = false;
+        else
+            os << ", ";
+    };
     if (getBBType())
     {
-        OS << " [" << getBBTypeStr() << "], ";
+        maybeComma();
+        os << " [" << getBBTypeStr() << "]";
     }
     if (isDivergent())
     {
-        OS << " [inDivergent],";
+        maybeComma();
+        os << " [inDivergent]";
     }
-    OS << "        Pred: ";
-    for (auto pred : Preds)
-    {
-        OS << pred->getId() << " ";
-    }
-    OS << "  Succ: ";
-    for (auto succ : Succs)
-    {
-        OS << succ->getId() << " ";
-    }
+    auto emitBbSet = [&](const char *name, const BB_LIST &bbl) {
+        maybeComma();
+        os << " " << name << ":{";
+        bool first = true;
+        for (const auto &bb : bbl) {
+            if (first) first = false; else os << ", ";
+            os << fmtBbId(bb->getId());
+        }
+        os << "}";
+    };
+    emitBbSet("Preds", Preds);
+    emitBbSet("Succs", Succs);
+}
+
+void G4_BB::print(std::ostream& OS) const
+{
+    emitBbInfo(OS);
     OS << "\n";
     for (auto& x : instList)
         x->print(OS);
@@ -1532,7 +1568,7 @@ void G4_BB::addSamplerFlushBeforeEOT()
     // null return version
     {
         int desc = G4_SendDescRaw::createDesc(samplerFlushFC, true, 1, 0);
-        G4_SrcRegRegion* sendMsgOpnd = builder->Create_Src_Opnd_From_Dcl(
+        G4_SrcRegRegion* sendMsgOpnd = builder->createSrcRegRegion(
             builder->getBuiltinR0(),
             builder->getRegionStride1());
 
@@ -1549,12 +1585,12 @@ void G4_BB::addSamplerFlushBeforeEOT()
     // valid return version
     {
         int desc = G4_SendDescRaw::createDesc(samplerFlushFC, true, 1, 1);
-        G4_SrcRegRegion* sendMsgOpnd = builder->Create_Src_Opnd_From_Dcl(
+        G4_SrcRegRegion* sendMsgOpnd = builder->createSrcRegRegion(
             builder->getBuiltinR0(),
             builder->getRegionStride1());
         G4_Declare *tmpDest = builder->createTempVar(g4::SIMD8, Type_UD, GRFALIGN);
         tmpDest->setDoNotSpill();
-        G4_DstRegRegion* sendMsgDst = builder->Create_Dst_Opnd_From_Dcl(tmpDest, 1);
+        G4_DstRegRegion* sendMsgDst = builder->createDstRegRegion(tmpDest, 1);
         auto msgDesc = builder->createSyncMsgDesc(SFID::SAMPLER, desc);
         G4_INST* samplerFlushInst = builder->createSendInst(
             nullptr, G4_send, g4::SIMD8,
@@ -1564,4 +1600,9 @@ void G4_BB::addSamplerFlushBeforeEOT()
         auto iter = std::prev(end());
         insert(iter, samplerFlushInst);
     }
+}
+
+bool G4_BB::dominates(G4_BB* other)
+{
+    return getParent().getDominator().dominates(this, other);
 }

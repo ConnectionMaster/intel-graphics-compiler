@@ -48,7 +48,7 @@ namespace IGC
     class CodeGenContext;
     struct SProgramOutput;
 
-    static const std::string INTEL_SYMBOL_TABLE_VOID_PROGRAM = "Intel_Symbol_Table_Void_Program";
+    static const char * const INTEL_SYMBOL_TABLE_VOID_PROGRAM = "Intel_Symbol_Table_Void_Program";
 
 #ifdef _DEBUG
     template<typename T, size_t N>
@@ -57,6 +57,12 @@ namespace IGC
     template<typename T, size_t N>
     using smallvector = llvm::SmallVector<T, N>;
 #endif
+
+    // This is used to return true/false/dunno results.
+    enum class Tristate
+    {
+        Unknown = -1, False = 0, True = 1
+    };
 
     enum e_llvmType
     {
@@ -133,8 +139,8 @@ namespace IGC
     llvm::LoadInst* cloneLoad(llvm::LoadInst* Orig, llvm::Value* Ptr);
     llvm::StoreInst* cloneStore(llvm::StoreInst* Orig, llvm::Value* Val, llvm::Value* Ptr);
 
-    llvm::Value* CreateLoadRawIntrinsic(llvm::LoadInst* inst, llvm::Instruction* bufPtr, llvm::Value* offsetVal);
-    llvm::Value* CreateStoreRawIntrinsic(llvm::StoreInst* inst, llvm::Instruction* bufPtr, llvm::Value* offsetVal);
+    llvm::LdRawIntrinsic* CreateLoadRawIntrinsic(llvm::LoadInst* inst, llvm::Value* bufPtr, llvm::Value* offsetVal);
+    llvm::StoreRawIntrinsic* CreateStoreRawIntrinsic(llvm::StoreInst* inst, llvm::Value* bufPtr, llvm::Value* offsetVal);
 
     void getTextureAndSamplerOperands(llvm::GenIntrinsicInst* pIntr, llvm::Value*& pTextureValue, llvm::Value*& pSamplerValue);
     void ChangePtrTypeInIntrinsic(llvm::GenIntrinsicInst*& pIntr, llvm::Value* oldPtr, llvm::Value* newPtr);
@@ -189,6 +195,10 @@ namespace IGC
     inline bool IsBindless(BufferType t)
     {
         return t == BINDLESS || t == BINDLESS_CONSTANT_BUFFER || t == BINDLESS_TEXTURE;
+    }
+    inline bool IsSSHbindless(BufferType t)
+    {
+        return t == SSH_BINDLESS || t == SSH_BINDLESS_CONSTANT_BUFFER;
     }
 
     bool IsUnsignedCmp(const llvm::CmpInst::Predicate Pred);
@@ -474,4 +484,5 @@ namespace IGC
 
     // Function modifies address space in selected uses of given input value
     void FixAddressSpaceInAllUses(llvm::Value* ptr, uint newAS, uint oldAS);
+
 } // namespace IGC

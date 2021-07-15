@@ -1,24 +1,8 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (c) 2000-2021 Intel Corporation
+Copyright (C) 2017-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"),
-to deal in the Software without restriction, including without limitation
-the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom
-the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-IN THE SOFTWARE.
+SPDX-License-Identifier: MIT
 
 ============================= end_copyright_notice ===========================*/
 
@@ -254,6 +238,10 @@ private:
   bool lowerMul64(Instruction *Inst);
   bool lowerLzd(Instruction *Inst);
   bool lowerTrap(CallInst *CI);
+  bool lowerLLVMMaskedLoad(CallInst *CI);
+  bool lowerLLVMMaskedStore(CallInst* CI);
+  bool lowerLLVMMaskedGather(CallInst *CI);
+  bool lowerLLVMMaskedScatter(CallInst *CI);
   bool generatePredicatedWrrForNewLoad(CallInst *CI);
 };
 
@@ -493,19 +481,19 @@ static Value *generatePredicatedWrregion(Value *OldVal, Value *NewVal,
 // Bale markers show how this will be baled later.
 static Value *generate1ChannelWrrregion(Value *Target, unsigned InitialOffset,
                                         CallInst *Load, Value *OldPred,
-                                        unsigned SplitNum,
+                                        unsigned AccumulatedOffset,
                                         Instruction *InsertBefore) {
   const DebugLoc &DL = Load->getDebugLoc();
   Type *LoadType = Load->getType();
   unsigned LoadWidth = cast<VectorType>(LoadType)->getNumElements();
 
   Value *Pred =
-      generatePredicateForLoadWrregion(OldPred, LoadWidth * SplitNum, LoadWidth,
-                                       1, InsertBefore, DL, "load1.pred.split");
+      generatePredicateForLoadWrregion(OldPred, AccumulatedOffset, LoadWidth, 1,
+                                       InsertBefore, DL, "load1.pred.split");
   Region WrR(LoadType);
   WrR.Mask = Pred;
-  WrR.Offset = InitialOffset +
-               LoadWidth * SplitNum * (LoadType->getScalarSizeInBits() / 8);
+  WrR.Offset =
+      InitialOffset + AccumulatedOffset * (LoadType->getScalarSizeInBits() / 8);
   return WrR.createWrRegion(Target, Load, "load1.join", InsertBefore, DL);
 }
 
@@ -665,6 +653,29 @@ getLoadTarget(CallInst *Load, const GenXSubtarget *ST) {
   return {Target, LoadPred, 0, Load};
 }
 
+// Get a vector of widths that are considered legal.
+// InstWidth is the width of an instruction.
+// InitWidth is the max legal width for that instruction, must be a power of 2.
+// Currently, a width considered legal if it is less than or equal to InitWidth
+// and is power of 2.
+static std::vector<unsigned> calculateLegalWidths(unsigned InstWidth,
+                                                  unsigned InitWidth) {
+  IGC_ASSERT_MESSAGE(InstWidth, "InstWidth cannot be 0");
+  IGC_ASSERT_MESSAGE(isPowerOf2_32(InitWidth), "InitWidth must be power of 2");
+  std::vector<unsigned> Widths;
+  while (InstWidth) {
+    if (InstWidth >= InitWidth) {
+      Widths.push_back(InitWidth);
+      InstWidth -= InitWidth;
+    } else
+      // TODO: some intrinsics support very limited exec size range. Legal exec
+      // sizes must be calculated more accurately.
+      InitWidth /= 2;
+  }
+
+  return Widths;
+}
+
 /***********************************************************************
  * splitGatherScatter : lower gather/scatter/atomic to the width support
  * by the hardware platform.
@@ -673,6 +684,9 @@ getLoadTarget(CallInst *Load, const GenXSubtarget *ST) {
  *
  * 1. If the operation is wider than what hardware can support, splits it
  *    into the legal width.
+ *    gather4/scatter4_* are split into instructions of the same width. Whereas
+ *    others supported by this function intrinsics are split in a more flexible
+ *    way with the legal width variation.
  *
  * 2. For typed gather4/scatter4, when r or both v and r are zero, replace
  *    with undef so that they are not encoded in the vISA instruction and the
@@ -879,18 +893,23 @@ bool GenXLowering::splitGatherScatter(CallInst *CI, unsigned IID) {
   auto Width = cast<VectorType>(CI->getArgOperand(WidthOperand)->getType())
                    ->getNumElements();
   unsigned TargetWidth = IsTyped ? 8 : 16;
-  if (Width <= TargetWidth)
+  // If exec size isn't a power of 2, it must be split. For example, exec size
+  // 12 -> 8 and 4.
+  if (Width <= TargetWidth && isPowerOf2_64(Width))
     return false;
   IGC_ASSERT(TargetWidth);
-  IGC_ASSERT((Width % TargetWidth) == 0);
-  auto NumSplits = Width / TargetWidth;
-  IGC_ASSERT(NumSplits == 2 || NumSplits == 4);
+  const std::vector<unsigned> Widths = calculateLegalWidths(Width, TargetWidth);
+  IGC_ASSERT(!Widths.empty());
   unsigned NumChannels = NumVectorElements;
   if (MaskIdx != NONEED) {
     NumChannels = (unsigned)cast<ConstantInt>(CI->getArgOperand(MaskIdx))
                       ->getZExtValue();
     NumChannels = (NumChannels & 1) + ((NumChannels & 2) >> 1) +
                   ((NumChannels & 4) >> 2) + ((NumChannels & 8) >> 3);
+    IGC_ASSERT(std::all_of(Widths.begin(), Widths.end(),
+                           [FirstWidth = Widths.front()](unsigned NextWidth) {
+                             return FirstWidth == NextWidth;
+                           }));
   }
 
   unsigned NumBlks = 1;
@@ -923,7 +942,8 @@ bool GenXLowering::splitGatherScatter(CallInst *CI, unsigned IID) {
     std::tie(NewResult, LoadPred, InitialOffset, InstToReplace) =
         getLoadTarget(CI, ST);
 
-  for (unsigned i = 0; i < NumSplits; ++i) {
+  unsigned AccumulatedOffset = 0;
+  for (auto CurWidth : Widths) {
     SmallVector<Value *, 8> Args;
     // initialize the args with the old values
     for (unsigned ArgI = 0; ArgI < CI->getNumArgOperands(); ++ArgI)
@@ -932,10 +952,10 @@ bool GenXLowering::splitGatherScatter(CallInst *CI, unsigned IID) {
     if (PredIdx != NONEED) {
       Value *V = CI->getArgOperand(PredIdx);
       if (auto C = dyn_cast<Constant>(V))
-        Args[PredIdx] = getConstantSubvector(C, i * TargetWidth, TargetWidth);
+        Args[PredIdx] = getConstantSubvector(C, AccumulatedOffset, CurWidth);
       else
         Args[PredIdx] = Region::createRdPredRegion(
-          V, i * TargetWidth, TargetWidth, "predsplit", CI, DL);
+            V, AccumulatedOffset, CurWidth, "predsplit", CI, DL);
     }
     // address source
     unsigned NumAddrs = 1;
@@ -944,8 +964,9 @@ bool GenXLowering::splitGatherScatter(CallInst *CI, unsigned IID) {
     for (unsigned AddrI = 0; AddrI < NumAddrs; ++AddrI) {
       Value *V = CI->getArgOperand(AddrIdx + AddrI);
       Region R(V);
-      R.Width = R.NumElements = TargetWidth;
-      R.Offset = i * TargetWidth * V->getType()->getScalarSizeInBits()/8; // in bytes
+      R.Width = R.NumElements = CurWidth;
+      R.Offset = AccumulatedOffset * V->getType()->getScalarSizeInBits() /
+                 8; // in bytes
       Args[AddrIdx + AddrI] = R.createRdRegion(V, "addrsplit", CI, DL);
     }
     // data source
@@ -954,19 +975,20 @@ bool GenXLowering::splitGatherScatter(CallInst *CI, unsigned IID) {
     if (DataIdx != NONEED) {
       Value *V = CI->getArgOperand(DataIdx);
       auto DataTy = IGCLLVM::FixedVectorType::get(
-          V->getType()->getScalarType(), TargetWidth * NumChannels * NumBlks);
+          V->getType()->getScalarType(), CurWidth * NumChannels * NumBlks);
       auto ElmSz = V->getType()->getScalarSizeInBits() / 8;
       Value *NewVec = UndefValue::get(DataTy);
       if (!isa<UndefValue>(V)) {
         for (unsigned Channel = 0; Channel < NumChannels; ++Channel) {
           Region RdR(V);
-          RdR.Width = RdR.NumElements = TargetWidth * NumBlks;
-          RdR.Offset = 4 * (Width * NumBlks * Channel + TargetWidth * NumBlks * i);
+          RdR.Width = RdR.NumElements = CurWidth * NumBlks;
+          RdR.Offset =
+              ElmSz * (Width * NumBlks * Channel + AccumulatedOffset * NumBlks);
           auto Rd = RdR.createRdRegion(V, "datasplit", CI, DL);
           if (NumChannels > 1) {
             Region WrR(DataTy);
-            WrR.Width = WrR.NumElements = TargetWidth * NumBlks;
-            WrR.Offset = ElmSz * TargetWidth * NumBlks * Channel;
+            WrR.Width = WrR.NumElements = CurWidth * NumBlks;
+            WrR.Offset = ElmSz * CurWidth * NumBlks * Channel;
             NewVec = WrR.createWrRegion(NewVec, Rd, "datasplit", CI, DL);
           } else
             NewVec = Rd;
@@ -979,8 +1001,9 @@ bool GenXLowering::splitGatherScatter(CallInst *CI, unsigned IID) {
       for (int SrcI = 0; SrcI < AtomicNumSrc; ++SrcI) {
         Value *V = CI->getArgOperand(AtomicSrcIdx + SrcI);
         Region R(V);
-        R.Width = R.NumElements = TargetWidth;
-        R.Offset = i * TargetWidth * V->getType()->getScalarSizeInBits()/8; // in bytes
+        R.Width = R.NumElements = CurWidth;
+        R.Offset = AccumulatedOffset * V->getType()->getScalarSizeInBits() /
+                   8; // in bytes
         Args[AtomicSrcIdx + SrcI] = R.createRdRegion(V, "addrsplit", CI, DL);
         }
     }
@@ -990,9 +1013,8 @@ bool GenXLowering::splitGatherScatter(CallInst *CI, unsigned IID) {
       if (DataIdx != NONEED)
         DstTy = Args[DataIdx]->getType();
       else {
-        DstTy =
-            IGCLLVM::FixedVectorType::get(CI->getType()->getScalarType(),
-                                          TargetWidth * NumBlks * NumChannels);
+        DstTy = IGCLLVM::FixedVectorType::get(CI->getType()->getScalarType(),
+                                              CurWidth * NumBlks * NumChannels);
       }
       SmallVector<Type *, 4> Tys = {DstTy};
 
@@ -1008,34 +1030,39 @@ bool GenXLowering::splitGatherScatter(CallInst *CI, unsigned IID) {
       auto Decl = GenXIntrinsic::getAnyDeclaration(CI->getModule(), IID, Tys);
       auto *Gather = CallInst::Create(Decl, Args, CI->getName() + ".split", CI);
       Gather->setDebugLoc(DL);
+      Gather->copyMetadata(*CI);
       if (IsNewLoad) {
         if (NumChannels == 1)
-          NewResult = generate1ChannelWrrregion(NewResult, InitialOffset,
-                                                Gather, LoadPred, i, CI);
-        else
           NewResult =
-              generateNChannelWrregion(NewResult, InitialOffset, Gather,
-                                       LoadPred, i, NumSplits, NumChannels, CI);
+              generate1ChannelWrrregion(NewResult, InitialOffset, Gather,
+                                        LoadPred, AccumulatedOffset, CI);
+        else
+          NewResult = generateNChannelWrregion(
+              NewResult, InitialOffset, Gather, LoadPred,
+              AccumulatedOffset / CurWidth, Widths.size(), NumChannels, CI);
+
+        AccumulatedOffset += CurWidth;
         continue;
       }
       // Join the results together, starting with the old value.
       auto ElmSz = DstTy->getScalarSizeInBits() / 8;
       if (NumChannels > 1) {
         Region RdR(Gather);
-        RdR.Width = RdR.NumElements = TargetWidth * NumBlks;
+        RdR.Width = RdR.NumElements = CurWidth * NumBlks;
         Region WrR(NewResult);
-        WrR.Width = WrR.NumElements = TargetWidth * NumBlks;
+        WrR.Width = WrR.NumElements = CurWidth * NumBlks;
         WrR.Mask = Args[PredIdx];
         for (unsigned Channel = 0; Channel != NumChannels; ++Channel) {
-          RdR.Offset = ElmSz * TargetWidth * NumBlks * Channel;
+          RdR.Offset = ElmSz * CurWidth * NumBlks * Channel;
           auto Rd = RdR.createRdRegion(Gather, "joint", CI, DL);
-          WrR.Offset = 4 * (Width * NumBlks * Channel + TargetWidth * NumBlks * i);
+          WrR.Offset =
+              ElmSz * (Width * NumBlks * Channel + NumBlks * AccumulatedOffset);
           NewResult = WrR.createWrRegion(NewResult, Rd, "join", CI, DL);
         }
       } else {
         Region WrR(NewResult);
-        WrR.Width = WrR.NumElements = TargetWidth * NumBlks;
-        WrR.Offset = ElmSz * TargetWidth * NumBlks * i;
+        WrR.Width = WrR.NumElements = CurWidth * NumBlks;
+        WrR.Offset = ElmSz * AccumulatedOffset * NumBlks;
         WrR.Mask = Args[PredIdx];
         NewResult = WrR.createWrRegion(NewResult, Gather, "join", CI, DL);
       }
@@ -1048,7 +1075,9 @@ bool GenXLowering::splitGatherScatter(CallInst *CI, unsigned IID) {
       auto Decl = GenXIntrinsic::getAnyDeclaration(CI->getModule(), IID, Tys);
       auto NewInst = CallInst::Create(Decl, Args, "", CI);
       NewInst->setDebugLoc(DL);
+      NewInst->copyMetadata(*CI);
     }
+    AccumulatedOffset += CurWidth;
   }
 
   if (NewResult)
@@ -1415,6 +1444,14 @@ bool GenXLowering::processInst(Instruction *Inst) {
       return lowerGenXMulSat(CI, IntrinsicID);
     case GenXIntrinsic::genx_lzd:
       return lowerLzd(Inst);
+    case Intrinsic::masked_load:
+      return lowerLLVMMaskedLoad(CI);
+    case Intrinsic::masked_store:
+      return lowerLLVMMaskedStore(CI);
+    case Intrinsic::masked_gather:
+      return lowerLLVMMaskedGather(CI);
+    case Intrinsic::masked_scatter:
+      return lowerLLVMMaskedScatter(CI);
     case Intrinsic::trap:
       return lowerTrap(CI);
     case Intrinsic::ctpop:
@@ -2129,8 +2166,16 @@ bool GenXLowering::lowerBoolShuffle(ShuffleVectorInst *SI) {
  */
 bool GenXLowering::lowerBoolSplat(ShuffleVectorInst *SI, Value *In,
                                   unsigned Idx) {
-  unsigned Width = cast<VectorType>(SI->getType())->getNumElements();
-  if (isa<VectorType>(In->getType())) {
+  auto IsFixedVectorOfWidth = [](const Type *Ty, unsigned Width) {
+    IGC_ASSERT(Ty);
+    const auto *VTy = dyn_cast<IGCLLVM::FixedVectorType>(Ty);
+    if (!VTy)
+      return false;
+    return VTy->getNumElements() == Width;
+  };
+
+  unsigned Width = cast<IGCLLVM::FixedVectorType>(SI->getType())->getNumElements();
+  if (IsFixedVectorOfWidth(In->getType(), Width)) {
     IRBuilder<> B(SI);
     Constant *C1 = ConstantVector::getSplat(IGCLLVM::getElementCount(Width),
                                             B.getInt16(1));
@@ -2976,6 +3021,162 @@ bool GenXLowering::lowerLzd(Instruction *Inst) {
   ToErase.push_back(Inst);
   return true;
 }
+
+#define SYCL_SLM_AS  3
+bool GenXLowering::lowerLLVMMaskedLoad(CallInst* CallOp) {
+  auto PtrV = CallOp->getArgOperand(0);
+  assert(PtrV->getType()->isPointerTy());
+  auto AS = cast<PointerType>(PtrV->getType())->getAddressSpace();
+  assert(AS != SYCL_SLM_AS && "do not expect masked load from SLM");
+  auto DTy = CallOp->getType();
+  // convert to unaligned-block-load then select
+  std::string IntrName =
+      std::string(GenXIntrinsic::getGenXIntrinsicPrefix()) +
+      "svm.block.ld.unaligned";
+  auto ID = GenXIntrinsic::lookupGenXIntrinsicID(IntrName);
+  Function* NewFDecl = GenXIntrinsic::getGenXDeclaration(
+      CallOp->getModule(), ID, { DTy, PtrV->getType() });
+  auto VecDT = CallInst::Create(NewFDecl, { PtrV },
+      "svm.block.ld.unaligned", CallOp);
+  IRBuilder<> Builder(CallOp);
+  auto RepI = Builder.CreateSelect(CallOp->getArgOperand(2), VecDT,
+      CallOp->getArgOperand(3), CallOp->getName());
+  CallOp->replaceAllUsesWith(RepI);
+  ToErase.push_back(CallOp);
+  return true;
+}
+
+bool GenXLowering::lowerLLVMMaskedStore(CallInst* CallOp) {
+  auto PtrV = CallOp->getArgOperand(1);
+  assert(PtrV->getType()->isPointerTy());
+  auto AS = cast<PointerType>(PtrV->getType())->getAddressSpace();
+  assert(AS != SYCL_SLM_AS && "do not expected masked store to SLM");
+  auto DTV = CallOp->getArgOperand(0);
+  // convert to unaligned-block-load then select
+  // then block-store
+  std::string IntrName =
+      std::string(GenXIntrinsic::getGenXIntrinsicPrefix()) +
+      "svm.block.ld.unaligned";
+  auto ID = GenXIntrinsic::lookupGenXIntrinsicID(IntrName);
+  Function* NewFDecl = GenXIntrinsic::getGenXDeclaration(
+      CallOp->getModule(), ID, { DTV->getType(), PtrV->getType() });
+  auto VecDT = CallInst::Create(NewFDecl, { PtrV },
+      "svm.block.ld.unaligned", CallOp);
+  IRBuilder<> Builder(CallOp);
+  auto SelI = Builder.CreateSelect(CallOp->getArgOperand(3), DTV, VecDT);
+
+  IntrName = std::string(GenXIntrinsic::getGenXIntrinsicPrefix()) +
+       "svm.block.st";
+  ID = GenXIntrinsic::lookupGenXIntrinsicID(IntrName);
+  NewFDecl = GenXIntrinsic::getGenXDeclaration(
+      CallOp->getModule(), ID, { PtrV->getType(), DTV->getType() });
+  CallInst::Create(
+      NewFDecl, { PtrV, SelI },
+      NewFDecl->getReturnType()->isVoidTy() ? "" : "svm.block.st",
+      CallOp);
+  ToErase.push_back(CallOp);
+  return true;
+}
+
+bool GenXLowering::lowerLLVMMaskedGather(CallInst* CallOp) {
+  auto PtrV = CallOp->getArgOperand(0);
+  auto MaskV = CallOp->getArgOperand(2);
+  auto OldV = CallOp->getArgOperand(3);
+  auto DTy = CallOp->getType();
+  assert(PtrV->getType()->isVectorTy() && DTy->isVectorTy());
+  auto PtrETy = cast<VectorType>(PtrV->getType())->getElementType();
+  assert(PtrETy->isPointerTy());
+  auto AS = cast<PointerType>(PtrETy)->getAddressSpace();
+  assert(AS != SYCL_SLM_AS && "do not expect masked gather from SLM");
+  auto EltTy = cast<VectorType>(DTy)->getElementType();
+  auto NumElts = cast<VectorType>(DTy)->getNumElements();
+  auto EltBytes = EltTy->getPrimitiveSizeInBits() / 8;
+  int EltsPerLane = 1;
+  // for short or byte type, load-data is 4 bytes per lane
+  if (EltBytes < 4) {
+    EltTy = Type::getInt8Ty(EltTy->getContext());
+    EltsPerLane = 4;
+  }
+  auto VDTy = IGCLLVM::FixedVectorType::get(EltTy, NumElts * EltsPerLane);
+  auto CIntTy = Type::getInt32Ty(EltTy->getContext());
+  int nb = (EltBytes == 2) ? 1 : 0; // 0/1/2/3 means 1/2/4/8 blks
+  auto NumBlksC = ConstantInt::get(CIntTy, nb);
+  Value* RepI = nullptr;
+  IRBuilder<> Builder(CallOp);
+  // need write-region for old-data in byte or short type
+  if (EltBytes < 4) {
+    if (isa<UndefValue>(OldV))
+      OldV = UndefValue::get(VDTy);
+    else {
+      // zext to i32 type
+      auto VInt32 = IGCLLVM::FixedVectorType::get(CIntTy, NumElts);
+      auto ExtI = Builder.CreateZExt(OldV, VInt32, OldV->getName());
+      // bitcast to 4xi8
+      OldV = Builder.CreateBitCast(ExtI, VDTy, ExtI->getName());
+    }
+  }
+  std::string IntrName =
+      std::string(GenXIntrinsic::getGenXIntrinsicPrefix()) + "svm.gather";
+  auto ID = GenXIntrinsic::lookupGenXIntrinsicID(IntrName);
+  Function* NewFDecl = GenXIntrinsic::getGenXDeclaration(
+      CallOp->getModule(), ID, { VDTy, MaskV->getType(), PtrV->getType() });
+  RepI = CallInst::Create(NewFDecl, { MaskV, NumBlksC, PtrV, OldV },
+      CallOp->getName(), CallOp);
+  if (EltBytes < 4) {
+    // bitcast to i32 type
+    auto VInt32 = IGCLLVM::FixedVectorType::get(CIntTy, NumElts);
+    auto CastI = Builder.CreateBitCast(RepI, VInt32, RepI->getName());
+    // trunc to the dst type
+    RepI = Builder.CreateTrunc(CastI, DTy, CastI->getName());
+  }
+  CallOp->replaceAllUsesWith(RepI);
+  ToErase.push_back(CallOp);
+  return true;
+}
+
+bool GenXLowering::lowerLLVMMaskedScatter(CallInst* CallOp) {
+  auto DataV = CallOp->getArgOperand(0);
+  auto PtrV = CallOp->getArgOperand(1);
+  auto MaskV = CallOp->getArgOperand(3);
+  auto DTy = DataV->getType();
+  assert(PtrV->getType()->isVectorTy() && DTy->isVectorTy());
+  auto PtrETy = cast<VectorType>(PtrV->getType())->getElementType();
+  assert(PtrETy->isPointerTy());
+  auto AS = cast<PointerType>(PtrETy)->getAddressSpace();
+  assert(AS != SYCL_SLM_AS && "do not expect masked scatter to SLM");
+  auto EltTy = cast<VectorType>(DTy)->getElementType();
+  auto NumElts = cast<VectorType>(DTy)->getNumElements();
+  auto EltBytes = EltTy->getPrimitiveSizeInBits() / 8;
+  int EltsPerLane = 1;
+  // for short or byte type, store-data is 4 bytes per lane
+  if (EltBytes < 4) {
+    EltTy = Type::getInt8Ty(EltTy->getContext());
+    EltsPerLane = 4;
+  }
+  auto VDTy = IGCLLVM::FixedVectorType::get(EltTy, NumElts * EltsPerLane);
+  auto CIntTy = Type::getInt32Ty(EltTy->getContext());
+  int nb = (EltBytes == 2) ? 1 : 0; // 0/1/2/3 means 1/2/4/8 blks
+  auto NumBlksC = ConstantInt::get(CIntTy, nb);
+  // need write-region for old-data in byte or short type
+  IRBuilder<> Builder(CallOp);
+  if (EltBytes < 4) {
+    // zext to i32 type
+    auto VInt32 = IGCLLVM::FixedVectorType::get(CIntTy, NumElts);
+    auto ExtI = Builder.CreateZExt(DataV, VInt32, DataV->getName());
+    // bitcast to 4xi8
+    DataV = Builder.CreateBitCast(ExtI, VDTy, ExtI->getName());
+  }
+  std::string IntrName =
+      std::string(GenXIntrinsic::getGenXIntrinsicPrefix()) + "svm.scatter";
+  auto ID = GenXIntrinsic::lookupGenXIntrinsicID(IntrName);
+  Function* NewFDecl = GenXIntrinsic::getGenXDeclaration(
+      CallOp->getModule(), ID, { MaskV->getType(), PtrV->getType(), VDTy });
+  CallInst::Create(NewFDecl, { MaskV, NumBlksC, PtrV, DataV },
+      CallOp->getName(), CallOp);
+  ToErase.push_back(CallOp);
+  return true;
+}
+
 /***********************************************************************
  * widenByteOp : widen a vector byte operation to short if that might
  *               improve code
@@ -3194,6 +3395,14 @@ private:
     return T->getPrimitiveSizeInBits();
   }
 
+  bool isVectorInst() const {
+    if (auto *LI = dyn_cast<LoadInst>(Inst))
+      return LI->getType()->isVectorTy();
+
+    auto *SI = cast<StoreInst>(Inst);
+    return SI->getValueOperand()->getType()->isVectorTy();
+  }
+
   // Return true if this load/store can be translated.
   bool isSupported() const;
 
@@ -3202,6 +3411,14 @@ private:
   bool emitScatter();
   bool emitSVMGather();
   bool emitSVMScatter();
+  bool emitSVMBlockLD();
+  bool emitSVMBlockST();
+  bool emitOwordLD();
+  bool emitOwordST();
+
+  // Helpers
+  std::tuple<IGCLLVM::FixedVectorType *, Type *, Value *>
+  castValueIfNeeded(IGCLLVM::FixedVectorType *ValTy, Value *Val = nullptr);
 };
 
 } // namespace
@@ -3230,6 +3447,14 @@ bool LoadStoreResolver::resolve() {
     return emitSVMGather();
   case GenXIntrinsic::genx_svm_scatter:
     return emitSVMScatter();
+  case GenXIntrinsic::genx_svm_block_ld:
+    return emitSVMBlockLD();
+  case GenXIntrinsic::genx_svm_block_st:
+    return emitSVMBlockST();
+  case GenXIntrinsic::genx_oword_ld:
+    return emitOwordLD();
+  case GenXIntrinsic::genx_oword_st:
+    return emitOwordST();
   default:
     break;
   }
@@ -3255,6 +3480,13 @@ bool LoadStoreResolver::isSupported() const {
   if (auto SI = dyn_cast<StoreInst>(Inst))
     ValTy = SI->getValueOperand()->getType();
 
+  // Use scalar type for vector: it will be resolved separately
+  unsigned VecWidth = 0;
+  if (auto *VecTy = dyn_cast<IGCLLVM::FixedVectorType>(ValTy)) {
+    ValTy = VecTy->getScalarType();
+    VecWidth = VecTy->getNumElements();
+  }
+
   // Only scalar data types.
   if (!ValTy->isFloatingPointTy() && !ValTy->isIntegerTy() &&
       !ValTy->isPointerTy()) {
@@ -3269,17 +3501,37 @@ bool LoadStoreResolver::isSupported() const {
     return false;
   }
 
+  // Only legal vec size: 16/32/64/128 bytes
+  // TODO: it is possible to handle any vector by dividing it into
+  // separate instructions. This is uncommon case so it is not
+  // implemented now.
+  if (VecWidth) {
+    unsigned NumBytes = VecWidth * (NumBits / ByteBits);
+    if (NumBytes < 16 || NumBytes > 128 || !isPowerOf2_32(NumBytes)) {
+      Inst->getContext().emitError("unsupported vector type for load/store");
+    }
+  }
+
   // Translate this instruction.
   return true;
 }
 
 // Find a proper GenX intrinsic ID for this load/store instruction.
 GenXIntrinsic::ID LoadStoreResolver::getGenXIntrinsicID() const {
-  // A32 byte scattered stateless messages only work on CNL+.
   unsigned NBits = getPointerSizeInBits();
+  if (isVectorInst()) {
+    if (NBits == 32)
+      return isLoad() ? GenXIntrinsic::genx_oword_ld
+                      : GenXIntrinsic::genx_oword_st;
+    return isLoad() ? GenXIntrinsic::genx_svm_block_ld
+                    : GenXIntrinsic::genx_svm_block_st;
+  }
+
+  // A32 byte scattered stateless messages only work on CNL+.
   if (NBits == 32 && ST && !ST->WaNoA32ByteScatteredStatelessMessages())
     return isLoad() ? GenXIntrinsic::genx_gather_scaled
                     : GenXIntrinsic::genx_scatter_scaled;
+
   return isLoad() ? GenXIntrinsic::genx_svm_gather
                   : GenXIntrinsic::genx_svm_scatter;
 }
@@ -3505,6 +3757,146 @@ bool LoadStoreResolver::emitSVMScatter() {
   Module *M = Inst->getModule();
   auto Fn = GenXIntrinsic::getGenXDeclaration(M, GenXIntrinsic::genx_svm_scatter, Tys);
 
+  Builder.CreateCall(Fn, Args);
+  return true;
+}
+
+// Helper for pointer value cast.
+// Returns [Casted ValTy, Old ScalarTy, Casted Value]
+std::tuple<IGCLLVM::FixedVectorType *, Type *, Value *>
+LoadStoreResolver::castValueIfNeeded(IGCLLVM::FixedVectorType *ValTy,
+                                     Value *Val) {
+  Type *ScalarTy = ValTy->getScalarType();
+  if (ScalarTy->isPointerTy()) {
+    unsigned VecWidth = ValTy->getNumElements();
+    ValTy = IGCLLVM::FixedVectorType::get(
+        Builder.getIntNTy(getValueSizeInBits(ScalarTy)), VecWidth);
+    if (Val)
+      Val = Builder.CreatePtrToInt(Val, ValTy);
+  }
+
+  return {ValTy, ScalarTy, Val};
+}
+
+// Translate load to svm block ld.
+bool LoadStoreResolver::emitSVMBlockLD() {
+  IGC_ASSERT_MESSAGE(getPointerSizeInBits() == 64,
+                     "Incorrect ptr size for svm block ld");
+  auto *LI = cast<LoadInst>(Inst);
+
+  // Address argument should be int
+  Value *Addr = LI->getPointerOperand();
+  Type *IntPtrTy = getDL().getIntPtrType(Addr->getType());
+  Addr = Builder.CreatePtrToInt(Addr, IntPtrTy);
+
+  // Analyze types
+  auto *ValTy = cast<IGCLLVM::FixedVectorType>(LI->getType());
+  Type *BasicScalarTy = nullptr;
+  std::tie(ValTy, BasicScalarTy, std::ignore) = castValueIfNeeded(ValTy);
+
+  // Overload with return type and address type
+  Type *Tys[] = {ValTy, Addr->getType()};
+  Module *M = Inst->getModule();
+  auto *Fn = GenXIntrinsic::getGenXDeclaration(
+      M, GenXIntrinsic::genx_svm_block_ld, Tys);
+
+  Value *NewVal = Builder.CreateCall(Fn, Addr);
+  if (BasicScalarTy->isPointerTy())
+    NewVal = Builder.CreateIntToPtr(NewVal, LI->getType());
+  LI->replaceAllUsesWith(NewVal);
+  return true;
+}
+
+// Translate store to svm block st.
+bool LoadStoreResolver::emitSVMBlockST() {
+  IGC_ASSERT_MESSAGE(getPointerSizeInBits() == 64,
+                     "Incorrect ptr size for svm block st");
+  auto *SI = cast<StoreInst>(Inst);
+
+  // Address argument should be int
+  Value *Addr = SI->getPointerOperand();
+  Type *IntPtrTy = getDL().getIntPtrType(Addr->getType());
+  Addr = Builder.CreatePtrToInt(Addr, IntPtrTy);
+
+  // Data to write
+  Value *Val = SI->getValueOperand();
+  auto *ValTy = cast<IGCLLVM::FixedVectorType>(Val->getType());
+  std::tie(ValTy, std::ignore, Val) = castValueIfNeeded(ValTy, Val);
+
+  // Overload with predicate type, address vector type, and data type
+  Type *Tys[] = {Addr->getType(), ValTy};
+  Module *M = Inst->getModule();
+  auto *Fn = GenXIntrinsic::getGenXDeclaration(
+      M, GenXIntrinsic::genx_svm_block_st, Tys);
+
+  Builder.CreateCall(Fn, {Addr, Val});
+  return true;
+}
+
+// Translate load to oword ld.
+bool LoadStoreResolver::emitOwordLD() {
+  IGC_ASSERT_MESSAGE(getPointerSizeInBits() == 32,
+                     "Incorrect ptr size for oword ld");
+  auto *LI = cast<LoadInst>(Inst);
+
+  // Offset argument should be int
+  Value *Addr = LI->getPointerOperand();
+  Type *IntPtrTy = getDL().getIntPtrType(Addr->getType());
+  Addr = Builder.CreatePtrToInt(Addr, IntPtrTy);
+
+  // Analyze types
+  auto *ValTy = cast<IGCLLVM::FixedVectorType>(LI->getType());
+  Type *BasicScalarTy = nullptr;
+  std::tie(ValTy, BasicScalarTy, std::ignore) = castValueIfNeeded(ValTy);
+
+  // Arguments
+  Value *Args[] = {
+      Builder.getInt32(1), // is modified (ignored according to vISA spec)
+      Builder.getInt32(visa::getReservedSurfaceIndex(
+          PreDefined_Surface::PREDEFINED_SURFACE_T255)), // surface
+      Addr                                               // offset
+  };
+
+  // Overload with return type
+  Module *M = Inst->getModule();
+  auto *Fn =
+      GenXIntrinsic::getGenXDeclaration(M, GenXIntrinsic::genx_oword_ld, ValTy);
+
+  Value *NewVal = Builder.CreateCall(Fn, Args);
+  if (BasicScalarTy->isPointerTy())
+    NewVal = Builder.CreateIntToPtr(NewVal, LI->getType());
+  LI->replaceAllUsesWith(NewVal);
+  return true;
+}
+
+// Translate store to oword st.
+bool LoadStoreResolver::emitOwordST() {
+  IGC_ASSERT_MESSAGE(getPointerSizeInBits() == 32,
+                     "Incorrect ptr size for oword st");
+  auto *SI = cast<StoreInst>(Inst);
+
+  // Offset argument should be int
+  Value *Addr = SI->getPointerOperand();
+  Type *IntPtrTy = getDL().getIntPtrType(Addr->getType());
+  Addr = Builder.CreatePtrToInt(Addr, IntPtrTy);
+
+  // Value to write
+  Value *Val = SI->getValueOperand();
+  auto *ValTy = cast<IGCLLVM::FixedVectorType>(Val->getType());
+  std::tie(ValTy, std::ignore, Val) = castValueIfNeeded(ValTy, Val);
+
+  // Arguments.
+  Value *Args[] = {
+      Builder.getInt32(visa::getReservedSurfaceIndex(
+          PreDefined_Surface::PREDEFINED_SURFACE_T255)), // surface
+      Addr,                                              // offset
+      Val                                                // value to write
+  };
+
+  // Overload with value to write type.
+  Module *M = Inst->getModule();
+  auto *Fn =
+      GenXIntrinsic::getGenXDeclaration(M, GenXIntrinsic::genx_oword_st, ValTy);
   Builder.CreateCall(Fn, Args);
   return true;
 }

@@ -1,28 +1,10 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2020-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
+============================= end_copyright_notice ===========================*/
 
 #ifndef _INC_LINEARSCANRA_H_
 #define _INC_LINEARSCANRA_H_
@@ -99,7 +81,7 @@ namespace vISA
         PhyRegsLocalRA* pregs = nullptr;
         std::vector<LSLiveRange*> globalLiveIntervals;
         std::vector<LSLiveRange*> preAssignedLiveIntervals;
-        std::vector<LSLiveRange*> callSitesLiveIntervals;
+        std::vector<LSLiveRange*> liveThroughIntervals;
         unsigned int numRegLRA = 0;
         unsigned int numRowsEOT = 0;
         unsigned int globalLRSize = 0;
@@ -116,6 +98,7 @@ namespace vISA
         LSLiveRange* stackCallRetLR;
         std::vector<G4_Declare *> globalDeclares;
         unsigned int funcCnt = 0;
+        unsigned int lastInstLexID = 0;
         std::vector<unsigned int> funcLastLexID;
 
         LSLiveRange* GetOrCreateLocalLiveRange(G4_Declare* topdcl);
@@ -267,7 +250,10 @@ public:
     void setLastRef(G4_INST* inst, unsigned int idx)
     {
         lastRef = inst;
-        lrEndIdx = idx;
+        if (idx > lrEndIdx)
+        {
+            lrEndIdx = idx;
+        }
     }
 
     G4_INST* getLastRef(unsigned int& idx) const
@@ -367,7 +353,7 @@ namespace vISA
         void freeAllocedRegs(LSLiveRange*, bool);
         void updateGlobalActiveList(LSLiveRange* lr);
         bool insertLiveRange(std::list<LSLiveRange*>* liveIntervals, LSLiveRange* lr);
-        bool canBeSpilledLR(LSLiveRange* tlr, LSLiveRange* lr, int GRFNum);
+        bool canBeSpilledLR(LSLiveRange* lr);
         int findSpillCandidate(LSLiveRange* tlr);
         void freeSelectedRegistsers(int startGRF, LSLiveRange* tlr, std::list<LSLiveRange*>& spillLRs);
         bool spillFromActiveList(LSLiveRange* tlr, std::list<LSLiveRange*>& spillLRs);

@@ -1,28 +1,10 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2017-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
+============================= end_copyright_notice ===========================*/
 
 #include "visa_igc_common_header.h"
 #include "Common_ISA.h"
@@ -50,6 +32,7 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <list>
 #include <string>
 #include <sstream>
+#include <functional>
 
 using namespace vISA;
 extern "C" int64_t getTimerTicks(unsigned int idx);
@@ -221,6 +204,9 @@ static const WA_TABLE *CreateVisaWaTable(TARGET_PLATFORM platform, Stepping step
             VISA_WA_ENABLE(pWaTable, Wa_1406950495);
             break;
         case GENX_TGLLP:
+            VISA_WA_ENABLE(pWaTable, Wa_1406950495);
+            break;
+        case XeHP_SDV:
             VISA_WA_ENABLE(pWaTable, Wa_1406950495);
             break;
         default:
@@ -464,6 +450,194 @@ void restoreFCallState(
     }
 }
 
+G4_Kernel* CISA_IR_Builder::GetCallerKernel(G4_INST* inst)
+{
+    return &inst->getBuilder().kernel;
+}
+
+G4_Kernel* CISA_IR_Builder::GetCalleeKernel(G4_INST* fcall)
+{
+    assert(fcall->opcode() == G4_pseudo_fcall);
+    std::string funcName = fcall->getSrc(0)->asLabel()->getLabel();
+    auto iter = functionsNameMap.find(funcName);
+    assert(iter != functionsNameMap.end() && "can't find function with given name");
+    return iter->second;
+}
+
+void CISA_IR_Builder::CheckHazardFeatures(
+    std::list<std::list<vISA::G4_INST*>::iterator>& sgInvokeList,
+    std::unordered_map<G4_Kernel*, std::list<std::list<G4_INST*>::iterator>>& callSites)
+{
+    std::function<void(G4_Kernel*, G4_Kernel*, std::set<G4_Kernel*>&)> traverse;
+    traverse = [&](G4_Kernel* root, G4_Kernel* func, std::set<G4_Kernel*>& visited)
+    {
+        for (auto& it : callSites[func])
+        {
+            G4_INST* fcall = *it;
+            assert(fcall->opcode() == G4_pseudo_fcall);
+            assert(func == GetCallerKernel(fcall));
+            G4_Kernel* callee = GetCalleeKernel(fcall);
+
+            assert(root != callee && "Detected a recursion that is not allowed");
+
+            if (visited.count(callee))
+                continue;
+
+            visited.insert(callee);
+            traverse(root, callee, visited);
+        }
+    };
+
+    for (auto& it : sgInvokeList)
+    {
+        G4_INST* fcall = *it;
+        // Check if there is a indirect call
+        assert(!fcall->asCFInst()->isIndirectCall() && "Not supported for indirect calls");
+
+        // Check recursion
+        std::set<G4_Kernel*> visited;
+        G4_Kernel* root = GetCalleeKernel(fcall);
+        visited.insert(root);
+        traverse(root, root, visited);
+    }
+
+}
+
+void CISA_IR_Builder::CollectCallSites(
+    std::list<VISAKernelImpl *>& functions,
+    std::unordered_map<G4_Kernel*, std::list<std::list<G4_INST*>::iterator>>& callSites)
+{
+    auto IsFCall = [](G4_INST* inst)
+    {
+        return inst->opcode() == G4_pseudo_fcall;
+    };
+
+    for (auto func : functions)
+    {
+        functionsNameMap[std::string(func->getName())] = func->getKernel();
+        auto& instList = func->getKernel()->fg.builder->instList;
+        std::list<G4_INST*>::iterator it = instList.begin();
+        while (it != instList.end())
+        {
+            if (!IsFCall(*it))
+            {
+                it++;
+                continue;
+            }
+            callSites[func->getKernel()].push_back(it);
+            it++;
+        }
+    }
+}
+
+void CISA_IR_Builder::RemoveOptimizingFunction(
+    std::list<VISAKernelImpl *>& functions,
+    std::list<std::list<vISA::G4_INST*>::iterator>& sgInvokeList)
+{
+    std::set<G4_Kernel*> removeList;
+    for (auto& it : sgInvokeList)
+    {
+        G4_INST* fcall = *it;
+        removeList.insert(GetCalleeKernel(fcall));
+    }
+    std::list<VISAKernelImpl*>::iterator i = functions.begin();
+    while (i != functions.end())
+    {
+        auto func = *i;
+        if (!removeList.count(func->getKernel())) {
+            ++i;
+        } else {
+            functions.erase(i++);
+        }
+    }
+}
+
+// Perform LTO including transforming stack calls to subroutine calls, subroutine calls to jumps, and inlining
+void CISA_IR_Builder::LinkTimeOptimization(
+    std::list<std::list<vISA::G4_INST*>::iterator>& sgInvokeList,
+    bool call2jump)
+{
+    std::map<G4_INST*, std::list<G4_INST*>::iterator> callsite;
+    std::map<G4_INST*, std::list<G4_INST*>> rets;
+    std::list<G4_INST*> dummyContainer;
+    // append instructions from callee to caller
+    for (auto& it : sgInvokeList)
+    {
+        G4_INST* fcall = *it;
+        assert(fcall->opcode() == G4_pseudo_fcall);
+
+        G4_Kernel* caller = GetCallerKernel(fcall);
+        G4_Kernel* callee = GetCalleeKernel(fcall);
+        auto& callerInsts = caller->fg.builder->instList;
+        auto calleeInsts  = callee->fg.builder->instList;
+        G4_INST* calleeLabel = *calleeInsts.begin();
+        for (G4_INST* fret : calleeInsts)
+        {
+            if (fret->opcode() != G4_pseudo_fret)
+                continue;
+            // Change fret to ret
+            fret->setOpcode(G4_return);
+            rets[calleeLabel].push_back(fret);
+        }
+        callerInsts.insert(callerInsts.end(), calleeInsts.begin(), calleeInsts.end());
+        // Append declarations from callee to caller
+        for (auto curDcl : callee->Declares)
+        {
+            caller->Declares.push_back(curDcl);
+        }
+    }
+
+    // Change fcall to call
+    for (auto& it : sgInvokeList)
+    {
+        G4_INST* fcall = *it;
+        assert(fcall->opcode() == G4_pseudo_fcall);
+
+        G4_Kernel* callee = GetCalleeKernel(fcall);
+
+        G4_INST* calleeLabel = *callee->fg.builder->instList.begin();
+        ASSERT_USER(calleeLabel->isLabel() == true, "Entry inst is not a label");
+
+        fcall->setOpcode(G4_call);
+        fcall->setSrc(calleeLabel->getSrc(0), 0);
+        // we only record a single callsite to the target in order to convert to jumps
+        if (callsite.find(calleeLabel) == callsite.end())
+        {
+            callsite[calleeLabel] = it;
+        }
+        else
+        {
+            callsite[calleeLabel] = dummyContainer.end();
+        }
+    }
+
+    if (call2jump)
+    {
+        for(auto& [label, itCall]: callsite)
+        {
+            if (itCall == dummyContainer.end())
+                continue;
+            G4_INST* call = *itCall;
+            G4_Kernel* caller = GetCallerKernel(call);
+            auto& builder = caller->fg.builder;
+            call->setOpcode(G4_goto);
+            call->asCFInst()->setUip(label->getLabel());
+            std::string funcName = call->getSrc(0)->asLabel()->getLabel();
+            G4_Label *raLabel = builder->createLabel(funcName + "_ret", LABEL_BLOCK);
+            G4_INST* ra = caller->fg.createNewLabelInst(raLabel);
+            auto& callerInsts = caller->fg.builder->instList;
+            callerInsts.insert(++itCall, ra);
+
+            for (G4_INST* ret : rets[label])
+            {
+                ret->setOpcode(G4_goto);
+                ret->asCFInst()->setUip(raLabel);
+            }
+        }
+    }
+
+}
+
 // Stitch the FG of subFunctions to mainFunc
 // mainFunc could be a kernel or a non-kernel function.
 // It also modifies pseudo_fcall/fret in to call/ret opcodes.
@@ -519,6 +693,14 @@ static void Stitch_Compiled_Units(
                 // Connect new fg
                 mainFunc->fg.addPredSuccEdges(cur, callee->fg.getEntryBB());
                 mainFunc->fg.addPredSuccEdges(callee->fg.getUniqueReturnBlock(), retBlock);
+
+                // propagate properties of callee to mainFunc
+                // usesBarrier property is propagated to IGC and onwards in to NEO patch
+                // token. we need this logic here to propagate barrier usage to IGC and
+                // further to NEO so it can setup WG size appropriately. without this
+                // setting barrier would cause machine to hang.
+                // TODO: How to set usesBarrier when callee is indirect?
+                mainFunc->fg.builder->getJitInfo()->usesBarrier |= callee->fg.builder->getJitInfo()->usesBarrier;
 
                 G4_INST* calleeLabel = callee->fg.getEntryBB()->front();
                 ASSERT_USER(calleeLabel->isLabel() == true, "Entry inst is not label");
@@ -748,6 +930,33 @@ int CISA_IR_Builder::Compile(const char* nameInput, std::ostream* os, bool emit_
         return m_cisaBinary->dumpToStream(os);
     }
 
+    if (m_options.getuInt32Option(vISA_Linker) != Linker_Disabled)
+    {
+        std::map<std::string, G4_Kernel*> functionsNameMap;
+        G4_Kernel* mainFunc = (*m_kernelsAndFunctions.begin())->getKernel();
+        assert((*m_kernelsAndFunctions.begin())->getIsKernel() && "mainFunc must be the kernel entry");
+        std::unordered_map<G4_Kernel*, std::list<std::list<G4_INST*>::iterator>> callSites;
+        CollectCallSites(m_kernelsAndFunctions, callSites);
+
+        // Assume sg.invoke callsite list is calls in the kernel for now for testing purposes
+        auto& sgInvokeList = callSites.begin()->second;
+        assert(callSites.begin()->first == mainFunc);
+
+        CheckHazardFeatures(sgInvokeList, callSites);
+
+        RemoveOptimizingFunction(m_kernelsAndFunctions, sgInvokeList);
+
+        // Copy callees' context to callers and convert to subroutine calls
+        if (m_options.getuInt32Option(vISA_Linker) & Linker_Subroutine)
+        {
+            LinkTimeOptimization(sgInvokeList,
+                    (m_options.getuInt32Option(vISA_Linker) & Linker_Call2Jump) ||
+                    (m_options.getuInt32Option(vISA_Linker) & Linker_Inline));
+        }
+    }
+
+
+
     VISAKernelImpl* oldMainKernel = nullptr;
     if (IS_GEN_BOTH_PATH)
     {
@@ -835,6 +1044,24 @@ int CISA_IR_Builder::Compile(const char* nameInput, std::ostream* os, bool emit_
                 stopTimer(TimerID::TOTAL);
                 return status;
             }
+            if (kernel->getIsPayload())
+            {
+                // Remove payload live-outs from the kernel after the compilation since
+                // they will not be outputs anymore after stitching.
+                mainKernel->getIRBuilder()->getRealR0()->resetLiveOut();
+                std::vector<input_info_t*>& inputs = mainKernel->getIRBuilder()->m_inputVect;
+                std::vector<input_info_t*>::iterator it = inputs.begin();
+                while (it != inputs.end())
+                {
+                    input_info_t* input_info = *it;
+                    vISA::G4_Declare* dcl = input_info->dcl;
+                    if (dcl->isPayloadLiveOut())
+                    {
+                        dcl->resetLiveOut();
+                    }
+                    ++it;
+                }
+            }
         }
         // Here we change the payload section as the main kernel in m_kernelsAndFunctions
         // During stitching, all functions will be cloned and stitched to the main kernel.
@@ -864,7 +1091,24 @@ int CISA_IR_Builder::Compile(const char* nameInput, std::ostream* os, bool emit_
             {
                 m_kernelsAndFunctions.push_back(oldMainKernel);
             }
+            // payloadSection is the main kernel at this point
+            // We need to copy essential info from the shader body to the main kernel
+            auto payloadSection = m_kernelsAndFunctions.front()->getIRBuilder();
+            auto shaderBody = m_kernelsAndFunctions.back()->getIRBuilder();
+            *payloadSection->getJitInfo() = *shaderBody->getJitInfo();
 
+            payloadSection->m_inputVect = shaderBody->m_inputVect;
+            if (shaderBody->kernel.hasKernelDebugInfo())
+            {
+                payloadSection->kernel.setKernelDebugInfo(
+                    shaderBody->kernel.getKernelDebugInfo());
+            }
+
+            if (shaderBody->kernel.hasGTPinInit())
+            {
+                payloadSection->kernel.setGTPinData(
+                    shaderBody->kernel.getGTPinData());
+            }
         }
 
         // Preparing for stitching some functions to other functions
@@ -1406,7 +1650,7 @@ bool CISA_IR_Builder::CISA_attr_directive(
     const char* input_name, const char* input_var, int lineNum)
 {
     Attributes::ID attrID = Attributes::getAttributeID(input_name);
-    if (!m_options.getOption(VISA_AsmFileNameUser) &&
+    if (!m_options.getOption(vISA_AsmFileNameOverridden) &&
         attrID == Attributes::ATTR_OutputAsmPath)
     {
         if (strcmp(input_name, "AsmName") == 0) {
@@ -1417,7 +1661,8 @@ bool CISA_IR_Builder::CISA_attr_directive(
 
         char asmFileName[MAX_OPTION_STR_LENGTH];
 
-        strncpy_s(asmFileName, MAX_OPTION_STR_LENGTH, input_var, MAX_OPTION_STR_LENGTH-1);
+        strncpy_s(asmFileName,
+            MAX_OPTION_STR_LENGTH, input_var, MAX_OPTION_STR_LENGTH - 1);
         char *pos = strstr(asmFileName, ".asm");
         if (pos != NULL)
         {
@@ -1430,18 +1675,14 @@ bool CISA_IR_Builder::CISA_attr_directive(
         unsigned char visa_target;
         if (input_var == nullptr) {
             RecordParseError(lineNum,
-                ".kernel_attr Target=.. must be \"cm\", \"3d\", or \"cs\"");
+                ".kernel_attr Target=.. must be \"cm\" or \"3d\"");
             return false;
         }
         if (strcmp(input_var, "cm") == 0) {
             visa_target = VISA_CM;
-        }
-        else if (strcmp(input_var, "3d") == 0)
-        {
+        } else if (strcmp(input_var, "3d") == 0) {
             visa_target = VISA_3D;
-        }
-        else
-        {
+        } else {
             RecordParseError(lineNum, "invalid kernel target attribute");
             return false;
         }
@@ -3295,6 +3536,103 @@ void CISA_IR_Builder::CISA_post_file_parse()
 std::stringstream& IR_Builder::criticalMsgStream()
 {
     return const_cast<CISA_IR_Builder*>(parentBuilder)->criticalMsgStream();
+}
+
+bool CISA_IR_Builder::CISA_create_dpas_instruction(
+    ISA_Opcode opcode,
+    VISA_EMask_Ctrl emask,
+    unsigned exec_size,
+    VISA_opnd * dst_cisa,
+    VISA_opnd * src0_cisa,
+    VISA_opnd * src1_cisa,
+    VISA_opnd * src2_cisa,
+    GenPrecision  A,
+    GenPrecision  W,
+    uint8_t D,
+    uint8_t C,
+    int lineNum)
+{
+    // rcount !
+    VISA_Exec_Size executionSize = Get_VISA_Exec_Size_From_Raw_Size(exec_size);
+    VISA_CALL_TO_BOOL(AppendVISADpasInst,
+        opcode, emask, executionSize,
+        (VISA_RawOpnd *)dst_cisa, (VISA_RawOpnd *)src0_cisa,
+        (VISA_RawOpnd *)src1_cisa, (VISA_VectorOpnd *)src2_cisa,
+        A, W, D, C);
+    return true;
+}
+
+
+bool CISA_IR_Builder::CISA_create_bfn_instruction(
+    VISA_opnd * pred,
+    uint8_t func_ctrl,
+    bool  sat,
+    VISA_EMask_Ctrl emask,
+    unsigned exec_size,
+    VISA_opnd * dst_cisa,
+    VISA_opnd * src0_cisa,
+    VISA_opnd * src1_cisa,
+    VISA_opnd * src2_cisa,
+    int lineNum)
+{
+    VISA_Exec_Size executionSize = Get_VISA_Exec_Size_From_Raw_Size(exec_size);
+    VISA_CALL_TO_BOOL(AppendVISABfnInst,
+        func_ctrl, (VISA_PredOpnd *)pred, sat, emask, executionSize,
+        (VISA_VectorOpnd *)dst_cisa, (VISA_VectorOpnd *)src0_cisa,
+        (VISA_VectorOpnd *)src1_cisa, (VISA_VectorOpnd *)src2_cisa);
+    return true;
+}
+
+bool CISA_IR_Builder::CISA_create_qword_scatter_instruction(
+    ISA_Opcode             opcode,
+    VISA_opnd             *pred,
+    VISA_EMask_Ctrl        eMask,
+    unsigned               execSize,
+    unsigned               numBlocks,
+    const char            *surfaceName,
+    VISA_opnd             *offsets,
+    VISA_opnd             *dstSrc,
+    int                    lineNum)
+{
+    VISA_StateOpndHandle * surface = CISA_get_surface_variable(surfaceName, lineNum);
+    if (!surface)
+        return false; // error recorded
+
+    if (opcode == ISA_QW_GATHER)
+    {
+        VISA_CALL_TO_BOOL(AppendVISAQwordGatherInst,
+            static_cast<VISA_PredOpnd *>(pred),
+            eMask, Get_VISA_Exec_Size_From_Raw_Size(execSize),
+            valueToVISASVMBlockNum(numBlocks),
+            surface,
+            static_cast<VISA_RawOpnd *>(offsets),
+            static_cast<VISA_RawOpnd *>(dstSrc));
+    }
+    else
+    {
+        VISA_CALL_TO_BOOL(AppendVISAQwordScatterInst,
+            static_cast<VISA_PredOpnd *>(pred),
+            eMask, Get_VISA_Exec_Size_From_Raw_Size(execSize),
+            valueToVISASVMBlockNum(numBlocks),
+            surface,
+            static_cast<VISA_RawOpnd *>(offsets),
+            static_cast<VISA_RawOpnd *>(dstSrc));
+    }
+    return true;
+}
+
+bool CISA_IR_Builder::CISA_create_bf_cvt_instruction(
+    VISA_EMask_Ctrl emask,
+    unsigned exec_size,
+    VISA_opnd *dst,
+    VISA_opnd *src0,
+    int lineNum)
+{
+    VISA_Exec_Size executionSize = Get_VISA_Exec_Size_From_Raw_Size(exec_size);
+    VISA_CALL_TO_BOOL(AppendVISADataMovementInst,
+        ISA_BF_CVT, nullptr, false, emask, executionSize,
+        (VISA_VectorOpnd *)dst, (VISA_VectorOpnd *)src0);
+    return true;
 }
 
 

@@ -1,28 +1,10 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2017-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
+============================= end_copyright_notice ===========================*/
 
 #ifndef COMMON_ISA_UTIL_INCLUDED
 #define COMMON_ISA_UTIL_INCLUDED
@@ -172,6 +154,25 @@ inline uint32_t getvISAMaskOffset(VISA_EMask_Ctrl emask)
     }
 }
 
+const char* toString(GenPrecision P);
+
+inline uint32_t DpasInfoToUI32(GenPrecision A, GenPrecision W, uint8_t D, uint8_t C)
+{
+    uint32_t info = (C & 0xFF);
+    info = (info << 8) | ((uint32_t)D & 0xFF);
+    info = (info << 8) | ((uint32_t)A & 0xFF);
+    info = (info << 8) | ((uint32_t)W & 0xFF);
+    return info;
+}
+
+inline void UI32ToDpasInfo(const uint32_t dpasInfo,
+    GenPrecision& A, GenPrecision& W, uint8_t& D, uint8_t& C)
+{
+    W = (GenPrecision)(dpasInfo & 0xFF);
+    A = (GenPrecision)((dpasInfo >> 8) & 0xFF);
+    D = ((dpasInfo >> 16) & 0xFF);
+    C = ((dpasInfo >> 24) & 0xFF);
+}
 
 inline bool isPerSampleSet(uint16_t mode)
 {

@@ -185,6 +185,8 @@ namespace IGC
         offset += getGRFSize();
 
         bool bZeroIDs = !GetNumberOfId();
+        bool bSupportLoadThreadPayload = m_Platform->supportLoadThreadPayloadForCompute();
+        bZeroIDs &= !bSupportLoadThreadPayload;
         // for indirect threads data payload hardware doesn't allow empty per thread buffer
         // so we allocate a dummy thread id in case no IDs are used
         if (pctx->m_DriverInfo.UsesIndirectPayload() && bZeroIDs)
@@ -200,10 +202,24 @@ namespace IGC
 
         AllocatePerThreadConstantData(offset);
 
+        if (bSupportLoadThreadPayload)
+        {
+            uint perThreadInputSize = offset - getGRFSize();
+            encoder.GetVISAKernel()->AddKernelAttribute("PerThreadInputSize", sizeof(uint16_t), &perThreadInputSize);
+        }
+
         // Cross-thread constant data.
         if (pctx->m_DriverInfo.UsesIndirectPayload())
         {
             AllocateNOSConstants(offset);
+        }
+
+        if (bSupportLoadThreadPayload)
+        {
+            encoder.GetVISAKernel()->AddKernelAttribute(
+                "CrossThreadInputSize",
+                sizeof(uint16_t),
+                &m_NOSBufferSize);
         }
     }
 
@@ -294,7 +310,7 @@ namespace IGC
 
         pKernelProgram->hasControlFlow = m_numBlocks > 1 ? true : false;
 
-        pKernelProgram->MaxNumberOfThreads = m_Platform->getMaxGPGPUShaderThreads();
+        pKernelProgram->MaxNumberOfThreads = m_Platform->getMaxGPGPUShaderThreads() / GetShaderThreadUsageRate();
         pKernelProgram->FloatingPointMode = USC::GFX3DSTATE_FLOATING_POINT_IEEE_754;
         pKernelProgram->SingleProgramFlow = USC::GFX3DSTATE_PROGRAM_FLOW_MULTIPLE;
         pKernelProgram->CurbeReadOffset = 0;
@@ -458,18 +474,11 @@ namespace IGC
                 uint sendStallCycle = simd16Program->m_sendStallCycle;
                 uint staticCycle = simd16Program->m_staticCycle;
 
-                llvm::GlobalVariable* pGlobal = GetContext()->getModule()->getGlobalVariable("ThreadGroupSize_X");
-                unsigned threadGroupSize_X = int_cast<unsigned>(llvm::cast<llvm::ConstantInt>(pGlobal->getInitializer())->getZExtValue());
-                pGlobal = GetContext()->getModule()->getGlobalVariable("ThreadGroupSize_Y");
-                unsigned threadGroupSize_Y = int_cast<unsigned>(llvm::cast<llvm::ConstantInt>(pGlobal->getInitializer())->getZExtValue());
-                pGlobal = GetContext()->getModule()->getGlobalVariable("ThreadGroupSize_Z");
-                unsigned threadGroupSize_Z = int_cast<unsigned>(llvm::cast<llvm::ConstantInt>(pGlobal->getInitializer())->getZExtValue());
-
                 if ((sendStallCycle / (float)staticCycle > 0.2) ||
                     (m_Platform->AOComputeShadersSIMD32Mode() &&
-                        threadGroupSize_X == 32 &&
-                        threadGroupSize_Y == 32 &&
-                        threadGroupSize_Z == 1))
+                        m_threadGroupSize_X == 32 &&
+                        m_threadGroupSize_Y == 32 &&
+                        m_threadGroupSize_Z == 1))
                 {
                     return true;
                 }

@@ -1,24 +1,8 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (c) 2000-2021 Intel Corporation
+Copyright (C) 2020-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"),
-to deal in the Software without restriction, including without limitation
-the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom
-the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-IN THE SOFTWARE.
+SPDX-License-Identifier: MIT
 
 ============================= end_copyright_notice ===========================*/
 
@@ -228,12 +212,6 @@ static void adjustOptions(const IGC::CPlatform &IGCPlatform,
   adjustDumpOptions(Opts);
   adjustStackCalls(Opts, Diag);
 
-  // ZE Binary does not support debug info
-  if (Opts.Binary == vc::BinaryKind::ZE && Opts.EmitDebuggableKernels) {
-    Opts.EmitDebuggableKernels = false;
-    Diag.addWarning("ZEBinary does not support debuggable kernels! "
-                    "Emission of debuggable kernels disabled");
-  }
   adjustTransformationsAndOptimizations(Opts);
 }
 
@@ -364,21 +342,40 @@ parseOptions(vc::ShaderDumper &Dumper, llvm::StringRef ApiOptions,
   return std::move(ExpOptions);
 }
 
-static llvm::Optional<vc::ExternalData> fillExternalData() {
+// Returns whether the modules were successfully obtained.
+template <enum vc::bif::RawKind Printf32, enum vc::bif::RawKind Printf64>
+bool fillPrintfData(vc::ExternalData &ExtData) {
+  ExtData.VCPrintf32BIFModule = getVCModuleBuffer<Printf32>();
+  if (!ExtData.VCPrintf32BIFModule)
+    return false;
+  ExtData.VCPrintf64BIFModule = getVCModuleBuffer<Printf64>();
+  return static_cast<bool>(ExtData.VCPrintf64BIFModule);
+}
+
+static llvm::Optional<vc::ExternalData>
+fillExternalData(vc::BinaryKind Binary) {
   vc::ExternalData ExtData;
   ExtData.OCLGenericBIFModule =
       getGenericModuleBuffer(OCL_BC);
   if (!ExtData.OCLGenericBIFModule)
     return {};
-  // FIXME: consider other binary kinds besides ocl.
-  ExtData.VCPrintf32BIFModule =
-      getVCModuleBuffer<vc::bif::RawKind::PrintfOCL32>();
-  if (!ExtData.VCPrintf32BIFModule)
-    return {};
-  ExtData.VCPrintf64BIFModule =
-      getVCModuleBuffer<vc::bif::RawKind::PrintfOCL64>();
-  if (!ExtData.VCPrintf64BIFModule)
-    return {};
+  switch (Binary) {
+  case vc::BinaryKind::CM:
+    if (!fillPrintfData<vc::bif::RawKind::PrintfCM32,
+                        vc::bif::RawKind::PrintfCM64>(ExtData))
+      return {};
+    break;
+  case vc::BinaryKind::OpenCL:
+    if (!fillPrintfData<vc::bif::RawKind::PrintfOCL32,
+                        vc::bif::RawKind::PrintfOCL64>(ExtData))
+      return {};
+    break;
+  case vc::BinaryKind::ZE:
+    if (!fillPrintfData<vc::bif::RawKind::PrintfZE32,
+                        vc::bif::RawKind::PrintfZE64>(ExtData))
+      return {};
+    break;
+  }
   ExtData.VCEmulationBIFModule =
       getVCModuleBuffer<vc::bif::RawKind::Emulation>();
   if (!ExtData.VCEmulationBIFModule)
@@ -449,7 +446,7 @@ std::error_code vc::translateBuild(const TC::STB_TranslateInputArgs *InputArgs,
 
   Opts.Dumper = std::move(Dumper);
 
-  auto ExtData = fillExternalData();
+  auto ExtData = fillExternalData(Opts.Binary);
   if (!ExtData)
     return getError(vc::make_error_code(vc::errc::bif_load_fail),
                     OutputArgs);
@@ -485,6 +482,9 @@ std::error_code vc::translateBuild(const TC::STB_TranslateInputArgs *InputArgs,
         ProgramDebugData.GetLinearPointer(),
         static_cast<std::size_t>(ProgramDebugData.Size())};
 
+    if (CMProgram.HasErrors())
+      return getError(CMProgram.GetError(), OutputArgs);
+
     outputBinary(BinaryRef, DebugInfoRef, Diag, OutputArgs);
     break;
   }
@@ -495,15 +495,12 @@ std::error_code vc::translateBuild(const TC::STB_TranslateInputArgs *InputArgs,
     llvm::SmallVector<char, 0> ProgramBinary;
     llvm::raw_svector_ostream ProgramBinaryOS{ProgramBinary};
     CMProgram.GetZEBinary(ProgramBinaryOS, CompileResult.PointerSizeInBytes);
+
+    if (CMProgram.HasErrors())
+      return getError(CMProgram.GetError(), OutputArgs);
+
     llvm::StringRef BinaryRef{ProgramBinary.data(), ProgramBinary.size()};
-
-    Util::BinaryStream ProgramDebugData;
-    CMProgram.GetProgramDebugData(ProgramDebugData);
-    llvm::StringRef DebugInfoRef{
-        ProgramDebugData.GetLinearPointer(),
-        static_cast<std::size_t>(ProgramDebugData.Size())};
-
-    outputBinary(BinaryRef, DebugInfoRef, Diag, OutputArgs);
+    outputBinary(BinaryRef, {}, Diag, OutputArgs);
     break;
   }
   }

@@ -36,8 +36,6 @@ public:
     CPixelShader(llvm::Function* pFunc, CShaderProgram* pProgram);
     ~CPixelShader();
     CVariable* GetR1();
-    std::vector<CVariable*>& GetR1Lo();
-    void AppendR1Lo(CVariable* var);
     CVariable* GetCoarseR1();
     CVariable* GetBaryReg(e_interpolation mode);
     CVariable* GetBaryRegLoweredHalf(e_interpolation mode);
@@ -71,6 +69,8 @@ public:
 
     void        AllocatePSPayload();
     void        AllocatePixelPhasePayload();
+    void        MapPushedInputs() override;
+    int         getSetupIndex(uint inputIndex);
 
     void        FillProgram(SPixelShaderKernelProgram* pKernelProgram);
     void        AddRenderTarget(uint index);
@@ -114,6 +114,10 @@ public:
     std::bitset<NUMBER_EINTERPOLATION> m_ModeUsedFloat;
     bool LowerPSInput();
     static bool IsInterpolationLinear(e_interpolation mode);
+    // attribute "packing"
+    // Non continuous "input indexes" may be received and they are allocated one after another.
+    // We need to map them to "setup indexes".
+    std::set<unsigned int> m_SetupIndicesUsed;
 
 protected:
     void CreatePassThroughVar();
@@ -124,7 +128,6 @@ private:
     USC::GFX3DSTATE_SF_ATTRIBUTE_ACTIVE_COMPONENT GetActiveComponents(uint attribute) const;
 
     CVariable* m_R1;
-    std::vector<CVariable*> m_R1Lo;
     CVariable* m_PerspectiveBaryPlanes;
     CVariable* m_NonPerspectiveBaryPlanes;
     CVariable* m_CoarseR1;

@@ -1,28 +1,11 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
+============================= end_copyright_notice ===========================*/
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
 #include "IGC/common/StringMacros.hpp"
 #include "G4_IR.hpp"
 #include "BuildIR.h"
@@ -185,9 +168,8 @@ G4_SendDescLdSt::G4_SendDescLdSt(
     G4_Operand *surf,
     ImmOff _immOff,
     LdStAttrs _attrs)
-    : G4_SendDesc(G4_SendDesc::Kind::LDST, sfid),
+    : G4_SendDesc(G4_SendDesc::Kind::LDST, sfid, _execSize),
     op(_op),
-    execSize(_execSize),
     //
     addrType(at), addrBits(_addrBits), addrDims(_addrDims),
     //
@@ -202,7 +184,7 @@ G4_SendDescLdSt::G4_SendDescLdSt(
 static size_t toExecSlots(const G4_SendDescLdSt &d)
 {
     int minExecSize = 8;
-    int execSlots = std::max((int)d.execSize, minExecSize);
+    int execSlots = std::max((int)d.getExecSize(), minExecSize);
     return (size_t)execSlots;
 }
 
@@ -439,9 +421,22 @@ G4_SendDescRaw::G4_SendDescRaw(
     uint32_t _extDesc,
     int _src1Len,
     SendAccess access,
-    G4_Operand *bti,
+    G4_Operand* bti,
     bool isValidFuncCtrl)
-    : G4_SendDesc(G4_SendDesc::Kind::RAW, _sfid),
+    : G4_SendDescRaw(_sfid, _desc, _extDesc, _src1Len, access, bti,
+                     g4::SIMD_UNDEFINED, isValidFuncCtrl)
+{}
+
+G4_SendDescRaw::G4_SendDescRaw(
+    SFID _sfid,
+    uint32_t _desc,
+    uint32_t _extDesc,
+    int _src1Len,
+    SendAccess access,
+    G4_Operand *bti,
+    G4_ExecSize execSize,
+    bool isValidFuncCtrl)
+    : G4_SendDesc(G4_SendDesc::Kind::RAW, _sfid, execSize),
     accessType(access), m_sti(nullptr), m_bti(bti), funcCtrlValid(isValidFuncCtrl)
 {
     desc.value = _desc;
@@ -601,6 +596,152 @@ bool G4_SendDescRaw::is16BitInput() const
 bool G4_SendDescRaw::is16BitReturn() const
 {
     return desc.layout.returnFormat == 1;
+}
+
+bool G4_SendDescRaw::isByteScatterRW() const
+{
+    auto funcID = getSFID();
+    switch (funcID) {
+    case SFID::DP_DC0:
+        switch (getHdcMessageType()) {
+        case DC_BYTE_SCATTERED_READ:
+        case DC_BYTE_SCATTERED_WRITE:
+            return true;
+        default:
+            break;
+        }
+        break;
+    case SFID::DP_DC1:
+        switch (getHdcMessageType()) {
+        case DC1_A64_SCATTERED_READ:
+        case DC1_A64_SCATTERED_WRITE:
+            return (getBlockSize() == 1);
+        default:
+            break;
+        }
+        break;
+    case SFID::DP_DC2:
+        switch (getHdcMessageType()) {
+        case DC2_A64_SCATTERED_READ:
+        case DC2_A64_SCATTERED_WRITE:
+            return (getBlockSize() == 1);
+        case DC2_BYTE_SCATTERED_READ:
+        case DC2_BYTE_SCATTERED_WRITE:
+            return true;
+        default:
+            break;
+        }
+        break;
+    default:
+        break;
+    }
+    return false;
+}
+
+bool G4_SendDescRaw::isDWScatterRW() const
+{
+    auto funcID = getSFID();
+    switch (funcID) {
+    case SFID::DP_DC0:
+        switch (getHdcMessageType()) {
+        case DC_DWORD_SCATTERED_READ:
+        case DC_DWORD_SCATTERED_WRITE:
+            return true;
+        default:
+            break;
+        }
+        break;
+    case SFID::DP_DC1:
+        switch (getHdcMessageType()) {
+        case DC1_A64_SCATTERED_READ:
+        case DC1_A64_SCATTERED_WRITE:
+            return (getBlockSize() == 4);
+        default:
+            break;
+        }
+        break;
+    case SFID::DP_DC2:
+        switch (getHdcMessageType()) {
+        case DC2_A64_SCATTERED_READ:
+        case DC2_A64_SCATTERED_WRITE:
+            return (getBlockSize() == 4);
+        default:
+            break;
+        }
+        break;
+    default:
+        break;
+    }
+    return false;
+}
+
+bool G4_SendDescRaw::isQWScatterRW() const
+{
+    auto funcID = getSFID();
+    switch (funcID) {
+    case SFID::DP_DC0:
+        switch (getHdcMessageType()) {
+        case DC_QWORD_SCATTERED_READ:
+        case DC_QWORD_SCATTERED_WRITE:
+            return true;
+        default:
+            break;
+        }
+        break;
+    case SFID::DP_DC1:
+        switch (getHdcMessageType()) {
+        case DC1_A64_SCATTERED_READ:
+        case DC1_A64_SCATTERED_WRITE:
+            return (getBlockSize() == 8);
+        default:
+            break;
+        }
+        break;
+    case SFID::DP_DC2:
+        switch (getHdcMessageType()) {
+        case DC2_A64_SCATTERED_READ:
+        case DC2_A64_SCATTERED_WRITE:
+            return (getBlockSize() == 8);
+        default:
+            break;
+        }
+        break;
+    default:
+        break;
+    }
+    return false;
+}
+
+bool G4_SendDescRaw::isUntypedRW() const
+{
+    auto funcID = getSFID();
+    switch (funcID) {
+    case SFID::DP_DC1:
+        switch (getHdcMessageType()) {
+        case DC1_UNTYPED_SURFACE_READ:
+        case DC1_UNTYPED_SURFACE_WRITE:
+        case DC1_A64_UNTYPED_SURFACE_READ:
+        case DC1_A64_UNTYPED_SURFACE_WRITE:
+            return true;
+        default:
+            break;
+        }
+        break;
+    case SFID::DP_DC2:
+        switch (getHdcMessageType()) {
+        case DC2_UNTYPED_SURFACE_READ:
+        case DC2_UNTYPED_SURFACE_WRITE:
+        case DC2_A64_UNTYPED_SURFACE_READ:
+        case DC2_A64_UNTYPED_SURFACE_WRITE:
+            return true;
+        default:
+            break;
+        }
+        break;
+    default:
+        break;
+    }
+    return false;
 }
 
 bool G4_SendDescRaw::isA64Message() const
@@ -836,6 +977,8 @@ std::string G4_SendDescRaw::getDescription() const
             case 0xa: return "oword dual block write";
             case 0xb: return "dword scattered write";
             case 0xc: return "byte scattered write";
+            case 0x5: return "qword gather";
+            case 0xd: return "qword scatter";
             default: return "unrecognized DC0 message";
             }
         }
@@ -897,6 +1040,28 @@ size_t G4_SendDescRaw::getDstLenBytes() const
         return 32 * getScratchRWSize(); // HWords
     } else if (isOwordLoad()) {
         return 16 * getOwordsAccessed(); // OWords
+#if 1
+    // Use macro fo easy testing.
+    } else if (isByteScatterRW() && isDataPortRead()) {
+        assert(getExecSize() != g4::SIMD_UNDEFINED);
+        uint16_t nbytes = getBlockNum();
+        // assume 4 at least
+        nbytes = (nbytes >= 4 ? nbytes : 4);
+        size_t sz = nbytes * getExecSize();
+        return sz;
+    } else if (isDWScatterRW() && isDataPortRead()) {
+        assert(getExecSize() != g4::SIMD_UNDEFINED);
+        size_t sz = 4 * getBlockNum() * getExecSize();
+        return sz;
+    } else if (isQWScatterRW() && isDataPortRead()) {
+        assert(getExecSize() != g4::SIMD_UNDEFINED);
+        size_t sz = 8 * getBlockNum() * getExecSize();
+        return sz;
+    } else if (isUntypedRW() && isDataPortRead()) {
+        assert(getExecSize() != g4::SIMD_UNDEFINED);
+        size_t sz = 4 * getEnabledChannelNum() * getExecSize();
+        return sz;
+#endif
     } else {
         // fallback to the raw GRF count
         return ResponseLength() * (size_t)getGRFSize();

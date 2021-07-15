@@ -1,28 +1,10 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2017-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
+============================= end_copyright_notice ===========================*/
 
 /*
  * ISA IR Disassembler
@@ -139,8 +121,7 @@ std::string printVariableDeclName(
         {   case STATE_OPND_SURFACE : sstr << printSurfaceName(declID); break;
             case STATE_OPND_SAMPLER : sstr << "S"   << declID; break;
             default                 :
-                if (options->getOption(vISA_easyIsaasm) == false ||
-                    options->getOption(vISA_PlatformIsSet) == false)
+                if (!options->getOption(vISA_PlatformIsSet))
                 {
                     // If platform is not set then dcl instances are
                     // not created causing a crash. So print dcl name
@@ -394,7 +375,8 @@ static void encodeStringLiteral(std::stringstream &ss, const char *str) {
           if (std::isprint((unsigned char)str[i])) {
               ss << str[i];
           } else {
-              ss << "\\x" << std::hex << (unsigned)((unsigned char)str[i]);
+              ss << "\\x" << std::setw(2) << std::setfill('0') << std::hex <<
+                  (unsigned)((unsigned char)str[i]);
           }
       }
   }
@@ -802,7 +784,13 @@ static std::string printInstructionCommon(
             sstr << (((relOp >> 7) & 0x1) ? "n" : ""); /// INFO: cmpn opcode print support here.
             sstr << "." << Rel_op_str[(unsigned)(relOp & 0x7)];
         }
-
+        else if (opcode == ISA_BFN)
+        {
+            // print BooleanFuncCtrl right after op name
+            sstr << ".x" << std::hex << (uint32_t)(getPrimitiveOperand<uint8_t>(inst, Count-1)) << std::dec;
+            // The following shall skip booleanFuncCtrl opnd
+            --Count;
+        }
 
         if (ISA_Inst_Arith   == ISA_Inst_Table[opcode].type ||
             ISA_Inst_Mov     == ISA_Inst_Table[opcode].type ||
@@ -1321,6 +1309,34 @@ static std::string printInstructionMisc(
 
             break;
         }
+        case ISA_DPAS:
+        case ISA_DPASW:
+        {
+            const VISA_opnd* dpasOpnd = inst->opnd_array[inst->opnd_count-1];
+            GenPrecision A, W;
+            uint8_t D, C;
+            UI32ToDpasInfo(dpasOpnd->_opnd.other_opnd, A, W, D, C);
+
+            sstr << ISA_Inst_Table[opcode].str
+                 << "." << toString(W) << "." << toString(A) << "."
+                 << (int)D << "." << (int)C;
+
+            sstr << " " << printExecutionSize(inst->opcode, inst->execsize);
+
+            // dst
+            sstr << printRawOperand(header, getRawOperand(inst, i++), opt);
+
+            // src0
+            sstr << printRawOperand(header, getRawOperand(inst, i++), opt);
+
+            // src1
+            sstr << printRawOperand(header, getRawOperand(inst, i++), opt);
+
+            // src2
+            sstr << printVectorOperand(header, inst->opnd_array[i++], opt, false);
+
+            break;
+        }
         case ISA_LIFETIME:
         {
             uint8_t properties = getPrimitiveOperand<uint8_t>(inst, i++);
@@ -1456,7 +1472,7 @@ static std::string printInstructionSampler(
             //   <dst> <u> <v> <r> <ai>
             auto subop = getSubOpcodeByte(inst, i++);
 
-            sstr << SAMPLE_OP_3D_NAME[subop.opcode] << ".";
+            sstr << getSampleOp3DName(subop.opcode) << ".";
             // Print the pixel null mask if it is enabled.
             if (subop.pixelNullMask)
             {
@@ -1507,7 +1523,7 @@ static std::string printInstructionSampler(
         {
             auto subop = getSubOpcodeByte(inst, i++);
 
-            sstr << SAMPLE_OP_3D_NAME[subop.opcode] << ".";
+            sstr << getSampleOp3DName(subop.opcode) << ".";
             // Print the pixel null mask if it is enabled.
             // The last '.' is for the channels.
             if (subop.pixelNullMask)
@@ -1546,7 +1562,7 @@ static std::string printInstructionSampler(
         {
             auto subop = getSubOpcodeByte(inst, i++);
 
-            sstr << SAMPLE_OP_3D_NAME[subop.opcode] << ".";
+            sstr << getSampleOp3DName(subop.opcode) << ".";
             // Print the pixel null mask if it is enabled.
             // The last '.' is for the channels.
             if (subop.pixelNullMask)
@@ -1603,7 +1619,7 @@ static std::string printInstructionSampler(
         case ISA_3D_INFO:
         {
             VISASampler3DSubOpCode subop = (VISASampler3DSubOpCode)getPrimitiveOperand<uint8_t>(inst, i++);
-            sstr << SAMPLE_OP_3D_NAME[subop];
+            sstr << getSampleOp3DName(subop);
             if (subop == VISA_3D_RESINFO || subop == VISA_3D_SAMPLEINFO)
             {
                 // channelMask
@@ -2142,6 +2158,8 @@ static std::string printInstructionDataport(
     case ISA_SCATTER_SCALED:
     case ISA_DWORD_ATOMIC:
     case ISA_3D_TYPED_ATOMIC:
+    case ISA_QW_GATHER:
+    case ISA_QW_SCATTER:
         sstr << printPredicate(inst->opcode, inst->pred);
         break;
     }
@@ -2457,6 +2475,28 @@ static std::string printInstructionDataport(
             sstr << printOperand(header, inst, i++, opt);
             break;
         }
+        case ISA_QW_GATHER:
+        case ISA_QW_SCATTER:
+        {
+            //QW_GATHER/SCATTER.<num_blocks> (<exec_size>) <surface> <offset> <dst>
+            VISA_SVM_Block_Num numBlocks;
+
+            numBlocks = static_cast<VISA_SVM_Block_Num>(getPrimitiveOperand<uint8_t>(inst, i++));
+            sstr << "." << Get_Common_ISA_SVM_Block_Num(numBlocks);
+
+            sstr << " " << printExecutionSize(inst->opcode, inst->execsize);
+
+            /// surface
+            surface = getPrimitiveOperand<uint8_t>(inst, i++);
+            sstr << " " << printSurfaceName(surface);
+
+            /// offsets
+            sstr << printOperand(header, inst, i++, opt);
+
+            /// src/dst
+            sstr << printOperand(header, inst, i++, opt);
+            break;
+        }
 
         default:
         {
@@ -2494,71 +2534,77 @@ std::string VISAKernel_format_provider::printKernelHeader(
     sstr << "\n" << "/// VISA Predefined Variables";
     for (unsigned i = 0; i < Get_CISA_PreDefined_Var_Count(); i++)
     {
-        const var_info_t* predefVar = this->getPredefVar(i);
+        const var_info_t* predefVar = getPredefVar(i);
         if (predefVar->name_index != -1)
         {
             sstr << "\n" << "// .decl V" << i
                 << " v_type=G"
-                << " v_name=" << this->getString(predefVar->name_index);
+                << " v_name=" << getString(predefVar->name_index);
         }
     }
     for (unsigned i = 0; i < Get_CISA_PreDefined_Surf_Count(); i++)
     {
-        const state_info_t* predefSurface = this->getPredefSurface(i);
+        const state_info_t* predefSurface = getPredefSurface(i);
         if (predefSurface->name_index != -1)
         {
             sstr << "\n" << "// .decl T" << i
                 << " v_type=T"
-                << " v_name=" << this->getString(predefSurface->name_index);
+                << " v_name=" << getString(predefSurface->name_index);
         }
     }
     sstr << "\n";
 
     // emit var decls
     //.decl  V<#> name=<name> type=<type> num_elts=<num_elements> [align=<align>] [alias=(<alias_index>,<alias_offset>)]
-    for (unsigned i = 0; i < this->getVarCount(); i++)
+    for (unsigned i = 0; i < getVarCount(); i++)
     {
         sstr << "\n" << printVariableDecl(this, i, options);
     }
     // address decls
-    for (unsigned i = 0; i < this->getAddrCount(); i++)
+    for (unsigned i = 0; i < getAddrCount(); i++)
     {
         sstr << "\n" << printAddressDecl(isaHeader, this, i);
     }
     // pred decls
-    for (unsigned i = 0; i < this->getPredCount(); i++)
+    for (unsigned i = 0; i < getPredCount(); i++)
     {
         // P0 is reserved; starting from P1 if there is predicate decl
         sstr << "\n" << printPredicateDecl(this, i);
     }
     // sampler
-    for (unsigned i = 0; i < this->getSamplerCount(); i++)
+    for (unsigned i = 0; i < getSamplerCount(); i++)
     {
         sstr << "\n" << printSamplerDecl(this, i);
     }
     // surface
     unsigned numPreDefinedSurfs = Get_CISA_PreDefined_Surf_Count();
-    for (unsigned i = 0; i < this->getSurfaceCount(); i++)
+    for (unsigned i = 0; i < getSurfaceCount(); i++)
     {
         sstr << "\n" << printSurfaceDecl(this, i, numPreDefinedSurfs);
     }
     // inputs to kernel
-    for (unsigned i = 0; i < this->getInputCount(); i++)
+    for (unsigned i = 0; i < getInputCount(); i++)
     {
         sstr << "\n" << printFuncInput(this, i, isKernel, options);
     }
 
     bool isTargetSet = false;
-    for (unsigned i = 0; i < this->getAttrCount(); i++)
+    for (unsigned i = 0; i < getAttrCount(); i++)
     {
-        sstr << "\n.kernel_attr " << printOneAttribute(this, this->getAttr(i));
-        const char* attrName = this->getString(this->getAttr(i)->nameIndex);
-        if (Attributes::isAttribute(Attributes::ATTR_Target, attrName))
-        {
+        const char* attrName = getString(getAttr(i)->nameIndex);
+        if (Attributes::isAttribute(Attributes::ATTR_OutputAsmPath, attrName)) {
+            // treat this as a transient property and skip it
+            // this simplifies diffs in shader dump debugging
+            // if you want to set an explicit name from the command line,
+            // then use the appropriate option to set this attribute
+            continue;
+        }
+        if (Attributes::isAttribute(Attributes::ATTR_Target, attrName)) {
             isTargetSet = true;
         }
+        sstr << "\n.kernel_attr " << printOneAttribute(this, getAttr(i));
     }
-    if (isTargetSet == false)
+    if (!isTargetSet)
     {
         const char* attrName = Attributes::getAttributeName(Attributes::ATTR_Target);
         sstr << "\n" << ".kernel_attr " << attrName << "=";

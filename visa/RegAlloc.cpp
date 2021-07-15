@@ -1,28 +1,10 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2017-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
+============================= end_copyright_notice ===========================*/
 
 #include "Mem_Manager.h"
 #include "FlowGraph.h"
@@ -537,6 +519,7 @@ bool LivenessAnalysis::setVarIDs(bool verifyRA, bool areAllPhyRegAssigned)
     bool phyRegAssigned = areAllPhyRegAssigned;
     for (G4_Declare* decl : gra.kernel.Declares)
     {
+
         if (livenessCandidate(decl, verifyRA) && decl->getAliasDeclare() == NULL)
         {
             if (decl->getIsSplittedDcl())
@@ -1057,14 +1040,12 @@ void LivenessAnalysis::computeLiveness()
     // analysis results in uses being propgated along paths that are not feasible
     // in the actual program.
     //
-
     if (performIPA())
     {
         hierarchicalIPA(inputDefs, outputUses);
         stopTimer(TimerID::LIVENESS);
         return;
     }
-
 
 
     if (fg.getKernel()->getInt32KernelAttr(Attributes::ATTR_Target) == VISA_3D &&
@@ -1149,7 +1130,7 @@ void LivenessAnalysis::computeLiveness()
             }
         }
 
-        fg.getKernel()->emitGenAsm(std::cerr, true, nullptr, 0);
+        fg.getKernel()->dump(std::cerr);
 
         auto printLive = [this, &idToDecl](int id)
         {
@@ -1549,11 +1530,11 @@ void LivenessAnalysis::hierarchicalIPA(const BitSet& kernelInput, const BitSet& 
     //  -- At each call site:
     //       add def_out[call-BB] to all of callee's BBs
     def_in[fg.getEntryBB()->getId()] = kernelInput;
-
     for (auto subroutine : fg.sortedFuncTable)
     {
         defAnalysis(subroutine);
     }
+
 
     // FIXME: I assume we consider all caller's defs to be callee's defs too?
     for (auto FI = fg.sortedFuncTable.rbegin(), FE = fg.sortedFuncTable.rend(); FI != FE; ++FI)
@@ -1699,12 +1680,11 @@ bool LivenessAnalysis::writeWholeRegion(const G4_BB* bb,
         return true;
     }
 
-       //
+    //
     // If the region does not cover the whole declare then it does not write the whole region.
-       //
-
-    if (dst->getTypeSize() * execSize !=
-        primaryDcl->getElemSize() * primaryDcl->getNumElems() * primaryDcl->getNumRows()) {
+    //
+    if (!primaryDcl->getRegVar()->isRegVarTransient() && (dst->getTypeSize() * execSize !=
+        primaryDcl->getElemSize() * primaryDcl->getNumElems() * primaryDcl->getNumRows())) {
            return false;
     }
 
@@ -1819,7 +1799,6 @@ void LivenessAnalysis::computeGenKillandPseudoKill(G4_BB* bb,
             {
                 G4_Declare* topdcl = GetTopDclFromRegRegion(dstrgn);
                 unsigned id = topdcl->getRegVar()->getId();
-
                 if (i->isPseudoKill())
                 {
                     // Mark kill, reset gen
@@ -1925,7 +1904,6 @@ void LivenessAnalysis::computeGenKillandPseudoKill(G4_BB* bb,
                 G4_Declare* topdcl = GetTopDclFromRegRegion(src);
                 const G4_VarBase* base = (topdcl != nullptr ? topdcl->getRegVar() :
                     src->asSrcRegRegion()->getBase());
-
                 if (base->isRegAllocPartaker())
                 {
                     unsigned id = topdcl->getRegVar()->getId();
@@ -2401,6 +2379,80 @@ void LivenessAnalysis::dump() const
     }
 }
 
+void LivenessAnalysis::dumpBB(G4_BB *bb) const
+{
+    std::cerr << "\n\nBB" << bb->getId() << "'s live in: ";
+    unsigned total_size = 0;
+    auto dumpVar = [&total_size](G4_RegVar* var)
+    {
+        int size = var->getDeclare()->getTotalElems() * var->getDeclare()->getElemSize();
+        std::cerr << var->getName() << "(" << size << ")" << "[" << var->getRegAllocPartaker() << "], ";
+        total_size += size;
+    };
+
+    unsigned count = 0;
+    for (auto var : vars)
+    {
+        if (var->isRegAllocPartaker() && isLiveAtEntry(bb, var->getId()))
+        {
+            if (count++ % 10 == 0) std::cerr << "\n";
+            dumpVar(var);
+        }
+    }
+    std::cerr << "\n\nBB" << bb->getId() << "'s live out: ";
+    total_size = 0;
+    count = 0;
+    for (auto var : vars)
+    {
+        if (var->isRegAllocPartaker() && isLiveAtExit(bb, var->getId()))
+        {
+            if (count++ % 10 == 0) std::cerr << "\n";
+            dumpVar(var);
+        }
+    }
+    std::cerr << "\n\nBB" << bb->getId() << "'s use through: ";
+    total_size = 0;
+    count = 0;
+    for (auto var : vars)
+    {
+        if (var->isRegAllocPartaker() && isUseThrough(bb, var->getId()))
+        {
+            if (count++ % 10 == 0) std::cerr << "\n";
+            dumpVar(var);
+        }
+    }
+    std::cerr << "\n\nBB" << bb->getId() << "'s def through: ";
+    total_size = 0;
+    count = 0;
+    for (auto var : vars)
+    {
+        if (var->isRegAllocPartaker() && isDefThrough(bb, var->getId()))
+        {
+            if (count++ % 10 == 0) std::cerr << "\n";
+            dumpVar(var);
+        }
+    }
+}
+
+void LivenessAnalysis::dumpLive(BitSet& live) const
+{
+    auto dumpVar = [](G4_RegVar* var)
+    {
+        int size = var->getDeclare()->getTotalElems() * var->getDeclare()->getElemSize();
+        std::cerr << var->getName() << "(" << size << ")" << "[" << var->getRegAllocPartaker() << "], ";
+    };
+
+    unsigned count = 0;
+    for (auto var : vars)
+    {
+        if (live.isSet(var->getId()))
+        {
+            if (count++ % 10 == 0) std::cerr << "\n";
+            dumpVar(var);
+        }
+    }
+}
+
 //
 // dump which vars are live at the entry of BB
 //
@@ -2433,6 +2485,11 @@ void LivenessAnalysis::dumpGlobalVarNum() const
     std::cerr << "total var num: " << numVarId << " global var num: " << global_var_num << "\n";
 }
 
+bool LivenessAnalysis::isEmptyLiveness() const
+{
+    return numBBId == 0;
+}
+
 //
 // return true if var is live at the entry of bb
 // check both use_in and def_in, if one condition fails then var is not in the live range
@@ -2447,6 +2504,37 @@ bool LivenessAnalysis::isLiveAtEntry(const G4_BB* bb, unsigned var_id) const
 bool LivenessAnalysis::isLiveAtExit(const G4_BB* bb, unsigned var_id) const
 {
     return use_out[bb->getId()].isSet(var_id) && def_out[bb->getId()].isSet(var_id);
+}
+
+//
+// return true if var is user through the bb
+//
+bool LivenessAnalysis::isUseOut(const G4_BB* bb, unsigned var_id) const
+{
+    return use_out[bb->getId()].isSet(var_id);
+}
+
+//
+// return true if var is user through the bb
+//
+bool LivenessAnalysis::isUseIn(const G4_BB* bb, unsigned var_id) const
+{
+    return use_in[bb->getId()].isSet(var_id);
+}
+
+//
+// return true if var is user through the bb
+//
+bool LivenessAnalysis::isUseThrough(const G4_BB* bb, unsigned var_id) const
+{
+    return use_in[bb->getId()].isSet(var_id) && use_out[bb->getId()].isSet(var_id);
+}
+//
+// return true if var is live at the exit of bb
+//
+bool LivenessAnalysis::isDefThrough(const G4_BB* bb, unsigned var_id) const
+{
+    return def_in[bb->getId()].isSet(var_id) && def_out[bb->getId()].isSet(var_id);
 }
 
 
@@ -2799,7 +2887,7 @@ void GlobalRA::verifyRA(LivenessAnalysis & liveAnalysis)
                             }
                             else
                             {
-                                MUST_BE_TRUE(false, "RA verification error: Found conflicting live-in variables: " << dcl->getName()
+                                DEBUG_MSG("RA verification warning: Found conflicting live-in variables: " << dcl->getName()
                                     << " and " << LiveInRegMapIt->second->getName() << " assigned to r" <<
                                     regNum << "." << regOff << "!\n");
                             }
@@ -2826,7 +2914,6 @@ void GlobalRA::verifyRA(LivenessAnalysis & liveAnalysis)
         {
             if (dcl->getAliasDeclare() != NULL)
                 continue;
-
             if (dcl->getRegVar()->isRegAllocPartaker())
             {
                 G4_RegVar* var = dcl->getRegVar();
@@ -2856,7 +2943,7 @@ void GlobalRA::verifyRA(LivenessAnalysis & liveAnalysis)
                             }
                             else
                             {
-                                MUST_BE_TRUE(false, "RA verification error: Found conflicting live-out variables: " << dcl->getName()
+                                DEBUG_MSG("RA verification warning: Found conflicting live-out variables: " << dcl->getName()
                                     << " and " << liveOutRegMapIt->second->getName() << " assigned to r" <<
                                     regNum << "." << regOff << "!\n");
                             }
@@ -2876,8 +2963,25 @@ void GlobalRA::verifyRA(LivenessAnalysis & liveAnalysis)
         for (INST_LIST::reverse_iterator rit = bb->rbegin(); rit != bb->rend(); ++rit)
         {
             G4_INST* inst = (*rit);
+            INST_LIST_RITER ritNext = rit;
+            ritNext++;
+            G4_INST* rNInst = nullptr;
+            if (ritNext != bb->rend())
+            {
+                rNInst = (*ritNext);
+            }
 
+            if (inst->isPseudoKill())
+            {
+                continue;
+            }
             G4_DstRegRegion* dst = inst->getDst();
+            G4_DstRegRegion* rNDst = nullptr;
+
+            if (rNInst && rNInst->isPseudoKill())
+            {
+                rNDst = rNInst->getDst();
+            }
 
             //
             // verify dst operand
@@ -2890,6 +2994,11 @@ void GlobalRA::verifyRA(LivenessAnalysis & liveAnalysis)
                     G4_RegVar* var = dstrgn->getBase()->asRegVar();
                     uint32_t varID = var->getId();
                     G4_Declare* dcl = GetTopDclFromRegRegion(dstrgn);
+                    G4_Declare* rNDcl = nullptr;
+                    if (rNDst != nullptr)
+                    {
+                        rNDcl = GetTopDclFromRegRegion(rNDst);
+                    }
                     MUST_BE_TRUE(dcl != nullptr, "Null declare found");
                     var = dcl->getRegVar();
 
@@ -2906,8 +3015,11 @@ void GlobalRA::verifyRA(LivenessAnalysis & liveAnalysis)
                         liveOutRegMapIt = liveOutRegMap.find(idx);
                         if (liveOutRegVec[idx] == UINT_MAX)
                         {
-                            MUST_BE_TRUE(liveOutRegMapIt == liveOutRegMap.end(), "RA verification error: Invalid entry in liveOutRegMap!");
-                            DEBUG_MSG("RA verification warning: Found unused variable " << dcl->getName() << "!\n");
+                            if (!inst->isPseudoKill())
+                            {
+                                MUST_BE_TRUE(liveOutRegMapIt == liveOutRegMap.end(), "RA verification error: Invalid entry in liveOutRegMap!");
+                                DEBUG_MSG("RA verification warning: Found unused variable " << dcl->getName() << "!\n");
+                            }
                         }
                         else
                         {
@@ -2930,14 +3042,17 @@ void GlobalRA::verifyRA(LivenessAnalysis & liveAnalysis)
                                 }
                                 else
                                 {
-                                    MUST_BE_TRUE(false, "RA verification error: Found conflicting variables: " << dcl->getName()
-                                        << " and " << liveOutRegMapIt->second->getName() << " assigned to r" <<
-                                        regNum << "." << regOff << "!\n");
+                                    if (!inst->isPseudoKill())
+                                    {
+                                        DEBUG_MSG("RA verification error: Found conflicting variables: " << dcl->getName()
+                                            << " and " << liveOutRegMapIt->second->getName() << " assigned to r" <<
+                                            regNum << "." << regOff << "!\n");
+                                    }
                                 }
                             }
 
                             if (liveAnalysis.writeWholeRegion(bb, inst, dstrgn, kernel.getOptions()) ||
-                                inst->isPseudoKill()) {
+                                inst->isPseudoKill() || rNDcl == dcl) {
                                 liveOutRegVec[idx] = UINT_MAX;
                                 MUST_BE_TRUE(liveOutRegMapIt != liveOutRegMap.end(), "RA verification error: Invalid entry in liveOutRegMap!");
                                 liveOutRegMap.erase(liveOutRegMapIt);
@@ -3127,7 +3242,6 @@ void GlobalRA::verifyRA(LivenessAnalysis & liveAnalysis)
                     uint32_t varID = var->getId();
                     G4_Declare* dcl = GetTopDclFromRegRegion(srcrgn);
                     var = dcl->getRegVar();
-
                     MUST_BE_TRUE(var->getId() == varID, "RA verification error: Invalid regVar ID!");
                     MUST_BE_TRUE(var->getPhyReg()->isGreg(), "RA verification error: Invalid dst reg!");
 
@@ -3189,7 +3303,7 @@ void GlobalRA::verifyRA(LivenessAnalysis & liveAnalysis)
                                             (*succ)->getDst() == NULL ||
                                             idMismatch)
                                         {
-                                            MUST_BE_TRUE(false, "RA verification error: Found conflicting variables: " << dcl->getName()
+                                            DEBUG_MSG("RA verification error: Found conflicting variables: " << dcl->getName()
                                                 << " and " << liveOutRegMapIt->second->getName() << " assigned to r" <<
                                                 regNum << "." << regOff << "!\n");
                                         }
@@ -3336,6 +3450,37 @@ static void recordRAStats(IR_Builder& builder,
 #endif // COMPILER_STATS_ENABLE
 }
 
+static void replaceSSO(G4_Kernel& kernel)
+{
+    // Invoke function only for XeHP_SDV+
+    // Replace SSO with r126.7 (scratch reg)
+
+    auto dst = kernel.fg.builder->createDst(
+        kernel.fg.getScratchRegDcl()->getRegVar(), 0, 7, 1, Type_UD);
+    for (auto bb : kernel.fg)
+    {
+        for (auto instIt = bb->begin(); instIt != bb->end(); instIt++)
+        {
+            auto inst = (*instIt);
+            if (inst->getDst() &&
+                inst->getDst()->getTopDcl() == kernel.fg.builder->getSpillSurfaceOffset())
+            {
+                if (kernel.fg.getIsStackCallFunc())
+                {
+                    bb->erase(instIt);
+                }
+                else
+                    inst->setDest(dst);
+
+                // Also update scratch msg dcl to be an alias
+                kernel.fg.builder->getSpillSurfaceOffset()->setAliasDeclare(
+                    kernel.fg.getScratchRegDcl(), 7 * TypeSize(Type_UD));
+
+                return;
+            }
+        }
+    }
+}
 
 int regAlloc(IR_Builder& builder, PhyRegPool& regPool, G4_Kernel& kernel)
 {
@@ -3347,6 +3492,8 @@ int regAlloc(IR_Builder& builder, PhyRegPool& regPool, G4_Kernel& kernel)
         kernel.fg.setABIForStackCallFunctionCalls();
         kernel.fg.addFrameSetupDeclares(builder, regPool);
         kernel.fg.normalizeFlowGraph();
+        if (builder.getPlatform() >= XeHP_SDV)
+            replaceSSO(kernel);
     }
 
     kernel.fg.reassignBlockIDs();
@@ -3434,13 +3581,11 @@ int regAlloc(IR_Builder& builder, PhyRegPool& regPool, G4_Kernel& kernel)
     {
         sp->replaceIntrinsics();
     }
-
     if (builder.getOption(vISA_VerifyRA))
     {
         LivenessAnalysis liveAnalysis(gra,
             G4_GRF | G4_INPUT, true);
         liveAnalysis.computeLiveness();
-
         gra.verifyRA(liveAnalysis);
     }
 

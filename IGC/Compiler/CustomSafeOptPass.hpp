@@ -52,6 +52,7 @@ namespace IGC
         }
 
         void visitInstruction(llvm::Instruction& I);
+        void visitUDiv(llvm::BinaryOperator& I);
         void visitAllocaInst(llvm::AllocaInst& I);
         void visitCallInst(llvm::CallInst& C);
         void removeHftoFCast(llvm::Instruction& I);
@@ -70,6 +71,7 @@ namespace IGC
         void dp4WithIdentityMatrix(llvm::ExtractElementInst& I);
         bool isIdentityMatrix(llvm::ExtractElementInst& I);
         void visitAnd(llvm::BinaryOperator& I);
+        void visitXor(llvm::Instruction& XorInstr);
 
         //
         // IEEE Floating point arithmetic is not associative.  Any pattern
@@ -168,6 +170,7 @@ namespace IGC
         void visitSDiv(llvm::BinaryOperator& I);
         void visitTruncInst(llvm::TruncInst& I);
         void visitBitCastInst(llvm::BitCastInst& I);
+        void visitLoadInst(llvm::LoadInst& I);
 #if LLVM_VERSION_MAJOR >= 10
         void visitFNeg(llvm::UnaryOperator& I);
 #endif

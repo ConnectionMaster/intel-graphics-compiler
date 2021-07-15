@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2017-2021 Intel Corporation
+Copyright (C) 2018-2021 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -38,6 +38,10 @@ namespace IGC
         static char ID;
 
         CodeAssumption() : ModulePass(ID), m_changed(false) {}
+
+        llvm::StringRef getPassName() const override {
+            return "CodeAssumption";
+        }
 
         bool runOnModule(llvm::Module&) override;
 

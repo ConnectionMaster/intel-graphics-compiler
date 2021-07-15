@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2017-2021 Intel Corporation
+Copyright (C) 2020-2021 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -32,19 +32,14 @@ public:
     {
         AU.addRequired<IGC::CodeGenContextWrapper>();
         AU.addRequired<IGC::MetaDataUtilsWrapper>();
-        AU.setPreservesCFG();
     }
 
     virtual bool runOnModule(llvm::Module& M);
 
-    void FixFunctionSignatures();
-    void FixFunctionUsers();
-    void FixCallInstruction(llvm::CallInst* callInst);
-
-    llvm::Function* CloneFunctionSignature(llvm::Type* ReturnType,
-        std::vector<llvm::Type*>& argTypes,
-        llvm::Function* pOldFunc,
-        bool changedRetVal);
+    void FixFunctionSignatures(llvm::Module& M);
+    void FixFunctionBody(llvm::Module& M);
+    void FixFunctionUsers(llvm::Module& M);
+    void FixCallInstruction(llvm::Module& M, llvm::CallInst* callInst);
 
     virtual llvm::StringRef getPassName() const
     {
@@ -52,15 +47,5 @@ public:
     }
 
 private:
-    IGC::CodeGenContext* m_pContext;
-    IGC::IGCMD::MetaDataUtils* m_pMdUtils;
-    IGCLLVM::IRBuilder<>* m_pBuilder;
-    llvm::Module* m_pModule;
-
-    bool m_funcSignatureChanged;
-    bool m_localAllocaCreated;
-
-    std::vector<llvm::Instruction*> instsToErase;
     std::map<llvm::Function*, llvm::Function*> oldToNewFuncMap;
 };
-

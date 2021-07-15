@@ -1,28 +1,10 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2017-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
+============================= end_copyright_notice ===========================*/
 
 #ifndef GED_TYPES_INTERNAL_H
 #define GED_TYPES_INTERNAL_H
@@ -183,7 +165,7 @@ const uintptr_t GED_QWORD_BITS = sizeof(uint64_t) * 8;                          
 const uintptr_t GED_NATIVE_INS_SIZE_BITS = GED_NATIVE_INS_SIZE * 8;                      // 128
 const uintptr_t GED_COMPACT_INS_SIZE_BITS = GED_COMPACT_INS_SIZE * 8;                    // 64
 const uintptr_t GED_MAX_ENTRIES_IN_COMPACT_TABLE = 128;                                  // this is an arbitrary limit, may be changed
-const uintptr_t GED_MAX_ENTRIES_IN_OPCODE_TABLE = 1 << 7;                                // 7 bits used for GEN opcodes, 128 total
+const uintptr_t GED_MAX_ENTRIES_IN_OPCODE_TABLE = 1 << 7;                                // 7 bits used for opcodes, 128 total
 
 
 const uint8_t dwordLow[GED_NUM_OF_NATIVE_INS_DWORDS] =  {  0, 32, 64,  96 };

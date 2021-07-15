@@ -1,28 +1,10 @@
-/*===================== begin_copyright_notice ==================================
+/*========================== begin_copyright_notice ============================
 
-Copyright (c) 2017 Intel Corporation
+Copyright (C) 2017-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of this software and associated documentation files (the
-"Software"), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish,
-distribute, sublicense, and/or sell copies of the Software, and to
-permit persons to whom the Software is furnished to do so, subject to
-the following conditions:
+SPDX-License-Identifier: MIT
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-
-======================= end_copyright_notice ==================================*/
+============================= end_copyright_notice ===========================*/
 
 #ifndef _HWCONFORMITY_H_
 #define _HWCONFORMITY_H_
@@ -31,6 +13,7 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "BuildIR.h"
 #include "FlowGraph.h"
 #include "Common_ISA_util.h"
+#include "RegAlloc.h"
 
 #include <map>
 
@@ -110,8 +93,6 @@ namespace vISA
         bool fixMathInst(INST_LIST_ITER it, G4_BB *bb);
         bool fixMULInst(INST_LIST_ITER &it, G4_BB *bb);
         void fixMULHInst(INST_LIST_ITER &i, G4_BB *bb);
-        void fixMulSrc1(INST_LIST_ITER i, G4_BB* bb);
-        void splitDWMULInst(INST_LIST_ITER &start, INST_LIST_ITER &end, G4_BB *bb);
         void fixOpnds(INST_LIST_ITER it, G4_BB *bb, G4_Type& exType);
         bool fixLine(INST_LIST_ITER it, G4_BB *bb);
         bool fixOpndType(INST_LIST_ITER it, G4_BB *bb);
@@ -164,6 +145,11 @@ namespace vISA
         bool fixRotate(INST_LIST_ITER i, G4_BB* bb);
         bool fixIntToHFMove(G4_BB* bb);
 
+        bool isFloatOr64b(G4_INST *inst);
+        uint16_t getSrcStride(G4_SrcRegRegion* src);
+        void change64bStride2CopyToUD(INST_LIST_ITER it, G4_BB* bb);
+        bool fixBFMove(INST_LIST_ITER i, G4_BB* bb);
+        void fixUnalignedRegions(INST_LIST_ITER it, G4_BB* bb);
 
         void helperGenerateTempDst(
             G4_BB *bb,
@@ -210,7 +196,11 @@ namespace vISA
 
         void fixSelCsel(INST_LIST_ITER it, G4_BB *bb);
 
-        void avoidDstSrcOverlap(INST_LIST_ITER i, G4_BB* bb);
+        void avoidDstSrcOverlap(PointsToAnalysis& p);
+        void avoidInstDstSrcOverlap(INST_LIST_ITER it, G4_BB* bb, PointsToAnalysis& p);
+
+        void replaceHFBFwithFloat(INST_LIST_ITER it, G4_BB* bb);
+
         void* operator new(size_t sz, vISA::Mem_Manager& m) { return m.alloc(sz); }
 
         bool checkSrcMod(INST_LIST_ITER it, G4_BB* bb, int srcPos);
@@ -235,6 +225,8 @@ namespace vISA
 
         void fixSrc1Region(INST_LIST_ITER it, G4_BB* bb);
 
+        INST_LIST_ITER fixMadwInst(INST_LIST_ITER i, G4_BB* bb);
+
     public:
         HWConformity(IR_Builder& b, G4_Kernel &k, vISA::Mem_Manager& m) :
             builder(b), kernel(k), mem(m)
@@ -243,6 +235,8 @@ namespace vISA
         void chkHWConformity();
         static void tryEliminateMadSrcModifier(IR_Builder &builder, G4_INST *inst);
         void localizeForAcc(G4_BB* bb);
+        void splitDWMULInst(INST_LIST_ITER& start, INST_LIST_ITER& end, G4_BB* bb);
+        void fixMulSrc1(INST_LIST_ITER i, G4_BB* bb);
     };
 }
 //single entry point for HW conformity checks

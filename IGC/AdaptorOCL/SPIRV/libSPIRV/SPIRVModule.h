@@ -55,6 +55,7 @@ THE SOFTWARE.
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <llvm/IR/Metadata.h>
 
 namespace igc_spv{
 
@@ -205,11 +206,11 @@ public:
   virtual SPIRVInstruction *addAsmCallINTELInst(SPIRVAsmINTEL *,
                                                 const std::vector<SPIRVWord> &,
                                                 SPIRVBasicBlock *) = 0;
-
   virtual void addCapability(SPIRVCapabilityKind) = 0;
 
   virtual SPIRVExtInst* getCompilationUnit() const = 0;
   virtual std::vector<SPIRVExtInst*> getGlobalVars() = 0;
+  virtual std::vector<SPIRVExtInst*> getModuleINTELInstructions() = 0;
   virtual std::vector<SPIRVValue*> parseSpecConstants() = 0;
 
   // I/O functions

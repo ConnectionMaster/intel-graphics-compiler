@@ -1,4 +1,13 @@
 {
+  "copyright": [
+    "============================ begin_copyright_notice ============================",
+    "",
+    "Copyright (C) 2019-2021 Intel Corporation",
+    "",
+    "SPDX-License-Identifier: MIT",
+    "",
+    "============================= end_copyright_notice ============================="
+  ],
   "DESCRIPTION": "See cisa_gen_intrinsics.py for description of this document",
   "INTRINSICS": {
     "genx_fptosi_sat": {
@@ -1380,6 +1389,52 @@
       "src0": [ "GENERAL", "UNSIGNED", "MODIFIER_ARITH", 1 ],
       "src1": [ "GENERAL", "UNSIGNED",  "MODIFIER_ARITH", 2 ]
     },
+    "genx_add3": {
+      "opc": "ISA_ADD3",
+      "exec_size": [ "EXECSIZE" ],
+      "pred": [ "IMPLICITPRED" ],
+      "ctsign": "ChooseSign({1, 2, 3})",
+      "dst": [ "GENERAL_CTSIGN", 0 ],
+      "src0": [ "GENERAL_CTSIGN", "MODIFIER_ARITH", 1 ],
+      "src1": [ "GENERAL_CTSIGN", "MODIFIER_ARITH", 2 ],
+      "src2": [ "GENERAL_CTSIGN", "MODIFIER_ARITH", 3 ]
+    },
+    "genx_ssadd3_sat": {
+      "opc": "ISA_ADD3",
+      "exec_size": [ "EXECSIZE" ],
+      "pred": [ "IMPLICITPRED" ],
+      "dst": [ "GENERAL", "SIGNED", "SATURATION_SATURATE", 0 ],
+      "src0": [ "GENERAL", "SIGNED", "MODIFIER_ARITH", 1 ],
+      "src1": [ "GENERAL", "SIGNED", "MODIFIER_ARITH", 2 ],
+      "src2": [ "GENERAL", "SIGNED", "MODIFIER_ARITH", 3 ]
+    },
+    "genx_suadd3_sat": {
+      "opc": "ISA_ADD3",
+      "exec_size": [ "EXECSIZE" ],
+      "pred": [ "IMPLICITPRED" ],
+      "dst": [ "GENERAL", "SIGNED", "SATURATION_SATURATE", 0 ],
+      "src0": [ "GENERAL", "UNSIGNED", "MODIFIER_ARITH", 1 ],
+      "src1": [ "GENERAL", "UNSIGNED", "MODIFIER_ARITH", 2 ],
+      "src2": [ "GENERAL", "UNSIGNED", "MODIFIER_ARITH", 3 ]
+    },
+    "genx_usadd3_sat": {
+      "opc": "ISA_ADD3",
+      "exec_size": [ "EXECSIZE" ],
+      "pred": [ "IMPLICITPRED" ],
+      "dst": [ "GENERAL", "UNSIGNED", "SATURATION_SATURATE", 0 ],
+      "src0": [ "GENERAL", "SIGNED", "MODIFIER_ARITH", 1 ],
+      "src1": [ "GENERAL", "SIGNED", "MODIFIER_ARITH", 2 ],
+      "src2": [ "GENERAL", "SIGNED", "MODIFIER_ARITH", 3 ]
+    },
+    "genx_uuadd3_sat": {
+      "opc": "ISA_ADD3",
+      "exec_size": [ "EXECSIZE" ],
+      "pred": [ "IMPLICITPRED" ],
+      "dst": [ "GENERAL", "UNSIGNED", "SATURATION_SATURATE", 0 ],
+      "src0": [ "GENERAL", "UNSIGNED", "MODIFIER_ARITH", 1 ],
+      "src1": [ "GENERAL", "UNSIGNED", "MODIFIER_ARITH", 2 ],
+      "src2": [ "GENERAL", "UNSIGNED", "MODIFIER_ARITH", 3 ]
+    },
     "genx_raw_send": {
       "opc": "ISA_RAW_SEND",
       "modifier_sendc": [ "BYTE", 1 ],
@@ -1714,6 +1769,16 @@
       "src2": [ "GENERAL", "OWALIGNED", "UNSIGNED", 3 ],
       "src3": [ "GENERAL", "OWALIGNED", "UNSIGNED", 4 ]
     },
+    "genx_bfn": {
+      "opc": "ISA_BFN",
+      "exec_size": [ "EXECSIZE" ],
+      "pred": [ "IMPLICITPRED" ],
+      "dst": [ "GENERAL", "UNSIGNED", 0 ],
+      "src0": [ "GENERAL", "UNSIGNED", 1 ],
+      "src1": [ "GENERAL", "UNSIGNED", 2 ],
+      "src2": [ "GENERAL", "UNSIGNED", 3 ],
+      "src4_LUT_value_constant": [ "BYTE", 4 ]
+    },
     "genx_va_minmax": {
       "opc": "ISA_VA",
       "gen_opc": "ISA_VA_MINMAX_FOPCODE",
@@ -1959,6 +2024,12 @@
       "opc": "ISA_SBARRIER",
       "signal_flag": [ "BYTE", 1 ]
     },
+    "genx_bf_cvt": {
+      "opc": "ISA_BF_CVT",
+      "exec_size": [ "EXECSIZE" ],
+      "dst": [ "GENERAL", "DIRECTONLY", 0 ],
+      "src0": [ "GENERAL", "DIRECTONLY", "NOIMM", 1 ]
+    },
     "genx_bfrev": {
       "opc": "ISA_BFREV",
       "exec_size": [ "EXECSIZE" ],
@@ -2005,6 +2076,78 @@
       "src0": [ "GENERAL", "STRIDE1", "OWALIGNED", 1 ],
       "src1": [ "GENERAL", "STRIDE1", "OWALIGNED", 2 ]
     },
+    "genx_ssdp4a": {
+      "opc": "ISA_DP4A",
+      "exec_size": [ "EXECSIZE" ],
+      "pred": [ "IMPLICITPRED" ],
+      "dst": [ "GENERAL", "SIGNED", 0 ],
+      "src0": [ "GENERAL", "SIGNED", 1 ],
+      "src1": [ "GENERAL", "SIGNED", 2 ],
+      "src2": [ "GENERAL", "SIGNED", 3 ]
+    },
+    "genx_sudp4a": {
+      "opc": "ISA_DP4A",
+      "exec_size": [ "EXECSIZE" ],
+      "pred": [ "IMPLICITPRED" ],
+      "dst": [ "GENERAL", "SIGNED", 0 ],
+      "src0": [ "GENERAL", "UNSIGNED", 1 ],
+      "src1": [ "GENERAL", "UNSIGNED", 2 ],
+      "src2": [ "GENERAL", "UNSIGNED", 3 ]
+    },
+    "genx_usdp4a": {
+      "opc": "ISA_DP4A",
+      "exec_size": [ "EXECSIZE" ],
+      "pred": [ "IMPLICITPRED" ],
+      "dst": [ "GENERAL", "UNSIGNED", 0 ],
+      "src0": [ "GENERAL", "SIGNED", 1 ],
+      "src1": [ "GENERAL", "SIGNED", 2 ],
+      "src2": [ "GENERAL", "SIGNED", 3 ]
+    },
+    "genx_uudp4a": {
+      "opc": "ISA_DP4A",
+      "exec_size": [ "EXECSIZE" ],
+      "pred": [ "IMPLICITPRED" ],
+      "dst": [ "GENERAL", "UNSIGNED", 0 ],
+      "src0": [ "GENERAL", "UNSIGNED", 1 ],
+      "src1": [ "GENERAL", "UNSIGNED", 2 ],
+      "src2": [ "GENERAL", "UNSIGNED", 3 ]
+    },
+    "genx_ssdp4a_sat": {
+      "opc": "ISA_DP4A",
+      "exec_size": [ "EXECSIZE" ],
+      "pred": [ "IMPLICITPRED" ],
+      "dst": [ "GENERAL", "SIGNED", "SATURATION_SATURATE", 0 ],
+      "src0": [ "GENERAL", "SIGNED", 1 ],
+      "src1": [ "GENERAL", "SIGNED", 2 ],
+      "src2": [ "GENERAL", "SIGNED", 3 ]
+    },
+    "genx_sudp4a_sat": {
+      "opc": "ISA_DP4A",
+      "exec_size": [ "EXECSIZE" ],
+      "pred": [ "IMPLICITPRED" ],
+      "dst": [ "GENERAL", "SIGNED", "SATURATION_SATURATE", 0 ],
+      "src0": [ "GENERAL", "UNSIGNED", 1 ],
+      "src1": [ "GENERAL", "UNSIGNED", 2 ],
+      "src2": [ "GENERAL", "UNSIGNED", 3 ]
+    },
+    "genx_usdp4a_sat": {
+      "opc": "ISA_DP4A",
+      "exec_size": [ "EXECSIZE" ],
+      "pred": [ "IMPLICITPRED" ],
+      "dst": [ "GENERAL", "UNSIGNED", "SATURATION_SATURATE", 0 ],
+      "src0": [ "GENERAL", "SIGNED", 1 ],
+      "src1": [ "GENERAL", "SIGNED", 2 ],
+      "src2": [ "GENERAL", "SIGNED", 3 ]
+    },
+    "genx_uudp4a_sat": {
+      "opc": "ISA_DP4A",
+      "exec_size": [ "EXECSIZE" ],
+      "pred": [ "IMPLICITPRED" ],
+      "dst": [ "GENERAL", "UNSIGNED", "SATURATION_SATURATE", 0 ],
+      "src0": [ "GENERAL", "UNSIGNED", 1 ],
+      "src1": [ "GENERAL", "UNSIGNED", 2 ],
+      "src2": [ "GENERAL", "UNSIGNED", 3 ]
+    },
     "genx_dph": {
       "opc": "ISA_DPH",
       "exec_size": [ "EXECSIZE_GE4" ],
@@ -2012,6 +2155,69 @@
       "dst": [ "GENERAL", "STRIDE1", "OWALIGNED", 0 ],
       "src0": [ "GENERAL", "STRIDE1", "OWALIGNED", 1 ],
       "src1": [ "GENERAL", "STRIDE1", "OWALIGNED", 2 ]
+    },
+    "genx_dpas": {
+      "opc": "ISA_DPAS",
+      "exec_size": [ "EXECSIZE_GE4" ],
+      "dstSign": ["LITERAL", 1 ],
+      "src0Sign": ["LITERAL", 1 ],
+      "dst": [ "RAW", 0 , "BUILD_ONLY::((dstSign)? II::SIGNED : II::UNSIGNED)" ],
+      "src0": [ "RAW", 1, "BUILD_ONLY::((src0Sign)? II::SIGNED : II::UNSIGNED)" ],
+      "src1": [ "RAW", 2 ],
+      "src2": [ "GENERAL", "CONTIGUOUS", "OWALIGNED", 3 ],
+      "src3": [ "INT", 4 ],
+      "src2Precision": "(GenPrecision)((src3 >> 8) & 0xff)",
+      "src1Precision": "(GenPrecision)(src3 & 0xff)",
+      "systolicDepth": "(src3 >> 16) & 0xff",
+      "RepeatCount":   "(src3 >> 24) & 0xff"
+    },
+    "genx_dpas2": {
+      "opc": "ISA_DPAS",
+      "exec_size": [ "EXECSIZE_GE4" ],
+      "dstSign": ["INT", 8 ],
+      "src0Sign": ["INT", 9 ],
+      "dst": [ "RAW", 0 , "BUILD_ONLY::((dstSign)? II::SIGNED : II::UNSIGNED)" ],
+      "src0": [ "RAW", 1, "BUILD_ONLY::((src0Sign)? II::SIGNED : II::UNSIGNED)" ],
+      "src1": [ "RAW", 2 ],
+      "src2": [ "GENERAL", "CONTIGUOUS", "OWALIGNED", 3 ],
+      "src1Precision": [ "INT", 4 ],
+      "src2Precision": [ "INT", 5 ],
+      "systolicDepth": ["INT", 6 ],
+      "RepeatCount":   ["INT", 7 ],
+      "src3": ["LITERAL", 0 ]
+    },
+    "genx_dpasw": {
+      "opc": "ISA_DPASW",
+      "exec_size": [ "EXECSIZE_GE4" ],
+      "dst": [ "RAW", 0 ],
+      "src0": [ "RAW", 1 ],
+      "src1": [ "RAW", 2 ],
+      "src2": [ "GENERAL", "CONTIGUOUS", "OWALIGNED", 3 ],
+      "src3": [ "INT", 4 ]
+    },
+    "genx_dpas_nosrc0": {
+      "opc": "ISA_DPAS",
+      "exec_size": [ "EXECSIZE_GE4" ],
+      "dstSign": ["LITERAL", 1],
+      "src0Sign": ["LITERAL", 1],
+      "dst": [ "RAW", 0 , "BUILD_ONLY::((dstSign)? II::SIGNED : II::UNSIGNED)" ],
+      "src0": [ "NULLRAW" ],
+      "src1": [ "RAW", 1 ],
+      "src2": [ "GENERAL", "CONTIGUOUS", "OWALIGNED", 2 ],
+      "src3": ["INT", 3],
+      "src2Precision": "(GenPrecision)((src3 >> 8) & 0xff)",
+      "src1Precision": "(GenPrecision)(src3 & 0xff)",
+      "systolicDepth": "(src3 >> 16) & 0xff",
+      "RepeatCount":   "(src3 >> 24) & 0xff"
+    },
+    "genx_dpasw_nosrc0": {
+      "opc": "ISA_DPASW",
+      "exec_size": [ "EXECSIZE_GE4" ],
+      "dst": [ "RAW", 0 ],
+      "src0": [ "NULLRAW" ],
+      "src1": [ "RAW", 1 ],
+      "src2": [ "GENERAL", "CONTIGUOUS", "OWALIGNED", 2 ],
+      "src3": [ "INT", 3 ]
     },
     "genx_sfbh": {
       "opc": "ISA_FBH",
@@ -2308,7 +2514,6 @@
       "sub_opc": [ "LITERAL", "SVM_GATHER" ],
       "exec_size": [ "EXECSIZE_FROM_ARG", 1 ],
       "pred": [ "PREDICATION", 1 ],
-      "block_size_inferred_from_dst": [ "SVMGATHERBLOCKSIZE", 0 ],
       "log2_num_blocks": [ "BYTE", 2 ],
       "address": [ "URAW", 3 ],
       "twoaddr": [ "TWOADDR", 4 ],
@@ -2333,7 +2538,6 @@
       "sub_opc": [ "LITERAL", "SVM_SCATTER" ],
       "exec_size": [ "EXECSIZE_FROM_ARG", 1 ],
       "pred": [ "PREDICATION", 1 ],
-      "block_size_inferred_from_dst": [ "SVMGATHERBLOCKSIZE", 4 ],
       "log2_num_blocks": [ "BYTE", 2 ],
       "address": [ "URAW", 3 ],
       "src": [ "RAW", 4 ]
@@ -3053,6 +3257,22 @@
         ]
       ]
     ],
+    "ISA_ADD3": [
+      "/* ctsign */",
+      [ "CISA_CALL",
+        [ "Kernel->AppendVISAArithmeticInst",
+          "opc",
+          "pred",
+          "Mod & MODIFIER_SAT",
+          "exec_mask",
+          "exec_size",
+          "dst",
+          "src0",
+          "src1",
+          "src2"
+        ]
+      ]
+    ],
     "ISA_RAW_SEND": [
       [ "CISA_CALL",
         [ "Kernel->AppendVISAMiscRawSend",
@@ -3256,6 +3476,21 @@
           "src1",
           "src2",
           "src3"
+        ]
+      ]
+    ],
+    "ISA_BFN": [
+      [ "CISA_CALL",
+        [ "Kernel->AppendVISABfnInst",
+          "src4_LUT_value_constant",
+          "pred",
+          "Mod & MODIFIER_SAT",
+          "exec_mask",
+          "exec_size",
+          "dst",
+          "src0",
+          "src1",
+          "src2"
         ]
       ]
     ],
@@ -3546,6 +3781,20 @@
         ]
       ]
     ],
+    "ISA_BF_CVT": [
+      [ "CISA_CALL",
+        [ "Kernel->AppendVISADataMovementInst",
+          "opc",
+          "nullptr",
+          "Mod & MODIFIER_SAT",
+          "exec_mask",
+          "exec_size",
+          "dst",
+          "src0",
+          "nullptr"
+        ]
+      ]
+    ],
     "ISA_BFREV": [
       [ "CISA_CALL",
         [ "Kernel->AppendVISALogicOrShiftInst",
@@ -3665,6 +3914,43 @@
           "src0",
           "src1",
           "nullptr"
+        ]
+      ]
+    ],
+    "ISA_DPAS": [
+      "(void)src3",
+      "(void)dstSign",
+      "(void)src0Sign",
+      [ "CISA_CALL",
+        [ "Kernel->AppendVISADpasInst",
+          "opc",
+          "exec_mask",
+          "exec_size",
+          "dst",
+          "src0",
+          "src1",
+          "src2",
+          "(GenPrecision)src2Precision",
+          "(GenPrecision)src1Precision",
+          "systolicDepth",
+          "RepeatCount"
+        ]
+      ]
+    ],
+    "ISA_DPASW": [
+      [ "CISA_CALL",
+        [ "Kernel->AppendVISADpasInst",
+          "opc",
+          "exec_mask",
+          "exec_size",
+          "dst",
+          "src0",
+          "src1",
+          "src2",
+          "(GenPrecision)((src3 >> 8) & 0xff)",
+          "(GenPrecision)(src3 & 0xff)",
+          "(src3 >> 16) & 0xff",
+          "(src3 >> 24) & 0xff"
         ]
       ]
     ],
@@ -3809,13 +4095,15 @@
       ]
     ],
     "ISA_SVM_SVM_GATHER": [
+      "unsigned BlockType, BlockNum",
+      "std::tie(BlockType, BlockNum) = GetSvmBlockSizeNum(II::ArgInfo(II::GENERAL | 0), II::ArgInfo(II::GENERAL | 2))",
       [ "CISA_CALL",
         [ "Kernel->AppendVISASvmGatherInst",
           "pred",
           "exec_mask",
           "exec_size",
-          "(VISA_SVM_Block_Type)block_size_inferred_from_dst",
-          "(VISA_SVM_Block_Num)log2_num_blocks",
+          "(VISA_SVM_Block_Type)BlockType",
+          "(VISA_SVM_Block_Num)BlockNum",
           "address",
           "dst"
         ]
@@ -3835,13 +4123,15 @@
       ]
     ],
     "ISA_SVM_SVM_SCATTER": [
+      "unsigned BlockType, BlockNum",
+      "std::tie(BlockType, BlockNum) = GetSvmBlockSizeNum(II::ArgInfo(II::GENERAL | 4), II::ArgInfo(II::GENERAL | 2))",
       [ "CISA_CALL",
         [ "Kernel->AppendVISASvmScatterInst",
           "pred",
           "exec_mask",
           "exec_size",
-          "(VISA_SVM_Block_Type)block_size_inferred_from_dst",
-          "(VISA_SVM_Block_Num)log2_num_blocks",
+          "(VISA_SVM_Block_Type)BlockType",
+          "(VISA_SVM_Block_Num)BlockNum",
           "address",
           "src"
         ]
@@ -3901,7 +4191,6 @@
     "INT":          "GetUnsignedValue(II::ArgInfo({args}))",
     "LOG2OWORDS":   "GetOwords(II::ArgInfo({args}))",
     "LOG2OWORDS_PLUS_8": "GetOwords(II::ArgInfo({args})) + 8",
-    "SVMGATHERBLOCKSIZE": "GetSvmGatherBlockSize(II::ArgInfo({args}))",
     "TWOADDR":      "ProcessTwoAddr(II::ArgInfo({args}))",
     "CONSTVI1ASI32": "ConstVi1Asi32(II::ArgInfo({args}))",
     "ARGCOUNT":     "GetArgCount(II::ArgInfo({args}))",

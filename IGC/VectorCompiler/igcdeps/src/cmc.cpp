@@ -1,24 +1,8 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (c) 2000-2021 Intel Corporation
+Copyright (C) 2019-2021 Intel Corporation
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"),
-to deal in the Software without restriction, including without limitation
-the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom
-the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-IN THE SOFTWARE.
+SPDX-License-Identifier: MIT
 
 ============================= end_copyright_notice ===========================*/
 
@@ -54,6 +38,8 @@ CMKernel::CMKernel(const PLATFORM& platform)
 
 CMKernel::~CMKernel()
 {
+    // TODO: refactor memory managment.
+    m_kernelInfo.m_kernelProgram.simd1.Destroy();
     delete m_btiLayout.getModifiableLayout();
 }
 
@@ -391,6 +377,23 @@ void CMKernel::createSizeAnnotation(unsigned initPayloadPosition,
         iOpenCL::DATA_PARAMETER_DATA_SIZE * 3);
 }
 
+void CMKernel::createPrintfBufferArgAnnotation(unsigned Index, unsigned BTI,
+                                               unsigned Size,
+                                               unsigned ArgOffset) {
+  m_kernelInfo.m_printfBufferAnnotation =
+      std::make_unique<iOpenCL::PrintfBufferAnnotation>();
+  m_kernelInfo.m_argIndexMap[Index] = BTI;
+  m_kernelInfo.m_printfBufferAnnotation->ArgumentNumber = Index;
+  m_kernelInfo.m_printfBufferAnnotation->PayloadPosition = ArgOffset;
+  m_kernelInfo.m_printfBufferAnnotation->Index = 0;
+  m_kernelInfo.m_printfBufferAnnotation->DataSize = Size;
+
+  // EnableZEBinary: ZEBinary related code
+  zebin::ZEInfoBuilder::addPayloadArgumentImplicit(
+      m_kernelInfo.m_zePayloadArgs,
+      zebin::PreDefinedAttrGetter::ArgType::printf_buffer, ArgOffset, Size);
+}
+
 // TODO: refactor this function with the OCL part.
 void CMKernel::RecomputeBTLayout(int numUAVs, int numResources)
 {
@@ -571,14 +574,8 @@ static void setArgumentsInfo(const GenXOCLRuntimeInfo::KernelInfo &Info,
       Kernel.m_kernelInfo.m_argIndexMap[Arg.getIndex()] = Arg.getBTI();
       break;
     case ArgKind::PrintBuffer:
-      Kernel.m_kernelInfo.m_printfBufferAnnotation =
-          std::make_unique<iOpenCL::PrintfBufferAnnotation>();
-      Kernel.m_kernelInfo.m_argIndexMap[Arg.getIndex()] = Arg.getBTI();
-      Kernel.m_kernelInfo.m_printfBufferAnnotation->ArgumentNumber =
-          Arg.getIndex();
-      Kernel.m_kernelInfo.m_printfBufferAnnotation->PayloadPosition = ArgOffset;
-      Kernel.m_kernelInfo.m_printfBufferAnnotation->Index = 0;
-      Kernel.m_kernelInfo.m_printfBufferAnnotation->DataSize = 8;
+      Kernel.createPrintfBufferArgAnnotation(Arg.getIndex(), Arg.getBTI(),
+                                             Arg.getSizeInBytes(), ArgOffset);
       break;
     case ArgKind::PrivateBase:
       if (Info.getStatelessPrivMemSize() != 0) {
@@ -622,6 +619,7 @@ static void setExecutionInfo(const GenXOCLRuntimeInfo::KernelInfo &BackendInfo,
   // SLM size in bytes, align to 1KB.
   ExecEnv.SumFixedTGSMSizes = iSTD::Align(BackendInfo.getSLMSize(), 1024);
   ExecEnv.HasBarriers = BackendInfo.usesBarriers();
+  ExecEnv.HasDPAS = BackendInfo.usesDPAS();
   ExecEnv.HasReadWriteImages = BackendInfo.usesReadWriteImages();
   ExecEnv.SubgroupIndependentForwardProgressRequired = true;
   ExecEnv.NumGRFRequired = JitterInfo.numGRFTotal;
@@ -694,8 +692,8 @@ static void setDebugInfo(const std::vector<char> &DebugInfo, CMKernel &Kernel) {
   const size_t DebugInfoSize = DebugInfo.size();
   void *DebugInfoBuf = IGC::aligned_malloc(DebugInfoSize, sizeof(void *));
   memcpy_s(DebugInfoBuf, DebugInfoSize, DebugInfo.data(), DebugInfoSize);
-  Kernel.getProgramOutput().m_debugDataVISA = DebugInfoBuf;
-  Kernel.getProgramOutput().m_debugDataVISASize = DebugInfoSize;
+  Kernel.getProgramOutput().m_debugData = DebugInfoBuf;
+  Kernel.getProgramOutput().m_debugDataSize = DebugInfoSize;
 }
 
 static void setGtpinInfo(const FINALIZER_INFO &JitterInfo,
@@ -780,10 +778,10 @@ void vc::createBinary(
   fillOCLProgramInfo(*CMProgram.m_programInfo, CompiledModule.ModuleInfo);
   for (const GenXOCLRuntimeInfo::CompiledKernel &CompKernel :
        CompiledModule.Kernels) {
-    CMKernel *K = new CMKernel(CMProgram.getPlatform());
-    CMProgram.m_kernels.push_back(K);
+    auto K = std::make_unique<CMKernel>(CMProgram.getPlatform());
     fillKernelInfo(CompKernel, *K);
     ProgramIsDebuggable |= !CompKernel.getDebugInfo().empty();
+    CMProgram.m_kernels.push_back(std::move(K));
   }
   CMProgram.m_ContextProvider.updateDebuggableStatus(ProgramIsDebuggable);
 }
