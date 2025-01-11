@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2022-2023 Intel Corporation
+Copyright (C) 2022-2024 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -102,8 +102,10 @@ SPDX-License-Identifier: MIT
 #endif // TRIBOOL_OPTION
 
 
-#ifdef SYNC_DISPATCH_RAYS_SHADER_INVOKE_METHOD
-#define SYNC_DISPATCH_RAYS_SHADER_INVOKE_METHODS                      \
-    SYNC_DISPATCH_RAYS_SHADER_INVOKE_METHOD(FUNCTION_CALLS,        0) \
-    SYNC_DISPATCH_RAYS_SHADER_INVOKE_METHOD(BTD_PER_SHADER_RECORD, 1)
-#endif // SYNC_DISPATCH_RAYS_SHADER_INVOKE_METHOD
+#ifdef INJECT_PRINTF_OPTION
+#define INJECT_PRINTF_OPTIONS                        \
+    INJECT_PRINTF_OPTION(InjectPrintfNone, 0)\
+    INJECT_PRINTF_OPTION(InjectPrintfLoads, 1)\
+    INJECT_PRINTF_OPTION(InjectPrintfStores, 2)\
+    INJECT_PRINTF_OPTION(InjectPrintfLoadsAndStores, 3)
+#endif // INJECT_PRINTF_OPTION

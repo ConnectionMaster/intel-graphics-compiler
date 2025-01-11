@@ -2172,6 +2172,34 @@ intrinsics:
             - !<MemoryRestriction>
                 memory_location: !MemoryLocation InaccessibleMem
     - !<IntrinsicDefinition>
+        name: "GenISA_WaveClusteredBallot"
+        comment: "Same as WaveBallot, but result includes only lanes for current cluster.\
+            \ Works in non-uniform context."
+        return_definition: !<ReturnDefinition>
+            type_definition: *i32
+            comment: "return a bitfield with 1 for active lane in cluster with input true,\
+                \ 0 for the rest."
+        arguments:
+            - !<ArgumentDefinition>
+                name: Arg0
+                type_definition: *i1
+                comment: "predicate"
+            - !<ArgumentDefinition>
+                name: Arg1
+                type_definition: *i32
+                comment: "cluster size - must be a compile time constant 8 or 16"
+            - !<ArgumentDefinition>
+                name: Arg2
+                type_definition: *i32
+                comment: "helperLaneMode : 0: not used; 1: helper lanes participatein\
+                    \ wave ops, 2: helper lanes do not participate in wave ops."
+        attributes:
+            - !AttributeID "Convergent"
+            - !AttributeID "NoUnwind"
+        memory_effects:
+            - !<MemoryRestriction>
+                memory_location: !MemoryLocation InaccessibleMem
+    - !<IntrinsicDefinition>
         name: "GenISA_WaveClustered"
         comment: "Accumulate all active lanes within consecutive input clusters and\
             \ broadcast the result to associated output clusters. A k-cluster is a\
@@ -2331,6 +2359,39 @@ intrinsics:
             - !<MemoryRestriction>
                 memory_location: !MemoryLocation InaccessibleMem
     - !<IntrinsicDefinition>
+        name: "GenISA_WaveClusteredPrefix"
+        comment: "WavePrefix with clusters. Accumulate and keep the intermediate results\
+            \ in each lane in cluster. At the moment only exclusive add is implemented.\
+            \ Compared to WavePrefix, arguments 'type' and 'mask' are removed, as  they\
+            \ are unsupported in current implementation."
+        return_definition: !<ReturnDefinition>
+            type_definition: *any_int
+            comment: "result"
+        arguments:
+            - !<ArgumentDefinition>
+                name: Arg0
+                type_definition: *ref_0_
+                comment: "value"
+            - !<ArgumentDefinition>
+                name: Arg1
+                type_definition: *i8
+                comment: "IGC::WaveOps"
+            - !<ArgumentDefinition>
+                name: Arg2
+                type_definition: *i32
+                comment: "cluster size - must be a compile time constant 8 or 16"
+            - !<ArgumentDefinition>
+                name: Arg3
+                type_definition: *i32
+                comment: "helperLaneMode : 0: not used; 1: helper lanes participate in\
+                    \ wave ops, 2: helper lanes do not participate in wave ops."
+        attributes:
+            - !AttributeID "Convergent"
+            - !AttributeID "NoUnwind"
+        memory_effects:
+            - !<MemoryRestriction>
+                memory_location: !MemoryLocation InaccessibleMem
+    - !<IntrinsicDefinition>
         name: "GenISA_WaveShuffleIndex"
         comment: "Read from a specific lane"
         return_definition: !<ReturnDefinition>
@@ -2384,6 +2445,37 @@ intrinsics:
             - !<MemoryRestriction>
                 memory_access: !MemoryAccessType NoModRef
     - !<IntrinsicDefinition>
+        name: "GenISA_WaveClusteredBroadcast"
+        comment: "Broadcasts from specific lane to all lanes in cluster.\
+            \ Works in non-uniform threads, but result is undefined if\
+            \ broadcasted lane is inactive."
+        return_definition: !<ReturnDefinition>
+            type_definition: *any_int
+            comment: "result"
+        arguments:
+            - !<ArgumentDefinition>
+                name: Arg0
+                type_definition: *ref_0_
+                comment: "value"
+            - !<ArgumentDefinition>
+                name: Arg1
+                type_definition: *i32
+                comment: "cluster size - must be a compile time constant 8 or 16"
+            - !<ArgumentDefinition>
+                name: Arg2
+                type_definition: *i32
+                comment: "cluster lane - lane inside cluster to broadcast"
+            - !<ArgumentDefinition>
+                name: Arg3
+                type_definition: *i32
+                comment: "helperLaneMode"
+        attributes:
+            - !AttributeID "Convergent"
+            - !AttributeID "NoUnwind"
+        memory_effects:
+            - !<MemoryRestriction>
+                memory_access: !MemoryAccessType NoModRef
+    - !<IntrinsicDefinition>
         name: "GenISA_WorkGroupAny"
         comment: "This intrinsic implies a barrier"
         return_definition: !<ReturnDefinition>
@@ -2426,6 +2518,66 @@ intrinsics:
                 memory_access: !MemoryAccessType NoModRef
     - !<IntrinsicDefinition>
         name: "GenISA_add_rtz"
+        comment: ""
+        return_definition: !<ReturnDefinition>
+            type_definition: *any_float
+            comment: ""
+        arguments:
+            - !<ArgumentDefinition>
+                name: Arg0
+                type_definition: *ref_0_
+                comment: ""
+            - !<ArgumentDefinition>
+                name: Arg1
+                type_definition: *ref_0_
+                comment: ""
+        attributes:
+            - !AttributeID "NoUnwind"
+        memory_effects:
+            - !<MemoryRestriction>
+                memory_access: !MemoryAccessType NoModRef
+    - !<IntrinsicDefinition>
+        name: "GenISA_add_rte"
+        comment: ""
+        return_definition: !<ReturnDefinition>
+            type_definition: *any_float
+            comment: ""
+        arguments:
+            - !<ArgumentDefinition>
+                name: Arg0
+                type_definition: *ref_0_
+                comment: ""
+            - !<ArgumentDefinition>
+                name: Arg1
+                type_definition: *ref_0_
+                comment: ""
+        attributes:
+            - !AttributeID "NoUnwind"
+        memory_effects:
+            - !<MemoryRestriction>
+                memory_access: !MemoryAccessType NoModRef
+    - !<IntrinsicDefinition>
+        name: "GenISA_add_rtp"
+        comment: ""
+        return_definition: !<ReturnDefinition>
+            type_definition: *any_float
+            comment: ""
+        arguments:
+            - !<ArgumentDefinition>
+                name: Arg0
+                type_definition: *ref_0_
+                comment: ""
+            - !<ArgumentDefinition>
+                name: Arg1
+                type_definition: *ref_0_
+                comment: ""
+        attributes:
+            - !AttributeID "NoUnwind"
+        memory_effects:
+            - !<MemoryRestriction>
+                memory_access: !MemoryAccessType NoModRef
+    - !<IntrinsicDefinition>
+        name: "GenISA_add_rtn"
         comment: ""
         return_definition: !<ReturnDefinition>
             type_definition: *any_float
@@ -3190,6 +3342,30 @@ intrinsics:
             - !AttributeID "NoUnwind"
     - !<IntrinsicDefinition>
         name: "GenISA_fma_rtz"
+        comment: ""
+        return_definition: !<ReturnDefinition>
+            type_definition: *any_float
+            comment: ""
+        arguments:
+            - !<ArgumentDefinition>
+                name: Arg0
+                type_definition: *ref_0_
+                comment: ""
+            - !<ArgumentDefinition>
+                name: Arg1
+                type_definition: *ref_0_
+                comment: ""
+            - !<ArgumentDefinition>
+                name: Arg2
+                type_definition: *ref_0_
+                comment: ""
+        attributes:
+            - !AttributeID "NoUnwind"
+        memory_effects:
+            - !<MemoryRestriction>
+                memory_access: !MemoryAccessType NoModRef
+    - !<IntrinsicDefinition>
+        name: "GenISA_fma_rte"
         comment: ""
         return_definition: !<ReturnDefinition>
             type_definition: *any_float
@@ -6531,6 +6707,66 @@ intrinsics:
                 memory_access: !MemoryAccessType NoModRef
     - !<IntrinsicDefinition>
         name: "GenISA_mul_rtz"
+        comment: ""
+        return_definition: !<ReturnDefinition>
+            type_definition: *any_float
+            comment: ""
+        arguments:
+            - !<ArgumentDefinition>
+                name: Arg0
+                type_definition: *ref_0_
+                comment: ""
+            - !<ArgumentDefinition>
+                name: Arg1
+                type_definition: *ref_0_
+                comment: ""
+        attributes:
+            - !AttributeID "NoUnwind"
+        memory_effects:
+            - !<MemoryRestriction>
+                memory_access: !MemoryAccessType NoModRef
+    - !<IntrinsicDefinition>
+        name: "GenISA_mul_rte"
+        comment: ""
+        return_definition: !<ReturnDefinition>
+            type_definition: *any_float
+            comment: ""
+        arguments:
+            - !<ArgumentDefinition>
+                name: Arg0
+                type_definition: *ref_0_
+                comment: ""
+            - !<ArgumentDefinition>
+                name: Arg1
+                type_definition: *ref_0_
+                comment: ""
+        attributes:
+            - !AttributeID "NoUnwind"
+        memory_effects:
+            - !<MemoryRestriction>
+                memory_access: !MemoryAccessType NoModRef
+    - !<IntrinsicDefinition>
+        name: "GenISA_mul_rtp"
+        comment: ""
+        return_definition: !<ReturnDefinition>
+            type_definition: *any_float
+            comment: ""
+        arguments:
+            - !<ArgumentDefinition>
+                name: Arg0
+                type_definition: *ref_0_
+                comment: ""
+            - !<ArgumentDefinition>
+                name: Arg1
+                type_definition: *ref_0_
+                comment: ""
+        attributes:
+            - !AttributeID "NoUnwind"
+        memory_effects:
+            - !<MemoryRestriction>
+                memory_access: !MemoryAccessType NoModRef
+    - !<IntrinsicDefinition>
+        name: "GenISA_mul_rtn"
         comment: ""
         return_definition: !<ReturnDefinition>
             type_definition: *any_float
@@ -10310,6 +10546,43 @@ intrinsics:
         attributes:
             - !AttributeID "NoUnwind"
     - !<IntrinsicDefinition>
+        name: "GenISA_SyncDispatchRaysSplitPoint"
+        comment: "Raytracing: Dedicated intrinsic for handling continuations in sync dispatch rays"
+        return_definition: !<ReturnDefinition>
+            type_definition: *void
+            comment: ""
+        arguments:
+            - !<ArgumentDefinition>
+                name: ContinuationID
+                type_definition: *i32
+                comment: "Continuation ID"
+            - !<ArgumentDefinition>
+                name: ContinuationFn
+                type_definition: *p_any_
+                comment: "Continuation function"
+            - !<ArgumentDefinition>
+                name: RTStack
+                type_definition: *p_any_
+                comment: "Mirror of the RTStack in the SWStack"
+            - !<ArgumentDefinition>
+                name: Payload
+                type_definition: *p_any_
+                comment: "Payload"
+            - !<ArgumentDefinition>
+                name: State
+                type_definition: *p_any_
+                comment: "Sync dispatch rays state object"
+            - !<ArgumentDefinition>
+                name: ShaderRecordAddress
+                type_definition: *i64
+                comment: "Address of the shader record to BTD into"
+            - !<ArgumentDefinition>
+                name: ShaderType
+                type_definition: *i32
+                comment: "Type of the shader that caused the split point"
+        attributes:
+            - !AttributeID "NoUnwind"
+    - !<IntrinsicDefinition>
         name: "GenISA_DispatchDimensions"
         comment: "Raytracing: Dispatch Dimensions"
         return_definition: !<ReturnDefinition>
@@ -10656,6 +10929,7 @@ intrinsics:
                 name: Arg2
                 type_definition: *p_any_
                 comment: "User defined intersection attributes struct"
+                param_attr: !ParamAttributeID "ByRef"
         attributes:
             - !AttributeID "NoUnwind"
     - !<IntrinsicDefinition>
@@ -10910,6 +11184,7 @@ intrinsics:
                 name: Arg16
                 type_definition: *p_any_
                 comment: "payload"
+                param_attr: !ParamAttributeID "NoCapture"
             - !<ArgumentDefinition>
                 name: Arg17
                 type_definition: *i32

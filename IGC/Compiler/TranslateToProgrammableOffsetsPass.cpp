@@ -299,7 +299,10 @@ struct TranslateIntrinsicImpl<GenISAIntrinsic::GenISA_sampleBptr>
 
     static llvm::CallInst* TranslateDetail(SampleIntrinsic* sampleIntr)
     {
-        uint aiOffset = 4;
+        // sampleB args:   bias,        u, v, r, ai, minLod, paired texture, texture, sampler, immOffU, immOffV, immOffR
+        // samplePOB args: bias_offuvr, u, v, r,     minLod, paired texture, texture, sampler, immOffU, immOffV, immOffR
+        // SamplerPerfOptPass copies minLod into ai
+        uint skipParamOffset = 5;
         uint biasOffset = 0;
 
         llvm::Value* packedBiasOffsetUVR = PackBiasOffsetUVR(sampleIntr);
@@ -314,7 +317,7 @@ struct TranslateIntrinsicImpl<GenISAIntrinsic::GenISA_sampleBptr>
                 continue;
             }
 
-            if (i == aiOffset)
+            if (i == skipParamOffset)
                 continue;
 
             args.push_back(sampleIntr->getArgOperand(i));
@@ -447,7 +450,7 @@ inline bool needsSampleDEmulation(const SampleIntrinsic* inst)
     Type* volumeTextureType = GetResourceDimensionType(M, RESOURCE_DIMENSION_TYPE::DIM_3D_TYPE);
     Type* cubeTextureType = GetResourceDimensionType(M, RESOURCE_DIMENSION_TYPE::DIM_CUBE_TYPE);
     Type* cubeArrayTextureType = GetResourceDimensionType(M, RESOURCE_DIMENSION_TYPE::DIM_CUBE_ARRAY_TYPE);
-    Type* textureType = IGCLLVM::getNonOpaquePtrEltTy(inst->getTextureValue()->getType());
+    Type* textureType = inst->getTexturePtrEltTy();
     if (textureType == cubeTextureType ||
         textureType == cubeArrayTextureType ||
         textureType == volumeTextureType)

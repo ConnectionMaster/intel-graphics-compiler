@@ -1,6 +1,6 @@
 # ========================== begin_copyright_notice ============================
 #
-# Copyright (C) 2020-2023 Intel Corporation
+# Copyright (C) 2020-2024 Intel Corporation
 #
 # SPDX-License-Identifier: MIT
 #
@@ -60,19 +60,47 @@ tool_dirs = [
   config.llvm_tools_dir]
 
 # Add extra args for opt to remove boilerplate from tests.
-vc_extra_args = ['-load', config.llvm_plugin]
+vc_extra_args_legacy_pm = ['-load', config.llvm_plugin]
+vc_extra_args_new_pm = ['-load-pass-plugin', config.llvm_new_pm_plugin]
 
 # Use one of the %opt version explicitly to override the default setting in the
 # course of LITs' migration to opaque pointers.
-opt_tool = ToolSubst('%opt', extra_args=vc_extra_args+[config.opaque_pointers_default_arg_opt], command=FindTool('opt'))
-opt_tool_typed_ptrs = ToolSubst('%opt_typed_ptrs', extra_args=vc_extra_args+['-opaque-pointers=0'], command=FindTool('opt'))
-opt_tool_opaque_ptrs = ToolSubst('%opt_opaque_ptrs', extra_args=vc_extra_args+['-opaque-pointers=1'], command=FindTool('opt'))
+opt_tool_old_pm = ToolSubst('%opt', extra_args=vc_extra_args_legacy_pm+[config.opaque_pointers_default_arg_opt], command=FindTool('opt'))
+opt_tool_typed_ptrs = ToolSubst('%opt_typed_ptrs', extra_args=vc_extra_args_legacy_pm+['-opaque-pointers=0'], command=FindTool('opt'))
+opt_tool_opaque_ptrs = ToolSubst('%opt_opaque_ptrs', extra_args=vc_extra_args_legacy_pm+['-opaque-pointers=1'], command=FindTool('opt'))
+
+if int(config.llvm_version) >= 16:
+  opt_tool_legacy_opaque = ToolSubst('%opt_legacy_opaque', extra_args=['not supported test'], command='true ||')
+  opt_tool_legacy_typed = ToolSubst('%opt_legacy_typed', extra_args=['not supported test'], command='true ||')
+  opt_tool_new_pm_opaque = ToolSubst('%opt_new_pm_opaque', extra_args=vc_extra_args_new_pm+['-opaque-pointers=1'], command=FindTool('opt'))
+  opt_tool_new_pm_typed = ToolSubst('%opt_new_pm_typed', extra_args=vc_extra_args_new_pm+['-opaque-pointers=0'], command=FindTool('opt'))
+  opt_tool_not_legacy = ToolSubst('%not_legacy', command='true ||')
+  opt_tool_not_new_pm = ToolSubst('%not_new_pm', command=FindTool('not'))
+else:
+  opt_tool_legacy_opaque = ToolSubst('%opt_legacy_opaque', extra_args=vc_extra_args_legacy_pm+['-opaque-pointers=1'], command=FindTool('opt'))
+  opt_tool_legacy_typed = ToolSubst('%opt_legacy_typed', extra_args=vc_extra_args_legacy_pm+['-opaque-pointers=0'], command=FindTool('opt'))
+  opt_tool_new_pm_opaque = ToolSubst('%opt_new_pm_opaque', extra_args=['not supported test'], command='true ||')
+  opt_tool_new_pm_typed = ToolSubst('%opt_new_pm_typed', extra_args=['not supported test'], command='true ||')
+  opt_tool_not_legacy = ToolSubst('%not_legacy', command=FindTool('not'))
+  opt_tool_not_new_pm = ToolSubst('%not_new_pm', command='true ||')
+
+
+llc_tool_typed_ptrs = ToolSubst('%llc_typed_ptrs', extra_args=vc_extra_args_legacy_pm+['-opaque-pointers=0'], command=FindTool('llc'))
+llc_tool_opaque_ptrs = ToolSubst('%llc_opaque_ptrs', extra_args=vc_extra_args_legacy_pm+['-opaque-pointers=1'], command=FindTool('llc'))
 
 tools = [ToolSubst('not'),
-         opt_tool,
+         opt_tool_not_legacy,
+         opt_tool_not_new_pm,
+         opt_tool_old_pm,
          opt_tool_typed_ptrs,
          opt_tool_opaque_ptrs,
-         ToolSubst('llc', extra_args=vc_extra_args),
+         opt_tool_legacy_opaque,
+         opt_tool_legacy_typed,
+         opt_tool_new_pm_opaque,
+         opt_tool_new_pm_typed,
+         ToolSubst('llc', extra_args=vc_extra_args_legacy_pm+[config.opaque_pointers_default_arg_opt]),
+         llc_tool_typed_ptrs,
+         llc_tool_opaque_ptrs,
          ToolSubst('oneapi-readelf', unresolved='ignore'),
          ToolSubst('llvm-dwarfdump'),
          ToolSubst('%igc-lld', command=FindTool('ld.lld'))]

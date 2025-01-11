@@ -17,6 +17,7 @@ SPDX-License-Identifier: MIT
 #include "GenISAIntrinsics/GenIntrinsicInst.h"
 #include "common/debug/Debug.hpp"
 #include "common/igc_regkeys.hpp"
+#include "llvmWrapper/IR/Function.h"
 
 #include <fstream>
 #include <queue>
@@ -96,20 +97,14 @@ ValueSet IGCLivenessAnalysisBase::getDefs(llvm::BasicBlock &BB) {
     return Difference;
 }
 
-// for every successor we take all of it's IN values
-// and the PHI values that are coming from our BB
-void IGCLivenessAnalysisBase::mergeSets(ValueSet *OutSet, llvm::BasicBlock *Succ) {
-    for (auto elem : In[Succ])
-        OutSet->insert(elem);
-}
-
 // we scan through all successors and merge their INSETs as our OUTSET
-void IGCLivenessAnalysisBase::combineOut(llvm::BasicBlock *BB, ValueSet *Set) {
+void IGCLivenessAnalysisBase::combineOut(llvm::BasicBlock *BB) {
     ValueSet *OutSet = &Out[BB];
     for (llvm::succ_iterator SI = llvm::succ_begin(BB), SE = llvm::succ_end(BB);
          SI != SE; ++SI) {
-        llvm::BasicBlock *Successor = *SI;
-        mergeSets(OutSet, Successor);
+        // for every successor we take all of it's IN values
+        // and the PHI values that are coming from our BB
+        OutSet->insert(In[*SI].begin(),In[*SI].end());
     }
 }
 
@@ -238,8 +233,9 @@ void IGCLivenessAnalysisBase::livenessAnalysis(llvm::Function &F, BBSet *StartBB
     {
         // Start with adding all BBs to the Worklist
         // to make sure In set is populated for every BB
-        for (BasicBlock &BB : F)
-            Worklist.push(&BB);
+        for (auto BBIt = IGCLLVM::rbegin(&F); BBIt != IGCLLVM::rend(&F); ++BBIt) {
+            Worklist.push(&*BBIt);
+        }
     }
 
     while (!Worklist.empty()) {
@@ -251,7 +247,7 @@ void IGCLivenessAnalysisBase::livenessAnalysis(llvm::Function &F, BBSet *StartBB
         ValueSet *OutSet = &Out[BB];
         PhiSet *InPhiSet = &InPhi[BB];
 
-        combineOut(BB, OutSet);
+        combineOut(BB);
 
         unsigned int SizeBefore = InSet->size();
         unsigned int SizeBeforePhi = InPhiSet->size();

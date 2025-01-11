@@ -57,6 +57,7 @@ private:
     //TODO: this is hardcoded string, we might want to put all "printf" of different adaptors to one place eventually
     static constexpr char *PrintfFuncName = "printf";
 
+
     bool isChildOfXe2 = false;
 
     // Field for explicit GlobalBufferPtr - used on OpenCL path.
@@ -272,7 +273,7 @@ public:
 
     std::pair<BasicBlock*, PHINode*>
         validateInstanceLeafPtr(RTBuilder::StackPointerVal* perLaneStackPtr, Instruction* I, bool forCommitted);
-    std::pair<Value*, Value*> createAllocaRayQueryObjects(unsigned int size, bool bShrinkSMStack, const llvm::Twine& Name = "");
+    std::pair<AllocaInst*, AllocaInst*> createAllocaRayQueryObjects(unsigned int size, bool bShrinkSMStack, const llvm::Twine& Name = "");
 
     void setDoneBit(StackPointerVal* StackPointer, bool Committed);
     Value* alignVal(Value* V, uint64_t Align);
@@ -356,8 +357,8 @@ public:
         bool Committed);
     Value* getHitValid(StackPointerVal* StackPointer, bool CommittedHit);
     void   setHitValid(StackPointerVal* StackPointer, bool CommittedHit);
-    Value* getSyncTraceRayControl(Value* ptrCtrl);
-    void   setSyncTraceRayControl(Value* ptrCtrl, RTStackFormat::TraceRayCtrl ctrl);
+    LoadInst* getSyncTraceRayControl(GetElementPtrInst* ptrCtrl);
+    void   setSyncTraceRayControl(GetElementPtrInst* ptrCtrl, RTStackFormat::TraceRayCtrl ctrl);
     Value* getHitBaryCentric(StackPointerVal* StackPointer, uint32_t idx, bool CommittedHit);
 
 
@@ -400,8 +401,8 @@ private:
     Value* getRTStackSize(uint32_t Align);
     SyncStackPointerVal* getSyncStackPointer(Value* syncStackOffset, RTBuilder::RTMemoryAccessMode Mode);
     Value* getGeometryIndex(
-        StackPointerVal* perLaneStackPtr, Instruction* I, Value* leafType, IGC::CallableShaderTypeMD ShaderTy);
-    PHINode* getPrimitiveIndex(
+        StackPointerVal* perLaneStackPtr, Value* leafType, bool committed);
+    Value* getPrimitiveIndex(
         StackPointerVal* perLaneStackPtr, Value* leafType, bool Committed);
     Value* getInstanceIndex(
         StackPointerVal* perLaneStackPtr, IGC::CallableShaderTypeMD ShaderTy);
@@ -484,8 +485,7 @@ public:
     void copyMemHitInProceed(
         SyncStackPointerVal* HWStackPtr,
         SyncStackPointerVal* SMStackPtr,
-        bool singleRQProceed,
-        bool useDeprecated);
+        bool singleRQProceed);
 
     Value* syncStackToShadowMemory(
         SyncStackPointerVal* HWStackPtr,

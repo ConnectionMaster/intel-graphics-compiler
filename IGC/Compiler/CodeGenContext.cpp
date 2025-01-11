@@ -749,17 +749,6 @@ namespace IGC
         return true;
     }
 
-    bool CodeGenContext::HasFuncExpensiveLoop(llvm::Function* pFunc)
-    {
-        if (m_FuncHasExpensiveLoops.find(pFunc) !=
-            m_FuncHasExpensiveLoops.end())
-        {
-            return m_FuncHasExpensiveLoops[pFunc];
-        }
-        return false;
-    }
-
-
     static std::string demangleFuncName(const std::string &rawName) {
         // OpenMP adds additional prefix and suffix to the mangling scheme,
         // remove it if present.
@@ -868,17 +857,21 @@ namespace IGC
             return m_NumGRFPerThread;
         }
 
-        // read value from CompOptions first
-        DWORD GRFNum4RQToUse = getModuleMetaData()->compOpt.ForceLargeGRFNum4RQ ? 256 : 0;
-
-        // override if reg key value is set
-        GRFNum4RQToUse = IGC_IS_FLAG_ENABLED( TotalGRFNum4RQ ) ?
-            IGC_GET_FLAG_VALUE( TotalGRFNum4RQ ) : GRFNum4RQToUse;
-
-        if (hasSyncRTCalls() && GRFNum4RQToUse != 0)
+        if (hasSyncRTCalls())
         {
-            m_NumGRFPerThread = GRFNum4RQToUse;
-            return m_NumGRFPerThread;
+            // read value from CompOptions first
+            DWORD GRFNum4RQToUse =
+                getModuleMetaData()->compOpt.ForceLargeGRFNum4RQ ? 256 : 0;
+
+            // override if reg key value is set
+            GRFNum4RQToUse = IGC_IS_FLAG_ENABLED(TotalGRFNum4RQ)
+                                ? IGC_GET_FLAG_VALUE(TotalGRFNum4RQ)
+                                : GRFNum4RQToUse;
+            if (GRFNum4RQToUse != 0)
+            {
+                m_NumGRFPerThread = GRFNum4RQToUse;
+                return m_NumGRFPerThread;
+            }
         }
         if (this->type == ShaderType::COMPUTE_SHADER && IGC_GET_FLAG_VALUE(TotalGRFNum4CS) != 0)
         {
@@ -948,7 +941,7 @@ namespace IGC
 
     // Returns the SIMD mode of a kernel based on a platform and settings flags.
     // VS, DS, HS, GS currently supported only.
-    SIMDMode CodeGenContext::GetSIMDMode()
+    SIMDMode CodeGenContext::GetSIMDMode() const
     {
         SIMDMode simdMode = SIMDMode::UNKNOWN;
 

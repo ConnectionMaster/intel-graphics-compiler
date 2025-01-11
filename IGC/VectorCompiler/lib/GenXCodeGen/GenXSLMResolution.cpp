@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2023 Intel Corporation
+Copyright (C) 2023-2024 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -35,9 +35,11 @@ SPDX-License-Identifier: MIT
 //===----------------------------------------------------------------------===//
 
 #include "GenX.h"
+#include "GenXTargetMachine.h"
 #include "GenXUtil.h"
 
 #include "vc/Support/GenXDiagnostic.h"
+#include "vc/Utils/GenX/BreakConst.h"
 #include "vc/Utils/GenX/GlobalVariable.h"
 #include "vc/Utils/GenX/KernelInfo.h"
 #include "vc/Utils/General/Types.h"
@@ -46,6 +48,7 @@ SPDX-License-Identifier: MIT
 #include "llvmWrapper/IR/Value.h"
 #include "llvmWrapper/Support/Alignment.h"
 
+#include <llvm/CodeGen/TargetPassConfig.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/InstIterator.h>
@@ -67,12 +70,12 @@ public:
   StringRef getPassName() const override { return "GenX SLM Resolution"; }
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.addRequired<CallGraphWrapperPass>();
+    AU.addRequired<TargetPassConfig>();
     AU.setPreservesCFG();
   }
   bool runOnModule(Module &M) override;
 
 private:
-  llvm::Align getSLMArgAlign(const Argument &A) const;
   llvm::Align getGlobalVarAlign(const GlobalVariable &GV) const;
   Constant *allocateOnSLM(const GlobalVariable &GV, unsigned &SLMSize) const;
   Constant *getNextOffset(llvm::Align Alignment, LLVMContext &Ctx,
@@ -123,16 +126,11 @@ static void lowerSlmInit(Instruction &I) {
 
 static bool isUserInList(const User &U,
                          const SmallPtrSetImpl<Function *> &FunctionSet) {
-  if (auto *I = dyn_cast<Instruction>(&U)) {
-    auto *F = I->getFunction();
-    return FunctionSet.count(F);
-  }
-  IGC_ASSERT_MESSAGE(isa<Constant>(&U), "unexpected SLM variable user");
-  // For constant user continue recursively traversing until instruction
-  // is met.
-  return llvm::any_of(U.users(), [&FunctionSet](const User *U) {
-    return isUserInList(*U, FunctionSet);
-  });
+  auto *UserInst = dyn_cast<Instruction>(&U);
+  if (!UserInst)
+    return false;
+  auto *F = UserInst->getFunction();
+  return FunctionSet.count(F);
 }
 
 static bool isBelongToKernel(const GlobalVariable &GV,
@@ -174,11 +172,6 @@ static SmallVector<GlobalVariable *, 4> collectSLMVariables(Module &M) {
     SLMVars.push_back(&GV);
   }
   return SLMVars;
-}
-
-llvm::Align GenXSLMResolution::getSLMArgAlign(const Argument &A) const {
-  auto *TypeToAlign = IGCLLVM::getNonOpaquePtrEltTy(A.getType());
-  return IGCLLVM::getABITypeAlign(*DL, TypeToAlign);
 }
 
 llvm::Align
@@ -255,8 +248,12 @@ bool GenXSLMResolution::runForKernel(Function &Head, Module &M,
   if (Arg == Head.arg_end())
     return Modified;
 
-  auto Align = getSLMArgAlign(*Arg);
-  auto *Offset = getNextOffset(Align, Head.getContext(), SLMSize);
+  const auto &ST = getAnalysis<TargetPassConfig>()
+                       .getTM<GenXTargetMachine>()
+                       .getGenXSubtarget();
+  auto Alignment =
+      ST.translateLegacyMessages() ? llvm::Align(8) : llvm::Align(16);
+  auto *Offset = getNextOffset(Alignment, Head.getContext(), SLMSize);
   auto *NewPtr = ConstantExpr::getIntToPtr(Offset, Arg->getType());
   Arg->replaceAllUsesWith(NewPtr);
   return true;
@@ -281,6 +278,14 @@ bool GenXSLMResolution::runOnModule(Module &M) {
   llvm::for_each(SLMInitToErase, [](Instruction *I) { I->eraseFromParent(); });
 
   auto SLMVars = collectSLMVariables(M);
+  if (!SLMVars.empty())
+    for (auto &F : M.functions()) {
+      if (F.isDeclaration())
+        continue;
+      Modified |=
+          vc::breakConstantExprs(&F, vc::LegalizationStage::NotLegalized);
+    }
+
   for (auto &F : M.functions())
     if (vc::isKernel(&F))
       Modified |= runForKernel(F, M, SLMVars);

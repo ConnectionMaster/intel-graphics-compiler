@@ -61,11 +61,14 @@ DEF_VISA_OPTION(vISA_disableInstDebugInfo, ET_BOOL, "-disableInstDebugInfo",
                 UNUSED, false)
 DEF_VISA_OPTION(vISA_analyzeMove, ET_BOOL, "-analyzeMove", UNUSED, false)
 DEF_VISA_OPTION(vISA_skipFDE, ET_BOOL, "-skipFDE", UNUSED, false)
+DEF_VISA_OPTION(vISA_storeCE, ET_BOOL, "-storeCE", UNUSED, false)
 // setting this flag makes VISA emit matching name for variable wrt visaasm file
 // but this makes it impossible to emit correct elf, so this is strictly for
 // debugging
 DEF_VISA_OPTION(vISA_UseFriendlyNameInDbg, ET_BOOL, "-useFriendlyNameInDbg",
                 UNUSED, false)
+DEF_VISA_OPTION(vISA_EmitSrcFileLineToRPE, ET_BOOL, "-emitsrclinetorpe",
+                "makes finalizer emit src line as comment to RPE dump", false)
 DEF_VISA_OPTION(vISA_addSWSBInfo, ET_BOOL, "-addSWSBInfo", UNUSED, true)
 DEF_VISA_OPTION(vISA_DumpRAIntfGraph, ET_BOOL, "-dumpintf", UNUSED, false)
 DEF_VISA_OPTION(vISA_dumpRAMetadata, ET_BOOL_TRUE, "-dumpRAMetadata",
@@ -271,6 +274,9 @@ DEF_VISA_OPTION(vISA_lscEnableImmOffsFor, ET_INT32, "-lscEnableImmOffsFor",
                 0x3003E)
 DEF_VISA_OPTION(vISA_PreserveR0InR0, ET_BOOL, "-preserver0", UNUSED, false)
 DEF_VISA_OPTION(vISA_StackCallABIVer, ET_INT32, "-abiver", "DEPRECATED, is a nop", 1)
+DEF_VISA_OPTION(vISA_LastCallerSavedGRF, ET_INT32, "-lastCallerSavedGRF",
+                "***ABI breaking change***"
+                "Last caller-save GRF; beyond this is callee saved partition.", 0)
 // override spill/fill cache control. 0 is default (no override). Its values are
 // enum LSC_L1_L3_CC, defined in igc/common/igc_regkeys_enums_defs.h or
 // visa_igc_common_headers.h
@@ -620,6 +626,8 @@ DEF_VISA_OPTION(
     "1 enables basic output, 2 enables with def/use dataflow information "
     "(may increase compile time significantly for large shaders)",
     0)
+DEF_VISA_OPTION(vISA_ParseBuildOptions, ET_BOOL, "-parseBuildOptions", UNUSED,
+                false)
 
 //=== misc options ===
 DEF_VISA_OPTION(vISA_PlatformSet, ET_INT32, NULLSTR, UNUSED, -1 /*GENX_NONE*/)

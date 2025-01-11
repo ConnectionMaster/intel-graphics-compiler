@@ -220,7 +220,7 @@ namespace IGC
                 auto& annotatnions = funcMD.UserAnnotations;
                 auto output = shader->ProgramOutput();
 
-                if (output->m_scratchSpaceUsedBySpills > 0 &&
+                if (hasSpills(output->m_scratchSpaceUsedBySpills) &&
                     std::find(annotatnions.begin(), annotatnions.end(), "igc-do-not-spill") != annotatnions.end())
                 {
                     std::string msg =
@@ -263,7 +263,7 @@ namespace IGC
     }
 
     COpenCLKernel::COpenCLKernel(OpenCLProgramContext* ctx, Function* pFunc, CShaderProgram* pProgram) :
-        CComputeShaderBase(pFunc, pProgram)
+        m_State(*pFunc, *pProgram->GetContext()), CComputeShaderBase(pFunc, pProgram, m_State)
     {
         m_HasTID = false;
         m_HasGlobalSize = false;
@@ -2302,7 +2302,7 @@ namespace IGC
                     break;
                 case GenISAIntrinsic::GenISA_dpas:
                 case GenISAIntrinsic::GenISA_sub_group_dpas:
-                    SetHasDPAS();
+                    m_State.SetHasDPAS();
                     break;
                 case GenISAIntrinsic::GenISA_ptr_to_pair:
                 case GenISAIntrinsic::GenISA_pair_to_ptr:
@@ -2315,7 +2315,7 @@ namespace IGC
             {
                 if (IA->getAsmString().find("dpas") != std::string::npos)
                 {
-                    SetHasDPAS();
+                    m_State.SetHasDPAS();
                 }
             }
             if (mayHasMemoryAccess)
@@ -2400,8 +2400,8 @@ namespace IGC
         }
 
 
-        m_ConstantBufferLength = 0;
-        m_NOSBufferSize = 0;
+        m_State.m_ConstantBufferLength = 0;
+        m_State.m_NOSBufferSize = 0;
 
         uint offset = 0;
 
@@ -2475,6 +2475,9 @@ namespace IGC
                     // Align on the desired alignment for this argument
                     auto alignment = arg.getAlignment();
 
+                    if (arg.isArgPtrType())
+                        alignment = m_Context->getModule()->getDataLayout().getPointerTypeSize(arg.getArg()->getType());
+
                     // FIXME: move alignment checks to implicit arg creation
                     if ((arg.getArgType() == KernelArg::ArgType::IMPLICIT_LOCAL_IDS ||
                          arg.getArgType() == KernelArg::ArgType::RT_STACK_ID) &&
@@ -2482,7 +2485,7 @@ namespace IGC
                     {
                         alignment = 64;
                         // generate a single SIMD32 variable in this case
-                        if (m_dispatchSize == SIMDMode::SIMD16 && m_Platform->getGRFSize() == 64)
+                        if (m_State.m_dispatchSize == SIMDMode::SIMD16 && m_Platform->getGRFSize() == 64)
                         {
                             allocSize = 64;
                         }
@@ -2612,7 +2615,7 @@ namespace IGC
 
             if (arg.isConstantBuf())
             {
-                m_ConstantBufferLength += offset - prevOffset;
+                m_State.m_ConstantBufferLength += offset - prevOffset;
             }
         }
 
@@ -2631,8 +2634,8 @@ namespace IGC
         {
             if (loadThreadPayload)
             {
-                uint perThreadInputSize = SIZE_WORD * 3 * (m_dispatchSize == SIMDMode::SIMD32 ? 32 : 16);
-                if (m_dispatchSize == SIMDMode::SIMD16 && getGRFSize() == 64)
+                uint perThreadInputSize = SIZE_WORD * 3 * (m_State.m_dispatchSize == SIMDMode::SIMD32 ? 32 : 16);
+                if (m_State.m_dispatchSize == SIMDMode::SIMD16 && getGRFSize() == 64)
                 {
                     perThreadInputSize *= 2;
                 }
@@ -2645,7 +2648,7 @@ namespace IGC
         m_kernelInfo.m_threadPayload.OffsetToSkipPerThreadDataLoad = 0;
         m_kernelInfo.m_threadPayload.OffsetToSkipSetFFIDGP = 0;
 
-        m_ConstantBufferLength = iSTD::Align(m_ConstantBufferLength, getGRFSize());
+        m_State.m_ConstantBufferLength = iSTD::Align(m_State.m_ConstantBufferLength, getGRFSize());
 
         // FIXME: skip this function when EnableZEBinary
         CreateInlineSamplerAnnotations();
@@ -2833,21 +2836,21 @@ namespace IGC
         m_kernelInfo.m_executionEnvironment.PerThreadScratchSpace = pOutput->getScratchSpaceUsageInSlot0();
         m_kernelInfo.m_executionEnvironment.PerThreadScratchSpaceSlot1 = pOutput->getScratchSpaceUsageInSlot1();
         m_kernelInfo.m_executionEnvironment.PerThreadPrivateOnStatelessSize = m_perWIStatelessPrivateMemSize;
-        m_kernelInfo.m_kernelProgram.NOSBufferSize = m_NOSBufferSize / getMinPushConstantBufferAlignmentInBytes(); // in 256 bits
-        m_kernelInfo.m_kernelProgram.ConstantBufferLength = m_ConstantBufferLength / getMinPushConstantBufferAlignmentInBytes(); // in 256 bits
+        m_kernelInfo.m_kernelProgram.NOSBufferSize = m_State.m_NOSBufferSize / getMinPushConstantBufferAlignmentInBytes(); // in 256 bits
+        m_kernelInfo.m_kernelProgram.ConstantBufferLength = m_State.m_ConstantBufferLength / getMinPushConstantBufferAlignmentInBytes(); // in 256 bits
         m_kernelInfo.m_kernelProgram.MaxNumberOfThreads = m_Platform->getMaxGPGPUShaderThreads() / GetShaderThreadUsageRate();
 
         m_kernelInfo.m_executionEnvironment.SumFixedTGSMSizes = getSumFixedTGSMSizes(entry);
 
         // TODO: need to change misleading HasBarriers to NumberofBarriers
-        m_kernelInfo.m_executionEnvironment.HasBarriers = this->GetBarrierNumber();
-        m_kernelInfo.m_executionEnvironment.HasSample = this->GetHasSample();
+        m_kernelInfo.m_executionEnvironment.HasBarriers = m_State.GetBarrierNumber();
+        m_kernelInfo.m_executionEnvironment.HasSample = m_State.GetHasSample();
         m_kernelInfo.m_executionEnvironment.DisableMidThreadPreemption = GetDisableMidThreadPreemption();
         m_kernelInfo.m_executionEnvironment.SubgroupIndependentForwardProgressRequired =
             m_Context->getModuleMetaData()->compOpt.SubgroupIndependentForwardProgressRequired;
         m_kernelInfo.m_executionEnvironment.CompiledForGreaterThan4GBBuffers =
             m_Context->getModuleMetaData()->compOpt.GreaterThan4GBBufferRequired;
-        IGC_ASSERT(gatherMap.size() == 0);
+        IGC_ASSERT(m_State.gatherMap.size() == 0);
         m_kernelInfo.m_kernelProgram.gatherMapSize = 0;
         m_kernelInfo.m_kernelProgram.bindingTableEntryCount = 0;
 
@@ -2903,7 +2906,7 @@ namespace IGC
 
         m_kernelInfo.m_executionEnvironment.NumGRFRequired = ProgramOutput()->m_numGRFTotal;
 
-        m_kernelInfo.m_executionEnvironment.HasDPAS = GetHasDPAS();
+        m_kernelInfo.m_executionEnvironment.HasDPAS = m_State.GetHasDPAS();
         m_kernelInfo.m_executionEnvironment.StatelessWritesCount = GetStatelessWritesCount();
         m_kernelInfo.m_executionEnvironment.IndirectStatelessCount = GetIndirectStatelessCount();
         m_kernelInfo.m_executionEnvironment.numThreads = ProgramOutput()->m_numThreads;
@@ -2995,7 +2998,7 @@ namespace IGC
         unsigned int groupSize = IGCMetaDataHelper::getThreadGroupSize(*m_pMdUtils, entry);
         if (groupSize != 0)
         {
-            if (groupSize % numLanes(m_dispatchSize) == 0)
+            if (groupSize % numLanes(m_State.m_dispatchSize) == 0)
             {
                 return true;
             }
@@ -3252,7 +3255,7 @@ namespace IGC
             return RetryType::NO_Retry_Pick_Prv;
         }
         else if (
-            pOutput->m_scratchSpaceUsedBySpills == 0 ||
+            !ctx->hasSpills(pOutput->m_scratchSpaceUsedBySpills) ||
             ctx->getModuleMetaData()->compOpt.OptDisable ||
             ctx->m_retryManager.IsLastTry() ||
             (!ctx->m_retryManager.kernelSkip.empty() &&
@@ -3319,15 +3322,18 @@ namespace IGC
 
                 dumpName = dumpName.PostFix(shaderName);
 
-                std::ostringstream FullPath(dumpName.str(), std::ostringstream::ate);
-                FullPath << "_previous_kernel_pick.txt";
+                if (dumpName.allow())
+                {
+                    std::ostringstream FullPath(dumpName.str(), std::ostringstream::ate);
+                    FullPath << "_previous_kernel_pick.txt";
 
-                std::ofstream OutF(FullPath.str(), std::ofstream::out);
+                    std::ofstream OutF(FullPath.str(), std::ofstream::out);
 
 
-                if (OutF)
-                    OutF.write(reason.str().c_str(),
-                        reason.str().length());
+                    if (OutF)
+                        OutF.write(reason.str().c_str(),
+                            reason.str().length());
+                }
             }
 
             pSelectedKernel =
@@ -3944,8 +3950,22 @@ namespace IGC
             bool hasIndirectCall = FG && FG->hasIndirectCall();
             if (hasNestedCall || hasIndirectCall || isIndirectGroup)
             {
-                pCtx->SetSIMDInfo(SIMD_SKIP_HW, simdMode, ShaderDispatchMode::NOT_APPLICABLE);
-                return SIMDStatus::SIMD_FUNC_FAIL;
+                // Disable EU fusion if SIMD32 is requested
+                if (getReqdSubGroupSize(F, pMdUtils) == numLanes(SIMDMode::SIMD32))
+                {
+                    pCtx->getModuleMetaData()->compOpt.DisableEUFusion = true;
+                    if (FG->getHead() == &F)
+                    {
+                        pCtx->EmitWarning(
+                            std::string("EU fusion is disabled, it does not work on the current platform if SIMD32 mode specified by intel_reqd_sub_group_size(32)").c_str(),
+                            &F);
+                    }
+                }
+                else
+                {
+                    pCtx->SetSIMDInfo(SIMD_SKIP_HW, simdMode, ShaderDispatchMode::NOT_APPLICABLE);
+                    return SIMDStatus::SIMD_FUNC_FAIL;
+                }
             }
         }
 

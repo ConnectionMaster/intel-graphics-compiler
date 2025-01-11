@@ -30,48 +30,13 @@ using namespace llvm;
 using namespace IGC;
 using namespace IGC::IGCMD;
 
-CShader::CShader(Function* pFunc, CShaderProgram* pProgram)
-    : entry(pFunc)
+CShader::CShader(Function *pFunc, CShaderProgram *pProgram, GenericShaderState &GState)
+    : m_State(GState)
+    , entry(pFunc)
     , m_parent(pProgram)
     , encoder()
-    , m_BarrierNumber(0)
 {
     m_ctx = m_parent->GetContext();
-    m_WI = nullptr;
-    m_deSSA = nullptr;
-    m_coalescingEngine = nullptr;
-    m_DL = nullptr;
-    m_FGA = nullptr;
-    m_VRA = nullptr;
-    m_RLA = nullptr;
-    m_EmitPass = nullptr;
-    m_HW_TID = nullptr;
-
-    m_shaderStats = nullptr;
-    m_constantBufferMask = 0;
-    m_constantBufferLoaded = 0;
-    m_ConstantBufferLength = 0;
-    m_uavLoaded = 0;
-    for (int i = 0; i < 4; i++)
-    {
-        m_shaderResourceLoaded[i] = 0;
-    }
-    m_renderTargetLoaded = 0;
-    isInputsPulled = false;
-    m_cbSlot = -1;
-    m_statelessCBPushedSize = 0;
-    isMessageTargetDataCacheDataPort = false;
-    m_BindingTableEntryCount = 0;
-    m_BindingTableUsedEntriesBitmap = 0;
-    // [OCL] preAnalysis()/ParseShaderSpecificOpcode() must
-    // set this to ture if there is any stateless access.
-    m_HasGlobalStatelessMemoryAccess = false;
-    m_HasConstantStatelessMemoryAccess = false;
-    m_HasDPAS = false;
-
-    m_SavedSRetPtr = nullptr;
-    m_FP = nullptr;
-    m_SavedFP = nullptr;
 
     bool SepSpillPvtSS = SeparateSpillAndScratch(m_ctx);
     bool SeparateScratchWA =
@@ -124,7 +89,7 @@ void CShader::InitEncoder(SIMDMode simdSize, bool canAbortOnSpill, ShaderDispatc
         m_SIMDSize = simdSize;
         m_numberInstance = 1;
     }
-    m_dispatchSize = simdSize;
+    m_State.m_dispatchSize = simdSize;
     globalSymbolMapping.clear();
     symbolMapping.clear();
     ccTupleMapping.clear();
@@ -152,7 +117,7 @@ void CShader::PreAnalysisPass()
                 const uint32_t GRFSize = getGRFSize();
                 IGC_ASSERT(0 < GRFSize);
 
-                m_ScratchSpaceSize = funcMDItr->second.privateMemoryPerWI * numLanes(m_dispatchSize);
+                m_ScratchSpaceSize = funcMDItr->second.privateMemoryPerWI * numLanes(m_State.m_dispatchSize);
                 m_ScratchSpaceSize = std::max(m_ScratchSpaceSize, m_ctx->getIntelScratchSpacePrivateMemoryMinimalSizePerThread());
 
                 // Round up to GRF-byte aligned.
@@ -391,7 +356,6 @@ void CShader::CreateImplicitArgs()
     if (IGC::isIntelSymbolTableVoidProgram(entry))
         return;
 
-    m_numBlocks = entry->size();
     m_R0 = GetNewVariable(getGRFSize() / SIZE_DWORD, ISA_TYPE_D, EALIGN_GRF, false, 1, "R0");
     encoder.GetVISAPredefinedVar(m_R0, PREDEFINED_R0);
 
@@ -682,15 +646,15 @@ void CShader::AllocateConstants3DShader(uint& offset)
 
 void CShader::AllocateConstants(uint& offset)
 {
-    m_ConstantBufferLength = 0;
+    m_State.m_ConstantBufferLength = 0;
     for (auto I = pushInfo.constants.begin(), E = pushInfo.constants.end(); I != E; I++) {
         CVariable* var = GetSymbol(m_argListCache[I->second]);
-        AllocateInput(var, offset + m_ConstantBufferLength, 0, encoder.IsCodePatchCandidate());
-        m_ConstantBufferLength += var->GetSize();
+        AllocateInput(var, offset + m_State.m_ConstantBufferLength, 0, encoder.IsCodePatchCandidate());
+        m_State.m_ConstantBufferLength += var->GetSize();
     }
 
-    m_ConstantBufferLength = iSTD::Align(m_ConstantBufferLength, getMinPushConstantBufferAlignmentInBytes());
-    offset += m_ConstantBufferLength;
+    m_State.m_ConstantBufferLength = iSTD::Align(m_State.m_ConstantBufferLength, getMinPushConstantBufferAlignmentInBytes());
+    offset += m_State.m_ConstantBufferLength;
 }
 
 void CShader::AllocateSimplePushConstants(uint& offset)
@@ -717,87 +681,8 @@ void CShader::AllocateNOSConstants(uint& offset)
         maxConstantPushed = std::max(maxConstantPushed, I->first + numConstantsPushed);
     }
     maxConstantPushed = iSTD::Max(maxConstantPushed, static_cast<uint>(m_ModuleMetadata->MinNOSPushConstantSize));
-    m_NOSBufferSize = iSTD::Align(maxConstantPushed * SIZE_DWORD, getMinPushConstantBufferAlignmentInBytes());
-    offset += m_NOSBufferSize;
-}
-
-
-void CShader::CreateGatherMap()
-{
-    int index = -1;
-    gatherMap.reserve(pushInfo.constants.size());
-    for (auto I = pushInfo.constants.begin(), E = pushInfo.constants.end(); I != E; I++)
-    {
-        unsigned int address = (I->first.bufId * 256 * 4) + (I->first.eltId);
-        unsigned int cstOffset = address / 4;
-        unsigned int cstChannel = address % 4;
-        if (cstOffset != index)
-        {
-            USC::SConstantGatherEntry entry;
-            entry.GatherEntry.Fields.constantBufferOffset = cstOffset % 256;
-            entry.GatherEntry.Fields.channelMask = BIT(cstChannel);
-            // with 3DSTATE_DX9_CONSTANT if buffer is more than 4Kb,
-            //  the constant after 255 can be accessed in constant buffer 1
-            int CBIndex = cstOffset / 256;
-            entry.GatherEntry.Fields.constantBufferIndex = CBIndex;
-            m_constantBufferMask |= BIT(CBIndex);
-            gatherMap.push_back(entry);
-            index = cstOffset;
-        }
-        else
-        {
-            gatherMap[gatherMap.size() - 1].GatherEntry.Fields.channelMask |= BIT(cstChannel);
-        }
-    }
-
-    // The size of the gather map must be even
-    if (gatherMap.size() % 2 != 0)
-    {
-        USC::SConstantGatherEntry entry;
-        entry.GatherEntry.Value = 0;
-        gatherMap.push_back(entry);
-    }
-}
-
-void  CShader::CreateConstantBufferOutput(SKernelProgram* pKernelProgram)
-{
-    pKernelProgram->ConstantBufferMask = m_constantBufferMask;
-    pKernelProgram->gatherMapSize = gatherMap.size();
-    if (pKernelProgram->gatherMapSize > 0)
-    {
-        pKernelProgram->gatherMap = new char[pKernelProgram->gatherMapSize * sizeof(USC::SConstantGatherEntry)];
-        memcpy_s(pKernelProgram->gatherMap, pKernelProgram->gatherMapSize *
-            sizeof(USC::SConstantGatherEntry),
-            &gatherMap[0],
-            gatherMap.size() * sizeof(USC::SConstantGatherEntry));
-        pKernelProgram->ConstantBufferLength = m_ConstantBufferLength / getMinPushConstantBufferAlignmentInBytes();
-    }
-
-    if (m_cbSlot != -1)
-    {
-        pKernelProgram->bufferSlot = m_cbSlot;
-        pKernelProgram->statelessCBPushedSize = m_statelessCBPushedSize;
-    }
-
-    // for simple push
-    for (unsigned int i = 0; i < pushInfo.simplePushBufferUsed; i++)
-    {
-        pKernelProgram->simplePushInfoArr[i].m_cbIdx = pushInfo.simplePushInfoArr[i].cbIdx;
-        pKernelProgram->simplePushInfoArr[i].m_pushableAddressGrfOffset= pushInfo.simplePushInfoArr[i].pushableAddressGrfOffset;
-        pKernelProgram->simplePushInfoArr[i].m_pushableOffsetGrfOffset = pushInfo.simplePushInfoArr[i].pushableOffsetGrfOffset;
-        pKernelProgram->simplePushInfoArr[i].m_offset = pushInfo.simplePushInfoArr[i].offset;
-        pKernelProgram->simplePushInfoArr[i].m_size = pushInfo.simplePushInfoArr[i].size;
-        pKernelProgram->simplePushInfoArr[i].isStateless = pushInfo.simplePushInfoArr[i].isStateless;
-        pKernelProgram->simplePushInfoArr[i].isBindless = pushInfo.simplePushInfoArr[i].isBindless;
-    }
-
-    if (GetContext()->m_ConstantBufferReplaceShaderPatterns)
-    {
-        pKernelProgram->m_ConstantBufferReplaceShaderPatterns = GetContext()->m_ConstantBufferReplaceShaderPatterns;
-        pKernelProgram->m_ConstantBufferReplaceShaderPatternsSize = GetContext()->m_ConstantBufferReplaceShaderPatternsSize;
-        pKernelProgram->m_ConstantBufferUsageMask = GetContext()->m_ConstantBufferUsageMask;
-        pKernelProgram->m_ConstantBufferReplaceSize = GetContext()->m_ConstantBufferReplaceSize;
-    }
+    m_State.m_NOSBufferSize = iSTD::Align(maxConstantPushed * SIZE_DWORD, getMinPushConstantBufferAlignmentInBytes());
+    offset += m_State.m_NOSBufferSize;
 }
 
 CVariable* CShader::CreateFunctionSymbol(llvm::Function* pFunc)
@@ -1235,7 +1120,7 @@ CVariable* CShader::ImmToVariable(uint64_t immediate, VISA_Type type, bool isCod
         // src-variable is no longer a boolean, V-ISA cannot take boolean-src immed.
 
         CVariable* dst = GetNewVariable(
-            numLanes(m_dispatchSize), ISA_TYPE_BOOL, EALIGN_BYTE, CName::NONE);
+            numLanes(m_State.m_dispatchSize), ISA_TYPE_BOOL, EALIGN_BYTE, CName::NONE);
         // FIXME: We need to pop/push the encoder context
         //encoder.save();
         if (isCodePatchCandidate)
@@ -1644,7 +1529,7 @@ void CShader::GetSimdOffsetBase(CVariable*& pVar, bool dup)
     encoder.Cast(pVar, ImmToVariable(0x76543210, ISA_TYPE_V));
     encoder.Push();
 
-    if (m_dispatchSize >= SIMDMode::SIMD16)
+    if (m_State.m_dispatchSize >= SIMDMode::SIMD16)
     {
         encoder.SetSimdSize(SIMDMode::SIMD8);
         encoder.SetDstSubReg(8);
@@ -3137,7 +3022,7 @@ unsigned int CShader::EvaluateSIMDConstExpr(Value* C)
     {
         if (genInst->getIntrinsicID() == GenISAIntrinsic::GenISA_simdSize)
         {
-            return numLanes(m_dispatchSize);
+            return numLanes(m_State.m_dispatchSize);
 
         }
     }
@@ -3855,6 +3740,19 @@ CVariable* CShader::GetNewAlias(
     return alias;
 }
 
+// Create a multi-instance alias of a single-instance variable.
+CVariable* CShader::GetNewAlias(CVariable* var, uint16_t numInstances)
+{
+    IGC_ASSERT_MESSAGE(false == var->IsImmediate(), "Trying to create an alias of an immediate");
+    IGC_ASSERT(var->GetNumberInstance() == 1);
+    IGC_ASSERT(var->GetSingleInstanceAlias() == nullptr);
+    IGC_ASSERT(var->GetAlias() == nullptr);
+    IGC_ASSERT(numInstances > 1);
+    CVariable* alias = new (Allocator)CVariable(var, numInstances);
+    encoder.CreateVISAVar(alias);
+    return alias;
+}
+
 // createAliasIfNeeded() returns the Var that is either BaseVar or
 // its alias of the same size.
 //
@@ -4092,28 +3990,7 @@ bool CShader::CompileSIMDSizeInCommon(SIMDMode simdMode)
 
 uint32_t CShader::GetShaderThreadUsageRate()
 {
-    uint32_t grfNum = GetContext()->getNumGRFPerThread();
-    // prevent callee divide by zero
-    return std::max<uint32_t>(1, grfNum / GRF_TOTAL_NUM);
-}
-
-unsigned int CShader::GetSamplerCount(unsigned int samplerCount)
-{
-    if (samplerCount > 0)
-    {
-        if (samplerCount <= 4)
-            return 1; // between 1 and 4 samplers used
-        else if (samplerCount >= 5 && samplerCount <= 8)
-            return 2; // between 5 and 8 samplers used
-        else if (samplerCount >= 9 && samplerCount <= 12)
-            return 3; // between 9 and 12 samplers used
-        else if (samplerCount >= 13 && samplerCount <= 16)
-            return 4; // between 13 and 16 samplers used
-        else
-            // Samplers count out of range. Force value 0 to avoid undefined behavior.
-            return 0;
-    }
-    return 0;
+    return m_State.GetShaderThreadUsageRate();
 }
 
 CShaderProgram::CShaderProgram(CodeGenContext* ctx, llvm::Function* kernel)

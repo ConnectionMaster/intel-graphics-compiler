@@ -12,6 +12,7 @@ SPDX-License-Identifier: MIT
 #include "FastSparseBitVector.h"
 #include "../FlowGraph.h"
 #include "../G4_IR.hpp"
+#include "G4_Declare.h"
 #include "LocalScheduler_G4IR.h"
 #include "../Mem_Manager.h"
 #include "../Timer.h"
@@ -138,6 +139,7 @@ struct SBFootprint {
   const unsigned short RightB;
   unsigned short offset = 0;
   bool isPrecision = false;
+  bool isFcvtByteType = false;;
   G4_INST *inst;
 
   // FIXME: The choice of C-style linked list seems suspect given that there are
@@ -153,13 +155,14 @@ struct SBFootprint {
     isPrecision = false;
   }
   SBFootprint(FOOTPRINT_TYPE ft, G4_Type t, unsigned short LB,
-              unsigned short RB, G4_INST *i)
-      : fType(ft), type((unsigned short)t), LeftB(LB), RightB(RB), inst(i) {
+              unsigned short RB, G4_INST *i, bool isByteType = false)
+      : fType(ft), type((unsigned short)t), LeftB(LB), RightB(RB), inst(i), isFcvtByteType(isByteType) {
     isPrecision = false;
   }
   SBFootprint(FOOTPRINT_TYPE ft, GenPrecision p, unsigned short LB,
-              unsigned short RB, G4_INST *i)
-      : fType(ft), type((unsigned short)p), LeftB(LB), RightB(RB), inst(i), isPrecision(true) {
+              unsigned short RB, G4_INST *i, bool isByteType = false)
+      : fType(ft), type((unsigned short)p), LeftB(LB), RightB(RB), inst(i),
+        isPrecision(true), isFcvtByteType(isByteType) {
   }
 
   void setOffset(unsigned short o) { offset = o; }
@@ -553,7 +556,9 @@ public:
   ~LiveGRFBuckets() {}
   bool isEmpty() {return empty;}
   int getNumOfBuckets() const { return numOfBuckets; }
-
+  const std::vector<SBBUCKET_VECTOR> &getAllBuckets() const {
+    return nodeBucketsArray;
+  }
   // The iterator which is used to scan the node vector of each bucket
   class BN_iterator {
   public:
@@ -614,6 +619,15 @@ typedef struct _SWSB_LOOP {
   int entryBBID = -1;
   int endBBID = -1;
 } SWSB_LOOP;
+
+struct BucketNodeInfo {
+  int globalID;
+  G4_Declare *topDeclare;
+  const SBFootprint *liveFootprint;
+  G4_INST *liveInst;
+  Gen4_Operand_Number liveOpnd;
+};
+using BucketInfos = std::vector<std::vector<BucketNodeInfo>>;
 
 class G4_BB_SB {
 private:
@@ -774,7 +788,7 @@ public:
   bool hasInternalDependence(SBNode *nodeFirst, SBNode *nodeNext);
 
   bool is2xFPBlockCandidate(G4_INST *inst, bool accDST);
-  bool hasExtraOverlap(G4_INST *liveInst, G4_INST *curInst,
+  bool hasExtraOverlap(const G4_INST *liveInst, const G4_INST *curInst,
                        const SBFootprint *liveFootprint,
                        const SBFootprint *curFootprint,
                        const Gen4_Operand_Number curOpnd, IR_Builder *builder);
@@ -793,11 +807,8 @@ public:
                                     bool &sameDstSrc);
 
   // Global SBID dependence analysis
-  bool handleCallForMayKilled(SparseBitVector *allDstGlobalIDs,
-                              SparseBitVector *allSrcGlobalIDs);
-
-  void setSendOpndMayKilled(LiveGRFBuckets *globalSendsLB, SBNODE_VECT &SBNodes,
-                            PointsToAnalysis &p);
+  void setSendOpndMayKilled(SBNODE_VECT &SBNodes, PointsToAnalysis &p,
+                            BucketInfos &bucketInfos);
   void
   setSendGlobalIDMayKilledByCurrentBB(std::vector<SparseBitVector> &dstTokenBit,
                                   std::vector<SparseBitVector> &srcTokenBit,
@@ -1090,10 +1101,6 @@ class SWSB {
   bool insertSyncToken(G4_BB *bb, SBNode *node, G4_INST *inst,
                        INST_LIST_ITER inst_it, int newInstID, BitSet *dstTokens,
                        BitSet *srcTokens, bool &keepDst, bool removeAllToken);
-
-  void SWSBInitializeGlobalSends(SparseBitVector &allDstGlobalIDs,
-                                 SparseBitVector &allSrcGlobalIDs,
-                                 LiveGRFBuckets &globalSendsLB);
 
   void
   SWSBInitializeGlobalNodesInBuckets(std::vector<SparseBitVector> &dstGlobalIDs,

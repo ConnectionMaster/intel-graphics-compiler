@@ -66,6 +66,7 @@ public:
     enum class AddressModeType { None, Stateful, Bindless, Stateless };
 
   private:
+    unsigned ArgNo;
     unsigned Index;
     KindType Kind;
     AccessKindType AccessKind;
@@ -82,6 +83,7 @@ public:
     KernelArgInfo() = default;
 
   public:
+    unsigned getArgNo() const { return ArgNo; }
     unsigned getIndex() const { return Index; }
     KindType getKind() const { return Kind; }
     AccessKindType getAccessKind() const { return AccessKind; }
@@ -177,12 +179,14 @@ public:
     bool UsesGroupId = false;
     bool UsesReadWriteImages = false;
     bool UsesSample = false;
+    bool DisableMidThreadPreemption = false;
 
     unsigned GRFSizeInBytes;
     unsigned NumBarriers = 0;
     unsigned SLMSize = 0;
     unsigned StatelessPrivateMemSize = 0;
     unsigned ThreadPrivateMemSize = 0;
+    unsigned IndirectCount = 0;
 
   private:
     void initInstructionLevelProperties(const FunctionGroup &FG,
@@ -250,6 +254,7 @@ public:
     // SIMD size is always set by igcmc to one. Preserve this here.
     unsigned getSIMDSize() const { return 1; }
     unsigned getSLMSize() const { return FuncInfo.SLMSize; }
+    unsigned getIndirectCount() const { return FuncInfo.IndirectCount; }
 
     // Deduced from actual function instructions.
     unsigned getTPMSize() const { return FuncInfo.ThreadPrivateMemSize; }
@@ -263,6 +268,10 @@ public:
     bool usesDPAS() const { return FuncInfo.UsesDPAS; }
     // igcmc always sets this to zero. Preserve this here.
     unsigned getNumThreads() const { return 0; }
+
+    bool disableMidThreadPreemption() const {
+      return FuncInfo.DisableMidThreadPreemption;
+    }
 
     unsigned getNumBarriers() const { return FuncInfo.NumBarriers; }
     bool usesSample() const { return FuncInfo.UsesSample; }

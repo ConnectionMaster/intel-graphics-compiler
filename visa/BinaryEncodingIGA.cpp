@@ -995,7 +995,7 @@ void BinaryEncodingIGA::SetSWSB(G4_INST *inst, SWSB &sw) {
   // - send has only distance     --> $0 and distance
   // This workaround can be removed once vISA doesn't produce such SWSB.
   // Currently this could happen only on EOT send.
-  if (inst->isSend() && !sw.hasBothDistAndToken() &&
+  if (inst->isSend() &&
       !sw.verify(getIGASWSBEncodeMode(), SWSB::InstType::SEND)) {
     sw.tokenType = SWSB::TokenType::SET;
     if (sw.hasDist()) {
@@ -1743,8 +1743,8 @@ void *BinaryEncodingIGA::EmitBinary(size_t &binarySize) {
         std::string errStr;
         errStr = "BinaryEncodingIGA: unable to open output path for write: " +
                  binFileName + "\n";
-        vISA_ASSERT(false, errStr);
-        return nullptr;
+        // vISA_ASSERT(false, errStr);
+        return m_kernelBuffer;
       }
       os.write((const char *)m_kernelBuffer, binarySize);
     }

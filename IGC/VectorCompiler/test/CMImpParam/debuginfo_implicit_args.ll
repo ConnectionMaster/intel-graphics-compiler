@@ -1,24 +1,65 @@
 ;=========================== begin_copyright_notice ============================
 ;
-; Copyright (C) 2021-2023 Intel Corporation
+; Copyright (C) 2021-2024 Intel Corporation
 ;
 ; SPDX-License-Identifier: MIT
 ;
 ;============================ end_copyright_notice =============================
 
-; RUN: %opt %use_old_pass_manager% -cmimpparam \
+; RUN: %opt_legacy_typed %use_old_pass_manager% -CMImpParam \
+; RUN: -march=genx64 -mcpu=Gen9 -mtriple=spir64-unknown-unknown \
+; RUN: -S < %s | FileCheck %s --check-prefix CHECK_LOCAL_ID
+; RUN: %opt_legacy_opaque %use_old_pass_manager% -CMImpParam \
 ; RUN: -march=genx64 -mcpu=Gen9 -mtriple=spir64-unknown-unknown \
 ; RUN: -S < %s | FileCheck %s --check-prefix CHECK_LOCAL_ID
 
-; RUN: %opt %use_old_pass_manager% -cmimpparam \
+; RUN: %opt_legacy_typed %use_old_pass_manager% -CMImpParam \
+; RUN: -march=genx64 -mcpu=Gen9 -mtriple=spir64-unknown-unknown \
+; RUN: -S < %s | FileCheck %s --check-prefix CHECK_LOCAL_SIZE
+; RUN: %opt_legacy_opaque %use_old_pass_manager% -CMImpParam \
 ; RUN: -march=genx64 -mcpu=Gen9 -mtriple=spir64-unknown-unknown \
 ; RUN: -S < %s | FileCheck %s --check-prefix CHECK_LOCAL_SIZE
 
-; RUN: %opt %use_old_pass_manager% -cmimpparam \
+; RUN: %opt_legacy_typed %use_old_pass_manager% -CMImpParam \
+; RUN: -march=genx64 -mcpu=Gen9 -mtriple=spir64-unknown-unknown \
+; RUN: -S < %s | FileCheck %s --check-prefix CHECK_GROUP_COUNT
+; RUN: %opt_legacy_opaque %use_old_pass_manager% -CMImpParam \
 ; RUN: -march=genx64 -mcpu=Gen9 -mtriple=spir64-unknown-unknown \
 ; RUN: -S < %s | FileCheck %s --check-prefix CHECK_GROUP_COUNT
 
-; RUN: %opt %use_old_pass_manager% -cmimpparam \
+; RUN: %opt_legacy_typed %use_old_pass_manager% -CMImpParam \
+; RUN: -march=genx64 -mcpu=Gen9 -mtriple=spir64-unknown-unknown \
+; RUN: -S < %s | FileCheck %s --check-prefix CHECK_PRINT_BUFFER
+; RUN: %opt_legacy_opaque %use_old_pass_manager% -CMImpParam \
+; RUN: -march=genx64 -mcpu=Gen9 -mtriple=spir64-unknown-unknown \
+; RUN: -S < %s | FileCheck %s --check-prefix CHECK_PRINT_BUFFER
+
+
+; RUN: %opt_new_pm_typed -passes=CMImpParam \
+; RUN: -march=genx64 -mcpu=Gen9 -mtriple=spir64-unknown-unknown \
+; RUN: -S < %s | FileCheck %s --check-prefix CHECK_LOCAL_ID
+; RUN: %opt_new_pm_opaque  -passes=CMImpParam \
+; RUN: -march=genx64 -mcpu=Gen9 -mtriple=spir64-unknown-unknown \
+; RUN: -S < %s | FileCheck %s --check-prefix CHECK_LOCAL_ID
+
+; RUN: %opt_new_pm_typed -passes=CMImpParam \
+; RUN: -march=genx64 -mcpu=Gen9 -mtriple=spir64-unknown-unknown \
+; RUN: -S < %s | FileCheck %s --check-prefix CHECK_LOCAL_SIZE
+; RUN: %opt_new_pm_opaque -passes=CMImpParam \
+; RUN: -march=genx64 -mcpu=Gen9 -mtriple=spir64-unknown-unknown \
+; RUN: -S < %s | FileCheck %s --check-prefix CHECK_LOCAL_SIZE
+
+; RUN: %opt_new_pm_typed -passes=CMImpParam \
+; RUN: -march=genx64 -mcpu=Gen9 -mtriple=spir64-unknown-unknown \
+; RUN: -S < %s | FileCheck %s --check-prefix CHECK_GROUP_COUNT
+; RUN: %opt_new_pm_opaque -passes=CMImpParam \
+; RUN: -march=genx64 -mcpu=Gen9 -mtriple=spir64-unknown-unknown \
+; RUN: -S < %s | FileCheck %s --check-prefix CHECK_GROUP_COUNT
+
+; RUN: %opt_new_pm_typed -passes=CMImpParam \
+; RUN: -march=genx64 -mcpu=Gen9 -mtriple=spir64-unknown-unknown \
+; RUN: -S < %s | FileCheck %s --check-prefix CHECK_PRINT_BUFFER
+; RUN: %opt_new_pm_opaque -passes=CMImpParam \
 ; RUN: -march=genx64 -mcpu=Gen9 -mtriple=spir64-unknown-unknown \
 ; RUN: -S < %s | FileCheck %s --check-prefix CHECK_PRINT_BUFFER
 

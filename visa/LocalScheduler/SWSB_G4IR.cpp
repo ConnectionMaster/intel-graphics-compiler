@@ -9,15 +9,11 @@ SPDX-License-Identifier: MIT
 #include "SWSB_G4IR.h"
 #include "../G4_Opcode.h"
 #include "../PointsToAnalysis.h"
-#include "../Timer.h"
 #include "Dependencies_G4IR.h"
 #include "visa_wa.h"
 
 #include <algorithm>
-#include <fstream>
-#include <functional>
 #include <limits>
-#include <queue>
 #include <sstream>
 
 using namespace vISA;
@@ -63,8 +59,8 @@ static bool hasSameFunctionID(const G4_INST *inst1, const G4_INST *inst2) {
     return false;
   }
   if (isInst1Send && isInst2Send) {
-    G4_SendDesc *msgDesc1 = inst1->getMsgDesc();
-    G4_SendDesc *msgDesc2 = inst2->getMsgDesc();
+    const auto *msgDesc1 = inst1->getMsgDesc();
+    const auto *msgDesc2 = inst2->getMsgDesc();
     if (msgDesc1->isSLM() ^ msgDesc2->isSLM()) {
       return false;
     }
@@ -164,10 +160,7 @@ static bool WARDepRequired(const G4_INST *inst1, const G4_INST *inst2) {
   if (!hasSamePredicator(inst1, inst2)) {
     return true;
   }
-  if (!hasSameExecMask(inst1, inst2)) {
-    return true;
-  }
-  return false;
+  return !hasSameExecMask(inst1, inst2);
 }
 
 // check if two operands occupy overlapping GRFs
@@ -181,30 +174,38 @@ static bool operandOverlap(G4_Operand *opnd1, G4_Operand *opnd2) {
           opnd2->getLinearizedEnd() > opnd1->getLinearizedStart());
 }
 
-static bool isExclusiveLoad(SBNode *node1, SBNode *node2, DepType type) {
+static bool isExclusiveLoad(const SBNode *node1, const SBNode *node2, DepType type) {
   if (type != WAW) {
     return false;
   }
 
-  G4_INST *inst1 = node1->getLastInstruction();
-  G4_INST *inst2 = node2->getLastInstruction();
+  const auto *inst1 = node1->getLastInstruction();
+  const auto *inst2 = node2->getLastInstruction();
 
   if (!inst1->isSend() || !inst2->isSend()) {
     return false;
   }
 
-  G4_Declare *dcl1 = inst1->getDst()->getTopDcl();
-  G4_Declare *dcl2 = inst2->getDst()->getTopDcl();
-
-  if (dcl1 != dcl2) {
+  auto *dcl1 = inst1->getDst()->getTopDcl();
+  if (dcl1 != inst2->getDst()->getTopDcl()) {
     return false;
   }
 
-  if (dcl1->isExclusiveLoad()) {
-    return true;
+  return dcl1->isExclusiveLoad();
+}
+
+static bool isDclExclusiveLoad(const G4_Declare *declare1,
+                               const G4_Declare *declare2) {
+
+  if (declare1 == nullptr) {
+    return false;
   }
 
-  return false;
+  if (declare1 != declare2) {
+    return false;
+  }
+
+  return declare1->isExclusiveLoad();
 }
 
 bool SBFootprint::hasOverlap(const SBFootprint *liveFootprint,
@@ -245,11 +246,13 @@ bool SBFootprint::hasOverlap(const SBFootprint *liveFootprint,
         if (curFootprintPtr->LeftB <= curFootprint2Ptr->RightB &&
             curFootprintPtr->RightB >= curFootprint2Ptr->LeftB) {
           internalOffset = curFootprint2Ptr->offset;
-          if (curFType == GRF_T && !isPrecision && IS_BTYPE(curType)) {
+          if (curFType == GRF_T && !isPrecision &&
+              (IS_BTYPE(curType) || isFcvtByteType)) {
             isRMWOverlap = true;
           }
           return true;
-        } else if (curFType == GRF_T && !isPrecision && IS_BTYPE(curType)) {
+        } else if (curFType == GRF_T && !isPrecision &&
+                   (IS_BTYPE(curType) || isFcvtByteType)) {
           unsigned short w_LeftB = curFootprintPtr->LeftB / 2;
           unsigned short w_RightB = curFootprintPtr->RightB / 2;
           unsigned short w_curLeftB = curFootprint2Ptr->LeftB / 2;
@@ -1019,11 +1022,15 @@ SBFootprint *G4_BB_SB::getFootprintForGRF(G4_Operand *opnd,
   int aregOffset = totalGRFNum;
   G4_Type type = opnd->getType();
   GenPrecision precision = GenPrecision::INVALID;
+  bool isFcvtByteType = false;
   bool isPrecision = false;
 
   if (inst->opcode() == G4_fcvt &&
       (IS_BTYPE(type) ||
        (type == Type_UD && builder.hasPartialInt64Support()))) {
+    if (IS_BTYPE(type)) {
+      isFcvtByteType = true;
+    }
     type = Type_F;
   }
   if (inst->opcode() == G4_srnd) { // srnd ub  hf  hf | srnd hf f f
@@ -1144,8 +1151,11 @@ SBFootprint *G4_BB_SB::getFootprintForGRF(G4_Operand *opnd,
   }
 
   SBFootprint *footprint =
-      isPrecision ? new (allocedMem) SBFootprint(GRF_T, precision, LB, RB, inst) :
-      new (allocedMem) SBFootprint(GRF_T, type, LB, RB, inst);
+      isPrecision
+          ? new (allocedMem)
+                SBFootprint(GRF_T, precision, LB, RB, inst, isFcvtByteType)
+          : new (allocedMem)
+                SBFootprint(GRF_T, type, LB, RB, inst, isFcvtByteType);
 
   return footprint;
 }
@@ -1516,32 +1526,6 @@ void SWSB::handleFuncCall() {
   }
 }
 
-void SWSB::SWSBInitializeGlobalSends(
-    SparseBitVector &allDstGlobalIDs, // node global ID bit vector in buckets
-                                      // touched by dst operands
-    SparseBitVector &allSrcGlobalIDs, // node global ID bit vector in buckets
-                                      // touched by src operands
-    LiveGRFBuckets &globalSendsLB) { // live buckets of global sends
-
-
-  // Scan the global send LB to set the node bit in dst or src bit set of each
-  // bucket that node touches.
-  for (unsigned curBucket = 0; curBucket < (unsigned)globalRegisterNum;
-       curBucket++) {
-    for (LiveGRFBuckets::BN_iterator bn_it = globalSendsLB.begin(curBucket);
-         bn_it != globalSendsLB.end(curBucket); ++bn_it) {
-      SBBucketNode *liveBN = (*bn_it);
-      SBNode *curLiveNode = liveBN->node;
-
-      if (liveBN->opndNum == Opnd_dst) {
-        allDstGlobalIDs.set(curLiveNode->globalID);
-      } else {
-        allSrcGlobalIDs.set(curLiveNode->globalID);
-      }
-    }
-  }
-}
-
 //
 // Set the global ID bit vector of each bucket touched by corresponding
 // operands
@@ -1591,6 +1575,26 @@ void SWSB::SWSBInitializeGlobalNodesInBuckets(
   }
 }
 
+// Pre collect all relevant data from LiveGRFBuckets for setSendOpndMayKilled
+// to speed up processing.
+static BucketInfos generateBucketInfos(const LiveGRFBuckets &globalSendsLB){
+  BucketInfos bucketInfos(globalSendsLB.getNumOfBuckets());
+  for (size_t i = 0; i < static_cast<size_t>(globalSendsLB.getNumOfBuckets()); i++) {
+    for (const auto *liveBN : globalSendsLB.getAllBuckets()[i]) {
+      SBNode *curLiveNode = liveBN->node;
+      const auto *inst = curLiveNode->getLastInstruction();
+      G4_Declare *topDcl = nullptr;
+      if (!inst->isSend()) {
+        topDcl = inst->getDst()->getTopDcl();
+      }
+      bucketInfos[i].emplace_back(
+          BucketNodeInfo{curLiveNode->globalID, topDcl, liveBN->footprint,
+                         liveBN->footprint->inst, liveBN->opndNum});
+    }
+  }
+  return bucketInfos;
+}
+
 void SWSB::SWSBGlobalTokenGenerator(PointsToAnalysis &p, LiveGRFBuckets &LB,
                                     LiveGRFBuckets &globalSendsLB,
                                     LiveGRFBuckets &GRFAlignedGlobalSendsLB) {
@@ -1599,6 +1603,8 @@ void SWSB::SWSBGlobalTokenGenerator(PointsToAnalysis &p, LiveGRFBuckets &LB,
     nodeMap.bitset = BitSet(SBSendNodes.size(), false);
   }
 
+  BucketInfos bucketInfos = generateBucketInfos(globalSendsLB);
+
   const bool enableGlobalTokenAllocation =
       fg.builder->getOptions()->getOption(vISA_GlobalTokenAllocation);
   const bool enableDistPropTokenAllocation =
@@ -1606,12 +1612,6 @@ void SWSB::SWSBGlobalTokenGenerator(PointsToAnalysis &p, LiveGRFBuckets &LB,
 
   std::vector<SparseBitVector> dstGlobalIDs;
   std::vector<SparseBitVector> srcGlobalIDs;
-  SparseBitVector allDstGlobalIDs;
-  SparseBitVector allSrcGlobalIDs;
-
-  //Get all the global sends bitvector
-  SWSBInitializeGlobalSends(allDstGlobalIDs, allSrcGlobalIDs, globalSendsLB);
-
   if (!fg.builder->hasReadSuppressionOrSharedLocalMemoryWAs()) {
     // Initialilze for setSendGlobalIDMayKilledByCurrentBB only
     SWSBInitializeGlobalNodesInBuckets(dstGlobalIDs, srcGlobalIDs,
@@ -1654,13 +1654,9 @@ void SWSB::SWSBGlobalTokenGenerator(PointsToAnalysis &p, LiveGRFBuckets &LB,
     if (!fg.builder->hasReadSuppressionOrSharedLocalMemoryWAs()) {
       bb->setSendGlobalIDMayKilledByCurrentBB(dstGlobalIDs, srcGlobalIDs,
                                               SBNodes, p);
-      if (!globalSendsLB.isEmpty()) {
-        bb->setSendOpndMayKilled(&globalSendsLB, SBNodes, p);
-      }
-    } else {
-      if (!bb->handleCallForMayKilled(&allDstGlobalIDs, &allSrcGlobalIDs)) {
-        bb->setSendOpndMayKilled(&globalSendsLB, SBNodes, p);
-      }
+    }
+    if (!globalSendsLB.isEmpty()) {
+      bb->setSendOpndMayKilled(SBNodes, p, bucketInfos);
     }
 
 #ifdef DEBUG_VERBOSE_ON
@@ -3037,7 +3033,7 @@ void SWSB::tokenAllocation() {
     printf("\n=======nodeID: %d, startID: %d, endID: %d\n", node->getNodeID(),
            node->getLiveStartID(), node->getLiveEndID());
 #endif
-    if (inst->isEOT()) {
+    if (!fg.builder->hasFourALUPipes() && inst->isEOT()) {
       continue;
     }
 
@@ -4500,23 +4496,6 @@ void SWSB::insertTokenSync() {
         continue;
       }
 
-      if (inst->isCall() || inst->isFCall() || inst->isReturn() ||
-          inst->isFReturn()) {
-        G4_INST *synAllInst = insertSyncAllWRInstruction(bb, 0, inst_it);
-        // In case previous inst need force A@1 in following inst
-        synAllInst->setDistance(1);
-        if (kernel.fg.builder->hasThreeALUPipes() ||
-            kernel.fg.builder->hasFourALUPipes()) {
-          synAllInst->setDistanceTypeXe(G4_INST::DistanceType::DISTALL);
-        }
-        synAllInst->setLexicalId(newInstID);
-        synAllInst = insertSyncAllRDInstruction(bb, 0, inst_it);
-        synAllInst->setLexicalId(newInstID);
-        newInstID++;
-        node_it++;
-        continue;
-      }
-
       auto jitInfo = kernel.fg.builder->getJitInfo();
       if (inst->getDistance() == 1) {
         if (kernel.fg.builder->hasThreeALUPipes() ||
@@ -5494,43 +5473,26 @@ void G4_BB_SB::getLiveOutToken(unsigned allSendNum,
   }
 }
 
-// All global dependencies will be resolved in function call
-bool G4_BB_SB::handleCallForMayKilled(SparseBitVector *allDstGlobalIDs,
-                                      SparseBitVector *allSrcGlobalIDs) {
-  if (!bb->size()) {
-    return false;
-  }
-
-  G4_INST *lastInst = bb->back();
-  if (!lastInst->isReturn() && !lastInst->isCall() && !lastInst->isFReturn() &&
-      !lastInst->isFCall()) {
-    return false;
-  }
-
-  send_may_kill.dst = *allDstGlobalIDs;
-  send_may_kill.src = *allSrcGlobalIDs;
-  send_WAW_may_kill = *allDstGlobalIDs;
-
-  return true;
-}
-
 //
 // Scan to check which global send operand for sends will be killed by current
 // BB. Note that there is no guarantee the send operand will in the live in set
 // of BB.
 // !!! Note that: since this "may kill" info is used in global analysis, "may
 // kill" is not accurate, here we in fact record the "definitely kill".
-void G4_BB_SB::setSendOpndMayKilled(LiveGRFBuckets *globalSendsLB,
-                                    SBNODE_VECT &SBNodes, PointsToAnalysis &p) {
-  std::vector<SBBucketDesc> BDvec;
+void G4_BB_SB::setSendOpndMayKilled(SBNODE_VECT &SBNodes, PointsToAnalysis &p,
+                                    BucketInfos &bucketInfos) {
   if (first_node == INVALID_ID) {
     return;
   }
 
+  std::vector<SBBucketDesc> BDvec;
   bool addGlobalSLMWARWA = false;
   for (int i = first_node; i <= last_node; i++) {
-    SBNode *node = SBNodes[i];
-    G4_INST *curInst = node->GetInstruction();
+    auto *node = SBNodes[i];
+    const auto *curInst = node->GetInstruction();
+    const auto *lastInst = node->getLastInstruction();
+    const auto isSend = node->getLastInstruction()->isSend();
+    const auto *topDcl = (!isSend) ? nullptr : lastInst->getDst()->getTopDcl();
 
     if (curInst->isLabel()) {
       continue;
@@ -5543,51 +5505,52 @@ void G4_BB_SB::setSendOpndMayKilled(LiveGRFBuckets *globalSendsLB,
     }
 
     // For all bucket descriptors of curInst
-    for (const SBBucketDesc &BD : BDvec) {
-      const int &curBucket = BD.bucket;
-      const Gen4_Operand_Number &curOpnd = BD.opndNum;
-      const SBFootprint *curFootprint = BD.footprint;
+    for (const auto &BD : BDvec) {
+      const auto &curBucket = BD.bucket;
+      const auto &curOpnd = BD.opndNum;
+      const auto *curFootprint = BD.footprint;
 
-      for (LiveGRFBuckets::BN_iterator bn_it = globalSendsLB->begin(curBucket);
-           bn_it != globalSendsLB->end(curBucket);) {
-        SBBucketNode *liveBN = (*bn_it);
-        SBNode *curLiveNode = liveBN->node;
-        Gen4_Operand_Number liveOpnd = liveBN->opndNum;
-        const SBFootprint *liveFootprint = liveBN->footprint;
-        G4_INST *liveInst = liveFootprint->inst;
+      for (const auto &nodeInfo : bucketInfos[curBucket]) {
+        const auto& globalID = nodeInfo.globalID;
 
         // Send operands are all GRF aligned, there is no overlap checking
         // required. Fix me, this is not right, for math instruction, less than
         // 1 GRF may happen. Find DEP type
         unsigned short internalOffset = 0;
-        DepType dep = getDepForOpnd(liveOpnd, curOpnd);
-        bool hasOverlap =
-            curFootprint->hasOverlap(liveFootprint, internalOffset);
+        DepType dep = getDepForOpnd(nodeInfo.liveOpnd, curOpnd);
+
+        // Early exit if current live node is already marked as killed.
+        if ((dep == WAR && send_may_kill.isSrcSet(globalID)) ||
+            (dep == RAW && send_may_kill.isDstSet(globalID)) ||
+            (dep == WAW && send_may_kill.isDstSet(globalID) &&
+             send_WAW_may_kill.test(globalID))) {
+          continue;
+        }
+
+        auto hasOverlap =
+            curFootprint->hasOverlap(nodeInfo.liveFootprint, internalOffset);
+
         if (!hasOverlap && dep == RAW) {
-          hasOverlap = hasExtraOverlap(liveInst, curInst, liveFootprint,
-                                       curFootprint, curOpnd, &builder);
+          hasOverlap = hasExtraOverlap(nodeInfo.liveInst, curInst,
+                                       nodeInfo.liveFootprint, curFootprint,
+                                       curOpnd, &builder);
         }
 
         if (!hasOverlap) {
-          ++bn_it;
           continue;
         }
-
-        // Exclusive WAW has no overlap
-        if (isExclusiveLoad(curLiveNode, node, dep)) {
-          ++bn_it;
-          continue;
-        }
-
         // For SBID global liveness analysis, both explicit and implicit kill
         // counted.
-        if (dep == RAW || dep == WAW) {
-          send_may_kill.setDst(curLiveNode->globalID, true);
-          if (dep == WAW) {
-            send_WAW_may_kill.set(curLiveNode->globalID);
-          }
-        } else if (dep == WAR && WARDepRequired(liveInst, curFootprint->inst)) {
-          send_may_kill.setSrc(curLiveNode->globalID, true);
+        if (dep == WAR &&
+            WARDepRequired(nodeInfo.liveInst, curFootprint->inst)) {
+          send_may_kill.src.set(globalID);
+        } else if (dep == RAW) {
+          send_may_kill.dst.set(globalID);
+          // Exclusive WAW has no overlap
+        } else if (dep == WAW && (isSend || !isDclExclusiveLoad(
+                                                nodeInfo.topDeclare, topDcl))) {
+          send_may_kill.dst.set(globalID);
+          send_WAW_may_kill.set(globalID);
         }
 
         // FIXME: for NODEP, there is optimization chance.
@@ -5610,28 +5573,20 @@ void G4_BB_SB::setSendOpndMayKilled(LiveGRFBuckets *globalSendsLB,
         // }
 
         vISA_ASSERT(dep != DEPTYPE_MAX, "dep unassigned?");
-        ++bn_it;
       }
     }
-
     if (!addGlobalSLMWARWA && builder.hasSLMWARIssue() && curInst->isSend() &&
         (isSLMMsg(curInst) &&
          (curInst->getDst() == nullptr || isFence(curInst)))) {
-      for (int curBucket = 0; curBucket < globalSendsLB->getNumOfBuckets();
-           curBucket++) {
-        for (LiveGRFBuckets::BN_iterator bn_it =
-                 globalSendsLB->begin(curBucket);
-             bn_it != globalSendsLB->end(curBucket);) {
-          SBBucketNode *liveBN = (*bn_it);
-          SBNode *curLiveNode = liveBN->node;
-          G4_INST *liveInst = liveBN->footprint->inst;
+      for (const auto &bucket : bucketInfos) {
+        for (const auto &nodeInfo : bucket) {
+          G4_INST *liveInst = nodeInfo.liveInst;
 
           if (liveInst->isSend() && isSLMMsg(liveInst) &&
               liveInst->getDst() != nullptr &&
               !liveInst->getDst()->isNullReg()) {
-            send_may_kill.setDst(curLiveNode->globalID, true);
+            send_may_kill.setDst(nodeInfo.globalID, true);
           }
-          ++bn_it;
         }
       }
       addGlobalSLMWARWA = true;
@@ -6185,20 +6140,20 @@ void G4_BB_SB::footprintMerge(SBNode *node, const SBNode *nextNode) {
 bool G4_BB_SB::hasInternalDependenceWithinDPAS(SBNode *node) const {
   const SBFootprint *dstfp = node->getFirstFootprint(Opnd_dst);
 
+  auto isDstSrc0DepException = [&](const SBFootprint *dstfp,
+                                   const SBFootprint *src0fp) -> bool {
+    return dstfp->LeftB == src0fp->LeftB && dstfp->RightB == src0fp->RightB;
+  };
+
   for (Gen4_Operand_Number opndNum :
        {Opnd_src0, Opnd_src1, Opnd_src2, Opnd_src3, Opnd_src4}) {
     const SBFootprint *srcfp = node->getFirstFootprint(opndNum);
     unsigned short internalOffset = 0;
     if (dstfp->hasOverlap(srcfp, internalOffset)) {
-
       // It's allowed that dst and src0 share same registers (not internal dep).
       // But not including partial overlap.
-      if (opndNum == Opnd_src0) {
-        if ((dstfp->LeftB == srcfp->LeftB) &&
-            (dstfp->RightB == srcfp->RightB)) {
-          continue;
-        }
-      }
+      if (opndNum == Opnd_src0 && isDstSrc0DepException(dstfp, srcfp))
+        continue;
       return true;
     }
   }
@@ -6505,7 +6460,7 @@ bool G4_BB_SB::is2xFPBlockCandidate(G4_INST *inst, bool accDST) {
   return true;
 }
 
-bool G4_BB_SB::hasExtraOverlap(G4_INST *liveInst, G4_INST *curInst,
+bool G4_BB_SB::hasExtraOverlap(const G4_INST *liveInst, const G4_INST *curInst,
                                const SBFootprint *liveFootprint,
                                const SBFootprint *curFootprint,
                                const Gen4_Operand_Number curOpnd,

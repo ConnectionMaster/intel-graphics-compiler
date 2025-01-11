@@ -24,6 +24,7 @@ set(OPT_SOURCES
   CMTrans/GenXTypeLegalization.cpp
   CMTrans/GenXCloneIndirectFunctions.cpp
   CMTrans/GenXLinkageCorruptor.cpp
+  CMPacketize/GenXLegalizeGVLoadUses.cpp
   CMPacketize/GenXPacketize.cpp
   CMPacketize/PacketBuilder.cpp
   CMPacketize/PacketBuilder_math.cpp
@@ -32,6 +33,16 @@ set(OPT_SOURCES
 )
 
 add_library(VCTransforms OBJECT ${OPT_SOURCES})
+
+add_dependencies(VCTransforms
+  GenXUtilBuild
+  GenXCommonTableGen_target
+  )
+
+target_include_directories(VCTransforms
+  PRIVATE
+  ${CMAKE_CURRENT_BINARY_DIR}/../GenXCodeGen/
+  )
 
 igc_get_llvm_targets(LLVM_LIBS
   Analysis
@@ -53,3 +64,11 @@ target_link_libraries(VCTransforms
   LLVMGenXIntrinsics
   VCInternalIntrinsics
   )
+
+if (LLVM_VERSION_MAJOR GREATER 15)
+target_include_directories(VCTransforms
+  PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/../GenXCodeGen/"
+  "${CMAKE_CURRENT_BINARY_DIR}/../../lib/GenXCodeGen/"
+  )
+endif()

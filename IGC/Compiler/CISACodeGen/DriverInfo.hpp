@@ -69,9 +69,6 @@ namespace IGC
         ///   registry allocation)
         virtual bool supportsSeparatingSpillAndPrivateScratchMemorySpace() const { return IGC_IS_FLAG_ENABLED(SeparateSpillPvtScratchSpace); }
 
-        /// The max size in bytes of the scratch space per thread.
-        unsigned int maxPerThreadScratchSpace() const { return 2 * 1024 * 1024; }
-
         /// The driver Uses special states to push constants beyond index 256
         virtual bool Uses3DSTATE_DX9_CONSTANT() const { return false; }
 
@@ -383,6 +380,8 @@ namespace IGC
 
         // Informs if the UMD understands atomic pull tile walk for raytracing
         virtual bool supportsAtomicPullSWTileWalk() const { return false; }
+
+        virtual bool supportsUniformPrivateMemorySpace() const { return false; }
 protected:
     bool autoGRFSelection = false;
     };

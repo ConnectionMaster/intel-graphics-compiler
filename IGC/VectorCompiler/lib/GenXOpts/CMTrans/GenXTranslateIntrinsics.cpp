@@ -25,7 +25,7 @@ SPDX-License-Identifier: MIT
 #include <llvm/Pass.h>
 #include <llvm/Support/Debug.h>
 
-#define DEBUG_TYPE "genx-translate-intrinsics"
+#define DEBUG_TYPE "GenXTranslateIntrinsics"
 
 using namespace llvm;
 
@@ -73,10 +73,22 @@ INITIALIZE_PASS_BEGIN(GenXTranslateIntrinsics, "GenXTranslateIntrinsics",
 INITIALIZE_PASS_END(GenXTranslateIntrinsics, "GenXTranslateIntrinsics",
                     "GenXTranslateIntrinsics", false, false)
 
-FunctionPass *llvm::createGenXTranslateIntrinsicsPass() {
+namespace llvm {
+FunctionPass *createGenXTranslateIntrinsicsPass() {
   initializeGenXTranslateIntrinsicsPass(*PassRegistry::getPassRegistry());
   return new GenXTranslateIntrinsics;
 }
+} // namespace llvm
+
+#if LLVM_VERSION_MAJOR >= 16
+PreservedAnalyses
+GenXTranslateIntrinsicsPass::run(Function &F, FunctionAnalysisManager &AM) {
+  GenXTranslateIntrinsics GenXTrans;
+  if (GenXTrans.runOnFunction(F))
+    return PreservedAnalyses::none();
+  return PreservedAnalyses::all();
+}
+#endif
 
 bool GenXTranslateIntrinsics::runOnFunction(Function &F) {
   LLVM_DEBUG(dbgs() << "GenXTranslateIntrinsics started\n");

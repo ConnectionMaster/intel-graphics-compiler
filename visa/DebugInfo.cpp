@@ -9,10 +9,10 @@ SPDX-License-Identifier: MIT
 #include "DebugInfo.h"
 
 #include "Assertions.h"
-#include "BitSet.h"
 #include "BuildIR.h"
 #include "Common_ISA_framework.h"
 #include "FlowGraph.h"
+#include "G4_BB.hpp"
 #include "G4_IR.hpp"
 #include "VISAKernel.h"
 
@@ -421,6 +421,24 @@ int DbgDecoder::ddDbg() {
     } else {
       std::cout << "Return addr not stored";
     }
+
+    std::cout << "\n";
+
+    uint16_t CEOffset = 0;
+    uint16_t CEIP = 0;
+    retval = fread(&CEOffset, sizeof(uint16_t), 1, dbgFile);
+    if (!retval)
+      return -1;
+    retval = fread(&CEIP, sizeof(uint16_t), 1, dbgFile);
+    if (!retval)
+      return -1;
+
+    if (CEOffset != 0xffff) {
+      std::cout << "CE saved at: FP + " << (uint16_t)CEOffset << " from IP "
+                << CEIP << "\n";
+    }
+    else
+      std::cout << "CE not saved\n";
 
     std::cout << "\n";
 
@@ -1352,6 +1370,22 @@ void emitDataCallFrameInfo(VISAKernelImpl *visaKernel, T &t) {
     emitDataUInt8((uint8_t)0, t);
   }
 
+  if (kernel->getOption(vISA_storeCE) &&
+      kernel->getKernelDebugInfo()->getCESaveInst()) {
+    uint16_t FPOffset = kernel->getKernelDebugInfo()->getCESaveOffset();
+    emitDataUInt16(FPOffset, t);
+    auto GenOffset =
+        kernel->getKernelDebugInfo()->getCESaveInst()->getGenOffset() +
+        getBinInstSize(kernel->getKernelDebugInfo()->getCESaveInst()) -
+        kernel->getKernelDebugInfo()->getRelocOffset();
+    vISA_ASSERT(GenOffset <= std::numeric_limits<uint16_t>::max(),
+                "GenOffset is OOB");
+    emitDataUInt16((uint16_t)GenOffset, t);
+  } else {
+    emitDataUInt16(-1, t);
+    emitDataUInt16(0, t);
+  }
+
   emitDataCalleeSave(visaKernel, t);
 
   emitDataCallerSave(visaKernel, t);
@@ -1522,6 +1556,8 @@ KernelDebugInfo::KernelDebugInfo() : varNameMapAlloc(4096) {
   fretVar = nullptr;
   reloc_offset = 0;
   missingVISAIdsComputed = false;
+  saveCE = nullptr;
+  CEStoreOffset = 0;
 }
 
 void KernelDebugInfo::updateRelocOffset() {
@@ -1890,75 +1926,83 @@ void KernelDebugInfo::updateCallStackLiveIntervals() {
 }
 
 void KernelDebugInfo::updateExpandedIntrinsic(G4_InstIntrinsic *spillOrFill,
-                                              G4_INST *inst) {
+                                              INST_LIST &insts) {
   // This function looks up all caller/callee save code added.
   // Once it finds "spillOrFill", it adds inst to it. This is
   // because VISA now uses spill/fill intrinsics to model
   // save/restore. These intrinsics are expanded after RA is
   // done. So this method gets invoked after RA is done and
   // when intrinsics are expanded.
-  for (auto &k : callerSaveRestore) {
-    for (auto it = k.second.first.begin(); it != k.second.first.end(); ++it) {
-      if ((*it) == spillOrFill) {
-        k.second.first.insert(it, inst);
-        return;
+
+  auto cacheIt = isSaveRestoreInst.find(spillOrFill);
+
+  if (cacheIt == isSaveRestoreInst.end()) {
+    if (spillOrFill == getCallerBEFPRestoreInst()) {
+      // caller be fp restore is a fill intrinsic that reads from FDE. it is
+      // expanded to a regular fill instruction. so update the pointer to new
+      // instruction.
+      setCallerBEFPRestoreInst(insts.back());
+    }
+
+    if (spillOrFill == getCallerSPRestoreInst()) {
+      setCallerSPRestoreInst(insts.back());
+    }
+
+    if (spillOrFill == getCallerBEFPSaveInst()) {
+      setCallerBEFPSaveInst(insts.back());
+    }
+
+    if (spillOrFill == getCESaveInst()) {
+      for (auto *inst : insts) {
+        if (inst->isSend()) {
+          setSaveCEInst(inst);
+        }
       }
     }
-
-    for (auto it = k.second.second.begin(); it != k.second.second.end(); ++it) {
-      if ((*it) == spillOrFill) {
-        k.second.second.insert(it, inst);
-        return;
-      }
-    }
+    return;
   }
 
-  for (auto it = calleeSaveRestore.first.begin();
-       it != calleeSaveRestore.first.end(); ++it) {
+  // We use isSaveRestoreInst map to determine if target spillOrFill instruction is part of
+  // callee/callerSaveRestore and is it in save or restore vector.
+  auto &[save, restore] = (cacheIt->second.bb == nullptr)
+                              ? calleeSaveRestore
+                              : callerSaveRestore[cacheIt->second.bb];
+  auto &target = (cacheIt->second.isSave) ? save : restore;
+
+  for (auto it = target.begin(); it != target.end(); ++it) {
     if ((*it) == spillOrFill) {
-      calleeSaveRestore.first.insert(it, inst);
+      target.insert(it, insts.begin(), insts.end());
       return;
     }
-  }
-
-  for (auto it = calleeSaveRestore.second.begin();
-       it != calleeSaveRestore.second.end(); ++it) {
-    if ((*it) == spillOrFill) {
-      calleeSaveRestore.second.insert(it, inst);
-      return;
-    }
-  }
-
-  if (spillOrFill == getCallerBEFPRestoreInst()) {
-    // caller be fp restore is a fill intrinsic that reads from FDE. it is
-    // expanded to a regular fill instruction. so update the pointer to new
-    // instruction.
-    setCallerBEFPRestoreInst(inst);
-  }
-
-  if (spillOrFill == getCallerSPRestoreInst()) {
-    setCallerSPRestoreInst(inst);
-  }
-
-  if (spillOrFill == getCallerBEFPSaveInst()) {
-    setCallerBEFPSaveInst(inst);
   }
 }
 
 void KernelDebugInfo::addCallerSaveInst(G4_BB *fcallBB, G4_INST *inst) {
   callerSaveRestore[fcallBB].first.push_back(inst);
+  if (inst->isIntrinsic()) {
+    isSaveRestoreInst.insert({inst, {true, fcallBB}});
+  }
 }
 
 void KernelDebugInfo::addCallerRestoreInst(G4_BB *fcallBB, G4_INST *inst) {
   callerSaveRestore[fcallBB].second.push_back(inst);
+  if (inst->isIntrinsic()) {
+    isSaveRestoreInst.insert({inst, {false, fcallBB}});
+  }
 }
 
 void KernelDebugInfo::addCalleeSaveInst(G4_INST *inst) {
   calleeSaveRestore.first.push_back(inst);
+  if (inst->isIntrinsic()) {
+    isSaveRestoreInst.insert({inst, {true, nullptr}});
+  }
 }
 
 void KernelDebugInfo::addCalleeRestoreInst(G4_INST *inst) {
   calleeSaveRestore.second.push_back(inst);
+  if (inst->isIntrinsic()) {
+    isSaveRestoreInst.insert({inst, {false, nullptr}});
+  }
 }
 
 std::vector<G4_INST *> &KernelDebugInfo::getCallerSaveInsts(G4_BB *fcallBB) {
@@ -1995,11 +2039,10 @@ bool KernelDebugInfo::isFcallWithSaveRestore(G4_BB *bb) {
 // return a new list.
 INST_LIST KernelDebugInfo::getDeltaInstructions(G4_BB *bb) {
   INST_LIST deltaInsts;
-  for (auto instIt = bb->begin(); instIt != bb->end(); instIt++)
-    deltaInsts.push_back(*instIt);
-
-  for (auto oldInstsIt : oldInsts) {
-    deltaInsts.remove(oldInstsIt);
+  for (auto *inst : bb->getInstList()) {
+    if (oldInsts.count(inst) == 0) {
+      deltaInsts.push_back(inst);
+    }
   }
 
   return deltaInsts;

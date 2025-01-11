@@ -281,14 +281,17 @@ DECLARE_OPCODE(GenISA_pair_to_ptr, GenISAIntrinsic, llvm_pair_to_ptr, false, fal
 
 // Wave intrinsics
 DECLARE_OPCODE(GenISA_WaveBallot, GenISAIntrinsic, llvm_waveBallot, false, false, false, false, false, false, false)
+DECLARE_OPCODE(GenISA_WaveClusteredBallot, GenISAIntrinsic, llvm_waveClusteredBallot, false, false, false, false, false, false, false)
 DECLARE_OPCODE(GenISA_WaveAll, GenISAIntrinsic, llvm_waveAll, false, false, false, false, false, false, false)
 DECLARE_OPCODE(GenISA_WaveClustered, GenISAIntrinsic, llvm_waveClustered, false, false, false, false, false, false, false)
 DECLARE_OPCODE(GenISA_WaveInterleave, GenISAIntrinsic, llvm_waveInterleave, false, false, false, false, false, false, false)
 DECLARE_OPCODE(GenISA_WaveClusteredInterleave, GenISAIntrinsic, llvm_waveClusteredInterleave, false, false, false, false, false, false, false)
 DECLARE_OPCODE(GenISA_WavePrefix, GenISAIntrinsic, llvm_wavePrefix, false, false, false, false, false, false, false)
 DECLARE_OPCODE(GenISA_QuadPrefix, GenISAIntrinsic, llvm_quadPrefix, false, false, false, false, false, false, false)
+DECLARE_OPCODE(GenISA_WaveClusteredPrefix, GenISAIntrinsic, llvm_waveClusteredPrefix, false, false, false, false, false, false, false)
 DECLARE_OPCODE(GenISA_WaveShuffleIndex, GenISAIntrinsic, llvm_waveShuffleIndex, false, false, false, false, false, false, false)
 DECLARE_OPCODE(GenISA_WaveBroadcast, GenISAIntrinsic, llvm_waveBroadcast, false, false, false, false, false, false, false)
+DECLARE_OPCODE(GenISA_WaveClusteredBroadcast, GenISAIntrinsic, llvm_waveClusteredBroadcast, false, false, false, false, false, false, false)
 
 // Unmasked region
 DECLARE_OPCODE(GenISA_UnmaskedRegionBegin, GenISAIntrinsic, llvm_unmaskedBegin, false, false, false, false, false, false, false)

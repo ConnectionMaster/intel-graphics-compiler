@@ -1005,9 +1005,14 @@ Instruction* LSCFuncsResolution::CreateSubGroup2DBlockOperation(llvm::CallInst& 
             {
                 tileWidth = 2;
             }
+            // equals is used to differentiate between k1 and k1[0-9], if needed
+            else if (funcName.equals_insensitive("k1"))
+            {
+                tileWidth = 1;
+            }
             else
             {
-                IGC_ASSERT_MESSAGE(0, "Transpose with 32 bit element size only supports width 8.");
+                IGC_ASSERT_MESSAGE(0, "Transpose with 32 bit element size only supports width: 1, 2, 4, 8.");
                 return nullptr;
             }
         }
@@ -1383,7 +1388,7 @@ Instruction* LSCFuncsResolution::CreateLSCFenceIntrinsicCallInst() {
     }
 
     Function *lscFunc = GenISAIntrinsic::getDeclaration(
-        m_pCurrInstFunc->getParent(), GenISAIntrinsic::GenISA_LSCFence, None);
+        m_pCurrInstFunc->getParent(), GenISAIntrinsic::GenISA_LSCFence, {});
     Instruction* lscCall = CallInst::Create(lscFunc, args, "", m_pCurrInst);
     return lscCall;
 }
@@ -1410,7 +1415,7 @@ Instruction* LSCFuncsResolution::CreateLSCFenceEvictToMemory()
     };
 
     Function* lscFunc = GenISAIntrinsic::getDeclaration(
-        m_pCurrInstFunc->getParent(), GenISAIntrinsic::GenISA_LSCFence, None);
+        m_pCurrInstFunc->getParent(), GenISAIntrinsic::GenISA_LSCFence, {});
     Instruction* lscCall = CallInst::Create(lscFunc, args, "", m_pCurrInst);
 
     if (context->platform.getPlatformInfo().eRenderCoreFamily == IGFX_XE_HPG_CORE)

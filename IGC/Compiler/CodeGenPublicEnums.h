@@ -96,6 +96,8 @@ namespace IGC
         SSH_BINDLESS,
         SSH_BINDLESS_CONSTANT_BUFFER,
         SSH_BINDLESS_TEXTURE,
+        BINDLESS_READONLY,
+        BINDLESS_WRITEONLY,
         BUFFER_TYPE_UNKNOWN
     };
 
@@ -190,6 +192,7 @@ namespace IGC
     enum GroupOpType
     {
         GroupOperationScan,
+        GroupOperationClusteredScan,
         GroupOperationReduce,
         GroupOperationClusteredReduce,
         GroupOperationInterleaveReduce
@@ -343,13 +346,6 @@ namespace IGC
         RTX_GLOBAL_BUFFER_PTR,
 
         NUM_ARG_SPACE_RESERVATION_SLOTS
-    };
-
-    enum class SYNC_DISPATCH_RAYS_MODE : unsigned char {
-        DISABLED,
-        FULLY_INLINED,
-        FUNCTION_CALLS,
-        BTD_PER_SHADER_RECORD,
     };
 }
 

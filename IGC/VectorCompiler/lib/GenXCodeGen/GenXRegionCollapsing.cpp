@@ -54,6 +54,7 @@ SPDX-License-Identifier: MIT
 #include "llvm/Transforms/Utils/Local.h"
 
 #include "llvmWrapper/IR/DerivedTypes.h"
+#include "vc/GenXCodeGen/GenXRegionCollapsing.h"
 
 #define DEBUG_TYPE "GENX_RegionCollapsing"
 
@@ -70,7 +71,8 @@ class GenXRegionCollapsing : public FunctionPass {
 
 public:
   static char ID;
-  explicit GenXRegionCollapsing() : FunctionPass(ID) {}
+  explicit GenXRegionCollapsing(DominatorTree *DT = nullptr)
+      : DT(DT), FunctionPass(ID) {}
   StringRef getPassName() const override { return "GenX Region Collapsing"; }
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.addRequired<DominatorTreeWrapperPass>();
@@ -109,6 +111,16 @@ char GenXRegionCollapsing::ID = 0;
 namespace llvm {
 void initializeGenXRegionCollapsingPass(PassRegistry &);
 }
+#if LLVM_VERSION_MAJOR >= 16
+llvm::PreservedAnalyses
+GenXRegionCollapsingPass::run(Function &F, FunctionAnalysisManager &AM) {
+  auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
+  GenXRegionCollapsing GenXRegCollaps(&DT);
+  if (GenXRegCollaps.runOnFunction(F))
+    return PreservedAnalyses::none();
+  return PreservedAnalyses::all();
+}
+#endif // LLVM_VERSION_MAJOR >= 16
 INITIALIZE_PASS_BEGIN(GenXRegionCollapsing, "GenXRegionCollapsing",
                       "GenXRegionCollapsing", false, false)
 INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
@@ -126,7 +138,8 @@ FunctionPass *llvm::createGenXRegionCollapsingPass() {
  */
 bool GenXRegionCollapsing::runOnFunction(Function &F) {
   DL = &F.getParent()->getDataLayout();
-  DT = &getAnalysis<DominatorTreeWrapperPass>().getDomTree();
+  if (!DT)
+    DT = &getAnalysis<DominatorTreeWrapperPass>().getDomTree();
 
   // Track if there is any modification to the function.
   bool Changed = false;
@@ -342,8 +355,8 @@ static Value *createBitCastToElementType(Value *Input, Type *ElementTy,
                                          const DebugLoc &DbgLoc) {
   unsigned ElBytes = vc::getTypeSize(ElementTy, &DL).inBytes();
   unsigned InputBytes = vc::getTypeSize(Input->getType(), &DL).inBytes();
-  IGC_ASSERT_MESSAGE(!(InputBytes & (ElBytes - 1)),
-                     "non-integral number of elements");
+  if (InputBytes % ElBytes != 0)
+    return nullptr;
   auto Ty = IGCLLVM::FixedVectorType::get(ElementTy, InputBytes / ElBytes);
   return createBitCast(Input, Ty, Name, InsertBefore, DbgLoc);
 }
@@ -645,11 +658,15 @@ void GenXRegionCollapsing::processRdRegion(Instruction *InnerRd) {
         OuterRd->getOperand(GenXIntrinsic::GenXRegion::OldValueOperandNum);
     // InnerR.ElementTy not always equal to InnerRd->getType()->getScalarType()
     // (look above)
-    if (InnerR.ElementTy != OuterRd->getType()->getScalarType())
+    if (InnerR.ElementTy != OuterRd->getType()->getScalarType()) {
       Input = createBitCastToElementType(Input, InnerR.ElementTy,
                                          Input->getName() +
                                              ".bitcast_before_collapse",
                                          OuterRd, *DL, OuterRd->getDebugLoc());
+      if (!Input)
+        return;
+    }
+
     // Create the combined rdregion.
     Instruction *CombinedRd = CombinedR.createRdRegion(
         Input, InnerRd->getName() + ".regioncollapsed", InnerRd,

@@ -1444,9 +1444,17 @@ bool hasBarrierControlFlowOpt() const
     return enabled;
 }
 
+bool needWaSamplerNoMask() const
+{
+    return m_WaTable.Wa_22011157800 && !IGC_IS_FLAG_DISABLED(DiableWaSamplerNoMask);
+}
+
 bool hasSlowSameSBIDLoad() const
 {
-    return isCoreChildOf(IGFX_XE2_HPG_CORE);
+    bool bYes = false;
+    bYes = isCoreChildOf(IGFX_XE_HPG_CORE);
+
+    return bYes && !needWaSamplerNoMask();
 }
 
 bool canDoMultipleLineMOVOpt() const
@@ -1612,10 +1620,8 @@ bool enableMultiGRFAccessWA() const
 // Return true if platform has structured control-flow instructions and IGC wants to use them.
 bool hasSCF() const
 {
-    bool doscf = true;
     // DG2 and PVC still has SCF, but igc will stop using them.
-    doscf = !isProductChildOf(IGFX_DG2);
-    return doscf;
+    return !isProductChildOf(IGFX_DG2);
 }
 
 const SCompilerHwCaps& GetCaps() { return m_caps; }
@@ -1805,7 +1811,6 @@ bool allowDivergentControlFlowRayQueryCheckRelease() const
 
 bool allowProceedBasedApproachForRayQueryDynamicRayManagementMechanism() const
 {
-
     return IGC_IS_FLAG_DISABLED(DisableProceedBasedApproachForRayQueryDynamicRayManagementMechanism);
 }
 

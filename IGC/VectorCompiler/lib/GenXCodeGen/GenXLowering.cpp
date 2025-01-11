@@ -122,6 +122,7 @@ SPDX-License-Identifier: MIT
 
 #include "vc/Support/GenXDiagnostic.h"
 #include "vc/Utils/GenX/GlobalVariable.h"
+#include "vc/Utils/GenX/InternalMetadata.h"
 
 #include "Probe/Assertion.h"
 #include <algorithm>
@@ -2166,6 +2167,10 @@ bool GenXLowering::processInst(Instruction *Inst) {
       return lowerHardwareThreadID(CI);
     case vc::InternalIntrinsic::logical_thread_id:
       return lowerLogicalThreadID(CI);
+    case vc::InternalIntrinsic::optimization_fence:
+      CI->replaceAllUsesWith(CI->getOperand(0));
+      ToErase.push_back(CI);
+      return true;
     case GenXIntrinsic::genx_nbarrier_arrive:
       return lowerNamedBarrierArrive(CI);
     case GenXIntrinsic::genx_dpas:
@@ -4794,6 +4799,9 @@ bool GenXLowering::lowerHardwareThreadID(CallInst *CI) {
     Res = IRB.CreateAnd(Res, MaskC);
   }
 
+  CI->getModule()->getOrInsertNamedMetadata(
+      vc::FunctionMD::VCDisableMidThreadPreemption);
+
   CI->replaceAllUsesWith(Res);
   ToErase.push_back(CI);
   return true;
@@ -5009,6 +5017,8 @@ bool GenXLowering::lowerReduction(CallInst *CI, Value *Src, Value *Start,
     IGC_ASSERT_EXIT(TailIndex);
     TailWidth = SrcWidth % TailIndex;
     SrcWidth = TailIndex;
+  } else {
+    TailWidth = 0;
   }
 
   for (SrcWidth /= 2; SrcWidth > 0; SrcWidth /= 2) {

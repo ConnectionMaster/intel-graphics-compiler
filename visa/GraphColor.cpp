@@ -2987,6 +2987,15 @@ bool Augmentation::updateDstMaskForGatherRaw(G4_INST *inst,
   SFID funcID = msgDesc->getFuncId();
 
   switch (funcID) {
+  case SFID::RTHW:
+    // Mark RT send dst to be NonDefault, even when it doesn't have WriteEnable
+    if (kernel.getPlatform() >= Xe2) {
+      for (auto &elem : mask)
+        elem = NOMASK_BYTE;
+      return true;
+    }
+    break;
+
   case SFID::DP_DC1:
     switch (msgDesc->getHdcMessageType()) {
     case DC1_A64_SCATTERED_READ: // a64 scattered read: svm_gather
@@ -4250,6 +4259,163 @@ void Augmentation::handleNonReducibleExtension(FuncInfo *funcInfo) {
   }
 }
 
+std::unordered_set<G4_BB *>
+Augmentation::getAllJIPTargetBBs(FuncInfo *funcInfo) {
+  // Any BB that has join as first non-label instruction is a JIP target.
+  std::unordered_set<G4_BB *> JIPTargetBBs;
+
+  for (auto *BB : funcInfo->getBBList()) {
+    if (BB->empty())
+      continue;
+    auto InstIt = BB->begin();
+    if ((*InstIt)->isLabel())
+      ++InstIt;
+    if (InstIt != BB->end() && (*InstIt)->opcode() == G4_join)
+      JIPTargetBBs.insert(BB);
+  }
+
+  return JIPTargetBBs;
+}
+
+std::vector<std::pair<G4_BB *, G4_BB *>>
+Augmentation::getNonLoopBackEdges(FuncInfo *funcInfo) {
+  auto &LoopBackEdges = kernel.fg.getAllNaturalLoops();
+  std::vector<std::pair<G4_BB *, G4_BB *>> NonLoopBackEdges;
+
+  for (auto *BB : funcInfo->getBBList()) {
+    if (BB->empty())
+      continue;
+    if (BB->back()->opcode() != G4_jmpi && BB->back()->opcode() != G4_goto)
+      continue;
+    auto LastInstLexId = BB->back()->getLexicalId();
+    for (auto *Succ : BB->Succs) {
+      vISA_ASSERT(!Succ->empty(), "expecting non-empty succ BB");
+      auto SuccInstLexId = Succ->front()->getLexicalId();
+      // Forward edge
+      if (SuccInstLexId > LastInstLexId)
+        continue;
+      // Check if this is a loop edge
+      auto Edge = std::pair(BB, Succ);
+      if (LoopBackEdges.find(Edge) == LoopBackEdges.end())
+        NonLoopBackEdges.push_back(Edge);
+    }
+  }
+
+  return NonLoopBackEdges;
+}
+
+void Augmentation::handleNonLoopBackEdges(FuncInfo *funcInfo) {
+
+  // up:
+  // (W) P5 =
+  // ...
+  // goto Later
+  // ...
+  // <other BBs>
+  // join down
+  //
+  // BB1:
+  // P21 = ...
+  // (P38) goto down
+  //
+  // otherBB:
+  // ...
+  // (W) jmpi (M1, 1) up
+  //
+  // down:
+  // = P21
+  //
+  // Later:
+  //
+  // In above snippet, following path may be taken:
+  // BB1, otherBB, up, down, Later
+  //
+  // P21 is defined in BB1. If P5 uses same register
+  // then it can clobber P21 before it gets used in
+  // down. So P5 and P21 intervals must overlap.
+  //
+  // If we've a non-loop backedge in an interval and if
+  // there's an incoming JIP edge within that interval
+  // then it means we should extend the interval up to
+  // the backedge destination. In above snippet, it means
+  // extending P21 to "up" so that it overlaps with P5.
+
+  auto AllJIPTargetBBs = getAllJIPTargetBBs(funcInfo);
+
+  // Return true if there's any JIP incoming edge within interval
+  auto hasIncomingJIPEdge = [&AllJIPTargetBBs](const vISA::Interval &Interval) {
+    for (auto *JIPTargetBB : AllJIPTargetBBs) {
+      vISA::Interval Temp(JIPTargetBB->front(), JIPTargetBB->front());
+      if (Interval.intervalsOverlap(Temp))
+        return true;
+    }
+    return false;
+  };
+
+  auto NonLoopBackEdges = getNonLoopBackEdges(funcInfo);
+  if (NonLoopBackEdges.empty()) {
+    VISA_DEBUG_VERBOSE({ std::cout << "No non-loop backedges found\n"; });
+    return;
+  }
+
+  auto getNonLoopBackEdgesInInterval =
+      [&NonLoopBackEdges](const vISA::Interval &Interval) {
+        std::vector<std::pair<G4_BB *, G4_BB *>> NonLoopBackEdgesInInterval;
+
+        for (auto &NonLoopBackEdge : NonLoopBackEdges) {
+          vISA::Interval Temp(NonLoopBackEdge.first->back(),
+                              NonLoopBackEdge.first->back());
+          if (Interval.intervalsOverlap(Temp))
+            NonLoopBackEdgesInInterval.push_back(NonLoopBackEdge);
+        }
+
+        return NonLoopBackEdgesInInterval;
+      };
+
+  for (G4_Declare *Dcl : kernel.Declares) {
+    auto &All = gra.getAllIntervals(Dcl);
+    // We shouldn't need to consider special variables like args, retval.
+    // Because such variables are not defined/used in same function.
+    if (All.size() != 1)
+      continue;
+    auto &Interval = All[0];
+    bool Change = false;
+    // Handle transitive backwards branches
+    // TODO: Handle forward branch from interval that later jump backwards
+    // and cause JIP edge to be taken in the middle of the interval.
+    do {
+      Change = false;
+      auto Start = Interval.start;
+      if (hasSubroutines && instToFunc[Start->getLexicalId()] != funcInfo)
+        continue;
+      if (!hasIncomingJIPEdge(Interval))
+        continue;
+      std::vector<std::pair<G4_BB *, G4_BB *>> NonLoopBackEdges =
+          getNonLoopBackEdgesInInterval(Interval);
+
+      for (auto &NonLoopBackEdge : NonLoopBackEdges) {
+        if (NonLoopBackEdge.second) {
+          vISA_ASSERT(NonLoopBackEdge.second->size() > 0,
+                      "expecting backedge target to be non-empty");
+          auto StartLexId = Interval.start->getLexicalId();
+          if (StartLexId > NonLoopBackEdge.second->front()->getLexicalId()) {
+            VISA_DEBUG_VERBOSE({
+              std::cout << "Updating start interval for " << Dcl->getName()
+                        << " from " << StartLexId << " to "
+                        << NonLoopBackEdge.second->front()->getLexicalId()
+                        << " - ";
+              NonLoopBackEdge.second->front()->dump();
+            });
+            auto OldInterval = Interval;
+            updateStartInterval(Dcl, NonLoopBackEdge.second->front());
+            Change = (OldInterval != Interval);
+          }
+        }
+      }
+    } while (Change);
+  }
+}
+
 void Augmentation::handleLoopExtension(FuncInfo *funcInfo) {
   // process each natural loop
   for (auto &iter : kernel.fg.getAllNaturalLoops()) {
@@ -4383,6 +4549,8 @@ void Augmentation::buildLiveIntervals(FuncInfo* funcInfo) {
       handlePred(funcInfo, inst);
     }
   }
+
+  handleNonLoopBackEdges(funcInfo);
 
   // A variable may be defined in each divergent loop iteration and used
   // outside the loop. SIMT liveness can detect the variable as KILL and
@@ -4786,23 +4954,14 @@ void Augmentation::handleSIMDIntf(G4_Declare *firstDcl, G4_Declare *secondDcl,
     return;
   }
 
-  auto contain = [](const auto &C, auto pred) {
-    return std::find_if(C.cbegin(), C.cend(), pred) != C.cend();
-  };
-
   bool isFirstDcl = true;
+  bool isPseudoVCADcl = kernel.fg.isPseudoVCADcl(firstDcl);
+  if (!isPseudoVCADcl){
+    isPseudoVCADcl = kernel.fg.isPseudoVCADcl(secondDcl);
+    isFirstDcl = false;
+  }
 
-  auto pred = [firstDcl, secondDcl, &isFirstDcl](const auto &el) {
-    if (el.second.VCA == firstDcl)
-      return true;
-    if (el.second.VCA == secondDcl) {
-      isFirstDcl = false;
-      return true;
-    }
-    return false;
-  };
-
-  if (contain(kernel.fg.fcallToPseudoDclMap, pred)) {
+  if (isPseudoVCADcl) {
     // Mark intf for following pattern:
     // V33 =
     // ...
@@ -9065,6 +9224,59 @@ void GlobalRA::addCalleeSavePseudoCode() {
   builder.instList.clear();
 }
 
+void GlobalRA::storeCEInProlog() {
+  if (!kernel.getOption(vISA_storeCE))
+    return;
+
+  // If we've to store CE in prolog, we emit:
+  // TmpReg (GRF_Aligned) = CE0.0
+  // Store TmpReg @ FP+Offset
+  //
+  // Where Offset = 1 GRF size in bytes
+
+  // Create new variable equal to GRF size so it's always GRF aligned.
+  // It's transitory so shouldn't impact register pressure. We want to
+  // write CE0.0 in 0th location of this variable so that it can be
+  // used as send payload.
+  auto TmpReg = builder.createDeclare(
+      "TmpCEReg", G4_GRF, builder.numEltPerGRF<Type_UD>(), 1, Type_UD);
+  auto *DstRgn = builder.createDstRegRegion(TmpReg, 1);
+  auto *CEReg = regPool.getMask0Reg();
+  auto *SrcOpnd = builder.createSrc(
+      CEReg, 0, 0, kernel.fg.builder->getRegionScalar(), Type_UD);
+  auto Mov = builder.createMov(g4::SIMD1, DstRgn, SrcOpnd,
+                               G4_InstOption::InstOpt_WriteEnable, false);
+  auto nextPos = kernel.fg.getEntryBB()->insertBefore(
+      kernel.fg.getEntryBB()->getFirstInsertPos(), Mov);
+
+  auto payloadSrc =
+      builder.createSrcRegRegion(TmpReg, builder.getRegionStride1());
+  const unsigned execSize = 8;
+  G4_DstRegRegion *postDst = builder.createNullDst(Type_UD);
+  G4_INST *store = nullptr;
+  unsigned int HWOffset = builder.numEltPerGRF<Type_UB>() / getHWordByteSize();
+  vISA_ASSERT(kernel.stackCall.getFrameDescriptorByteSize() <=
+                  builder.numEltPerGRF<Type_UB>(),
+              "ce0 overwrote FDE");
+  kernel.getKernelDebugInfo()->setCESaveOffset(HWOffset * getHWordByteSize());
+
+  if (builder.supportsLSC()) {
+    auto headerOpnd = getSpillFillHeader(*kernel.fg.builder, nullptr);
+    store = builder.createSpill(postDst, headerOpnd, payloadSrc,
+                                G4_ExecSize(execSize), 1, HWOffset,
+                                builder.getBEFP(), InstOpt_WriteEnable, false);
+  } else {
+    store = builder.createSpill(postDst, payloadSrc, G4_ExecSize(execSize), 1,
+                                HWOffset, builder.getBEFP(),
+                                InstOpt_WriteEnable, false);
+  }
+  kernel.fg.getEntryBB()->insertAfter(nextPos, store);
+
+  if (builder.kernel.getOption(vISA_GenerateDebugInfo)) {
+    builder.kernel.getKernelDebugInfo()->setSaveCEInst(store);
+  }
+}
+
 //
 // Insert store r125.[0-4] at entry and restore before return.
 // Dst of store will be a hardwired temp at upper end of caller save area.
@@ -10463,6 +10675,7 @@ void GlobalRA::stackCallSaveRestore(bool hasStackCall) {
     // Only GENX sub-graphs require callee-save code.
 
     if (builder.getIsKernel() == false) {
+      storeCEInProlog();
       addCalleeSavePseudoCode();
       addStoreRestoreToReturn();
     }
@@ -11046,8 +11259,13 @@ int GlobalRA::coloringRegAlloc() {
 
   if (kernel.fg.getIsStackCallFunc()) {
     // Allocate space to store Frame Descriptor
-    nextSpillOffset += 32;
-    scratchOffset += 32;
+    nextSpillOffset += builder.numEltPerGRF<Type_UB>();
+    scratchOffset += builder.numEltPerGRF<Type_UB>();
+
+    if (kernel.getOption(vISA_storeCE)) {
+      nextSpillOffset += builder.numEltPerGRF<Type_UB>();
+      scratchOffset += builder.numEltPerGRF<Type_UB>();
+    }
   }
 
   // Global linear scan RA
@@ -11187,8 +11405,9 @@ int GlobalRA::coloringRegAlloc() {
     GraphColor coloring(liveAnalysis, false, forceSpill);
 
     if (builder.getOption(vISA_dumpRPE) && iterationNo == 0 && !rematDone) {
+      coloring.dumpRPEToFile();
       // dump pressure the first time we enter global RA
-      coloring.dumpRegisterPressure();
+      coloring.dumpRegisterPressure(std::cerr);
     }
 
     // Get the size of register which are reserved for spill
@@ -11439,23 +11658,37 @@ void GlobalRA::insertPhyRegDecls() {
   VISA_DEBUG(std::cout << "Local RA used " << numGRFsUsed << " GRFs\n");
 }
 
-void GraphColor::dumpRegisterPressure() {
+void GraphColor::dumpRPEToFile() {
+  // Dump RPE output to file if asmName is set
+  auto *asmOutput = builder.getOptions()->getOptionCstr(VISA_AsmFileName);
+  if (asmOutput) {
+    std::string FN(asmOutput);
+    FN += ".rpe";
+    std::ofstream OF;
+    OF.open(FN, std::ofstream::out);
+    dumpRegisterPressure(OF);
+    OF.close();
+  }
+}
+
+void GraphColor::dumpRegisterPressure(std::ostream &OS) {
   RPE rpe(gra, &liveAnalysis);
   uint32_t max = 0;
   std::vector<G4_INST *> maxInst;
   rpe.run();
 
   for (auto bb : builder.kernel.fg) {
-    std::cerr << "BB " << bb->getId() << ": (Pred: ";
+    OS << "BB " << bb->getId() << ": (Pred: ";
     for (auto pred : bb->Preds) {
-      std::cerr << pred->getId() << ",";
+      OS << pred->getId() << ",";
     }
-    std::cerr << " Succ: ";
+    OS << " Succ: ";
     for (auto succ : bb->Succs) {
-      std::cerr << succ->getId() << ",";
+      OS << succ->getId() << ",";
     }
-    std::cerr << ")\n";
-    for (auto inst : *bb) {
+    OS << ")\n";
+    for (auto instIt = bb->begin(); instIt != bb->end(); ++instIt) {
+      auto *inst = *instIt;
       uint32_t pressure = rpe.getRegisterPressure(inst);
       if (pressure > max) {
         max = pressure;
@@ -11465,14 +11698,15 @@ void GraphColor::dumpRegisterPressure() {
         maxInst.push_back(inst);
       }
 
-      std::cerr << "[" << pressure << "] ";
-      inst->dump();
+      if (kernel.getOption(vISA_EmitSrcFileLineToRPE))
+        bb->emitInstructionSourceLineMapping(OS, instIt);
+      OS << "[" << pressure << "] ";
+      inst->print(OS);
     }
   }
-  std::cerr << "max pressure: " << max << ", " << maxInst.size()
-            << " inst(s)\n";
+  OS << "max pressure: " << max << ", " << maxInst.size() << " inst(s)\n";
   for (auto inst : maxInst) {
-    inst->dump();
+    inst->print(OS);
   }
 }
 
