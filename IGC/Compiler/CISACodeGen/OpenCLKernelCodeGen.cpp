@@ -123,6 +123,7 @@ namespace IGC
             (m_DriverInfo.supportsAutoGRFSelection() ||
                 m_InternalOptions.IntelEnableAutoLargeGRF ||
                 m_Options.IntelEnableAutoLargeGRF)
+            || platform.supportsVRT() && IGC_IS_FLAG_ENABLED(EnableVRT)
             ) && !m_InternalOptions.Intel128GRFPerThread &&
             !m_Options.Intel128GRFPerThread &&
             !m_InternalOptions.Intel256GRFPerThread &&
@@ -220,7 +221,7 @@ namespace IGC
                 auto& annotatnions = funcMD.UserAnnotations;
                 auto output = shader->ProgramOutput();
 
-                if (output->m_scratchSpaceUsedBySpills > 0 &&
+                if (hasSpills(output->m_scratchSpaceUsedBySpills) &&
                     std::find(annotatnions.begin(), annotatnions.end(), "igc-do-not-spill") != annotatnions.end())
                 {
                     std::string msg =
@@ -263,7 +264,7 @@ namespace IGC
     }
 
     COpenCLKernel::COpenCLKernel(OpenCLProgramContext* ctx, Function* pFunc, CShaderProgram* pProgram) :
-        CComputeShaderBase(pFunc, pProgram)
+        m_State(*pFunc, *pProgram->GetContext()), CComputeShaderBase(pFunc, pProgram, m_State)
     {
         m_HasTID = false;
         m_HasGlobalSize = false;
@@ -918,10 +919,18 @@ namespace IGC
                 zebin::PreDefinedAttrGetter::ArgType::local_size, cur_pos, size);
             break;
         }
+        case KernelArg::ArgType::IMPLICIT_PAYLOAD_HEADER_SHORT: {
+            // PayloadHeader contains global work offset x,y,z
+            // global work offset size is int32x3
+            uint32_t size = iOpenCL::DATA_PARAMETER_DATA_SIZE * 3;
+            zebin::ZEInfoBuilder::addPayloadArgumentImplicit(m_kernelInfo.m_zePayloadArgs,
+                zebin::PreDefinedAttrGetter::ArgType::global_id_offset, payloadPosition, size);
+            break;
+        }
         case KernelArg::ArgType::IMPLICIT_PRIVATE_BASE:
             zebin::ZEInfoBuilder::addPayloadArgumentImplicit(m_kernelInfo.m_zePayloadArgs,
                 zebin::PreDefinedAttrGetter::ArgType::private_base_stateless,
-                payloadPosition, kernelArg->getAllocateSize());
+                payloadPosition, kernelArg->getSize());
             break;
 
         case KernelArg::ArgType::IMPLICIT_NUM_GROUPS:
@@ -1026,7 +1035,7 @@ namespace IGC
                 // this address will be accessed as a value and cannot be de-referenced
                 zebin::zeInfoPayloadArgument& arg = zebin::ZEInfoBuilder::addPayloadArgumentImplicit(m_kernelInfo.m_zePayloadArgs,
                     zebin::PreDefinedAttrGetter::ArgType::buffer_address,
-                    payloadPosition, kernelArg->getAllocateSize());
+                    payloadPosition, kernelArg->getSize());
                 arg.arg_index = arg_idx;
                 break;
             }
@@ -1043,14 +1052,14 @@ namespace IGC
 
             zebin::zeInfoPayloadArgument& arg =
                 zebin::ZEInfoBuilder::addPayloadArgumentByPointer(m_kernelInfo.m_zePayloadArgs,
-                    payloadPosition, kernelArg->getAllocateSize(), arg_idx, addr_mode,
+                    payloadPosition, kernelArg->getSize(), arg_idx, addr_mode,
                     addr_space, access_type);
             arg.is_pipe = arg_idx < funcMD.m_OpenCLArgTypeQualifiers.size() && funcMD.m_OpenCLArgTypeQualifiers[arg_idx] == "pipe";
             break;
         }
         case KernelArg::ArgType::PTR_LOCAL:
             zebin::ZEInfoBuilder::addPayloadArgumentByPointer(m_kernelInfo.m_zePayloadArgs,
-                payloadPosition, kernelArg->getAllocateSize(),
+                payloadPosition, kernelArg->getSize(),
                 kernelArg->getAssociatedArgNo(),
                 zebin::PreDefinedAttrGetter::ArgAddrMode::slm,
                 zebin::PreDefinedAttrGetter::ArgAddrSpace::local,
@@ -1060,7 +1069,7 @@ namespace IGC
         // by value arguments
         case KernelArg::ArgType::CONSTANT_REG:
             zebin::ZEInfoBuilder::addPayloadArgumentByValue(m_kernelInfo.m_zePayloadArgs,
-                payloadPosition, kernelArg->getAllocateSize(),
+                payloadPosition, kernelArg->getSize(),
                 kernelArg->getAssociatedArgNo(), kernelArg->getStructArgOffset(),
                 kernelArg->isScalarAsPointer());
             break;
@@ -1101,14 +1110,14 @@ namespace IGC
                 zebin::zeInfoPayloadArgument& arg =
                     zebin::ZEInfoBuilder::addPayloadArgumentImplicit(
                         m_kernelInfo.m_zePayloadArgs, argTy, payloadPosition,
-                        kernelArg->getAllocateSize());
+                        kernelArg->getSize());
                 arg.addrmode = zebin::PreDefinedAttrGetter::get(zebin::PreDefinedAttrGetter::ArgAddrMode::bindless);
             }
             else
             {
                 zebin::ZEInfoBuilder::addPayloadArgumentByPointer(
                     m_kernelInfo.m_zePayloadArgs, payloadPosition,
-                    kernelArg->getAllocateSize(), argidx,
+                    kernelArg->getSize(), argidx,
                     zebin::PreDefinedAttrGetter::ArgAddrMode::bindless,
                     std::get<0>(attrs), std::get<1>(attrs));
             }
@@ -1160,7 +1169,7 @@ namespace IGC
                 arg_addrmode =
                     zebin::PreDefinedAttrGetter::ArgAddrMode::bindless;
                 arg_off = payloadPosition;
-                arg_size = kernelArg->getAllocateSize();
+                arg_size = kernelArg->getSize();
             } else {
                 // add bti index for this arg if it's stateful
                 SOpenCLKernelInfo::SResourceInfo resInfo = getResourceInfo(arg_idx);
@@ -1194,7 +1203,7 @@ namespace IGC
             zebin::zeInfoPayloadArgument& arg =
                 zebin::ZEInfoBuilder::addPayloadArgumentImplicit(m_kernelInfo.m_zePayloadArgs,
                     zebin::PreDefinedAttrGetter::ArgType::image_height,
-                    payloadPosition, kernelArg->getAllocateSize());
+                    payloadPosition, kernelArg->getSize());
             arg.arg_index = kernelArg->getAssociatedArgNo();
             break;
         }
@@ -1202,7 +1211,7 @@ namespace IGC
             zebin::zeInfoPayloadArgument& arg =
                 zebin::ZEInfoBuilder::addPayloadArgumentImplicit(m_kernelInfo.m_zePayloadArgs,
                     zebin::PreDefinedAttrGetter::ArgType::image_width,
-                    payloadPosition, kernelArg->getAllocateSize());
+                    payloadPosition, kernelArg->getSize());
             arg.arg_index = kernelArg->getAssociatedArgNo();
             break;
         }
@@ -1210,7 +1219,7 @@ namespace IGC
             zebin::zeInfoPayloadArgument& arg =
                 zebin::ZEInfoBuilder::addPayloadArgumentImplicit(m_kernelInfo.m_zePayloadArgs,
                     zebin::PreDefinedAttrGetter::ArgType::image_depth,
-                    payloadPosition, kernelArg->getAllocateSize());
+                    payloadPosition, kernelArg->getSize());
             arg.arg_index = kernelArg->getAssociatedArgNo();
             break;
         }
@@ -1218,7 +1227,7 @@ namespace IGC
             zebin::zeInfoPayloadArgument& arg =
                 zebin::ZEInfoBuilder::addPayloadArgumentImplicit(m_kernelInfo.m_zePayloadArgs,
                     zebin::PreDefinedAttrGetter::ArgType::image_num_mip_levels,
-                    payloadPosition, kernelArg->getAllocateSize());
+                    payloadPosition, kernelArg->getSize());
             arg.arg_index = kernelArg->getAssociatedArgNo();
             break;
         }
@@ -1226,7 +1235,7 @@ namespace IGC
             zebin::zeInfoPayloadArgument& arg =
                 zebin::ZEInfoBuilder::addPayloadArgumentImplicit(m_kernelInfo.m_zePayloadArgs,
                     zebin::PreDefinedAttrGetter::ArgType::image_channel_data_type,
-                    payloadPosition, kernelArg->getAllocateSize());
+                    payloadPosition, kernelArg->getSize());
             arg.arg_index = kernelArg->getAssociatedArgNo();
             break;
         }
@@ -1234,7 +1243,7 @@ namespace IGC
             zebin::zeInfoPayloadArgument& arg =
                 zebin::ZEInfoBuilder::addPayloadArgumentImplicit(m_kernelInfo.m_zePayloadArgs,
                     zebin::PreDefinedAttrGetter::ArgType::image_channel_order,
-                    payloadPosition, kernelArg->getAllocateSize());
+                    payloadPosition, kernelArg->getSize());
             arg.arg_index = kernelArg->getAssociatedArgNo();
             break;
         }
@@ -1242,7 +1251,7 @@ namespace IGC
             zebin::zeInfoPayloadArgument& arg =
                 zebin::ZEInfoBuilder::addPayloadArgumentImplicit(m_kernelInfo.m_zePayloadArgs,
                     zebin::PreDefinedAttrGetter::ArgType::image_srgb_channel_order,
-                    payloadPosition, kernelArg->getAllocateSize());
+                    payloadPosition, kernelArg->getSize());
             arg.arg_index = kernelArg->getAssociatedArgNo();
             break;
         }
@@ -1250,7 +1259,7 @@ namespace IGC
             zebin::zeInfoPayloadArgument& arg =
                 zebin::ZEInfoBuilder::addPayloadArgumentImplicit(m_kernelInfo.m_zePayloadArgs,
                     zebin::PreDefinedAttrGetter::ArgType::image_array_size,
-                    payloadPosition, kernelArg->getAllocateSize());
+                    payloadPosition, kernelArg->getSize());
             arg.arg_index = kernelArg->getAssociatedArgNo();
             break;
         }
@@ -1258,7 +1267,7 @@ namespace IGC
             zebin::zeInfoPayloadArgument& arg =
                 zebin::ZEInfoBuilder::addPayloadArgumentImplicit(m_kernelInfo.m_zePayloadArgs,
                     zebin::PreDefinedAttrGetter::ArgType::image_num_samples,
-                    payloadPosition, kernelArg->getAllocateSize());
+                    payloadPosition, kernelArg->getSize());
             arg.arg_index = kernelArg->getAssociatedArgNo();
             break;
         }
@@ -1266,7 +1275,7 @@ namespace IGC
             zebin::zeInfoPayloadArgument& arg =
                 zebin::ZEInfoBuilder::addPayloadArgumentImplicit(m_kernelInfo.m_zePayloadArgs,
                     zebin::PreDefinedAttrGetter::ArgType::flat_image_baseoffset,
-                    payloadPosition, kernelArg->getAllocateSize());
+                    payloadPosition, kernelArg->getSize());
             arg.arg_index = kernelArg->getAssociatedArgNo();
             break;
         }
@@ -1274,7 +1283,7 @@ namespace IGC
             zebin::zeInfoPayloadArgument& arg =
                 zebin::ZEInfoBuilder::addPayloadArgumentImplicit(m_kernelInfo.m_zePayloadArgs,
                     zebin::PreDefinedAttrGetter::ArgType::flat_image_height,
-                    payloadPosition, kernelArg->getAllocateSize());
+                    payloadPosition, kernelArg->getSize());
             arg.arg_index = kernelArg->getAssociatedArgNo();
             break;
         }
@@ -1282,7 +1291,7 @@ namespace IGC
             zebin::zeInfoPayloadArgument& arg =
                 zebin::ZEInfoBuilder::addPayloadArgumentImplicit(m_kernelInfo.m_zePayloadArgs,
                     zebin::PreDefinedAttrGetter::ArgType::flat_image_width,
-                    payloadPosition, kernelArg->getAllocateSize());
+                    payloadPosition, kernelArg->getSize());
             arg.arg_index = kernelArg->getAssociatedArgNo();
             break;
         }
@@ -1290,7 +1299,7 @@ namespace IGC
             zebin::zeInfoPayloadArgument& arg =
                 zebin::ZEInfoBuilder::addPayloadArgumentImplicit(m_kernelInfo.m_zePayloadArgs,
                     zebin::PreDefinedAttrGetter::ArgType::flat_image_pitch,
-                    payloadPosition, kernelArg->getAllocateSize());
+                    payloadPosition, kernelArg->getSize());
             arg.arg_index = kernelArg->getAssociatedArgNo();
             break;
         }
@@ -1309,7 +1318,7 @@ namespace IGC
                 arg_addrmode =
                     zebin::PreDefinedAttrGetter::ArgAddrMode::bindless;
                 arg_off = payloadPosition;
-                arg_size = kernelArg->getAllocateSize();
+                arg_size = kernelArg->getSize();
             }
 
             int arg_idx = kernelArg->getAssociatedArgNo();
@@ -1325,7 +1334,7 @@ namespace IGC
             zebin::zeInfoPayloadArgument& arg =
                 zebin::ZEInfoBuilder::addPayloadArgumentImplicit(m_kernelInfo.m_zePayloadArgs,
                     zebin::PreDefinedAttrGetter::ArgType::sampler_address,
-                    payloadPosition, kernelArg->getAllocateSize());
+                    payloadPosition, kernelArg->getSize());
             arg.arg_index = kernelArg->getAssociatedArgNo();
             break;
         }
@@ -1333,7 +1342,7 @@ namespace IGC
             zebin::zeInfoPayloadArgument& arg =
                 zebin::ZEInfoBuilder::addPayloadArgumentImplicit(m_kernelInfo.m_zePayloadArgs,
                     zebin::PreDefinedAttrGetter::ArgType::sampler_normalized,
-                    payloadPosition, kernelArg->getAllocateSize());
+                    payloadPosition, kernelArg->getSize());
             arg.arg_index = kernelArg->getAssociatedArgNo();
             break;
         }
@@ -1341,7 +1350,7 @@ namespace IGC
             zebin::zeInfoPayloadArgument& arg =
                 zebin::ZEInfoBuilder::addPayloadArgumentImplicit(m_kernelInfo.m_zePayloadArgs,
                     zebin::PreDefinedAttrGetter::ArgType::sampler_snap_wa,
-                    payloadPosition, kernelArg->getAllocateSize());
+                    payloadPosition, kernelArg->getSize());
             arg.arg_index = kernelArg->getAssociatedArgNo();
             break;
         }
@@ -1355,45 +1364,45 @@ namespace IGC
             IGC_ASSERT_MESSAGE(it != resAllocMD.inlineSamplersMD.end(), "Inline sampler isn't found in metadata.");
             zebin::ZEInfoBuilder::addPayloadArgumentImplicitInlineSampler(
                         m_kernelInfo.m_zePayloadArgs, zebin::PreDefinedAttrGetter::ArgType::inline_sampler, payloadPosition,
-                        kernelArg->getAllocateSize(), it->index);
+                        kernelArg->getSize(), it->index);
             break;
         }
 
         case KernelArg::ArgType::IMPLICIT_BUFFER_OFFSET: {
             zebin::zeInfoPayloadArgument& arg = zebin::ZEInfoBuilder::addPayloadArgumentImplicit(m_kernelInfo.m_zePayloadArgs,
                 zebin::PreDefinedAttrGetter::ArgType::buffer_offset,
-                payloadPosition, kernelArg->getAllocateSize());
+                payloadPosition, kernelArg->getSize());
             arg.arg_index = kernelArg->getAssociatedArgNo();
             break;
         }
         case KernelArg::ArgType::IMPLICIT_PRINTF_BUFFER:
             zebin::ZEInfoBuilder::addPayloadArgumentImplicit(m_kernelInfo.m_zePayloadArgs,
                 zebin::PreDefinedAttrGetter::ArgType::printf_buffer,
-                payloadPosition, kernelArg->getAllocateSize());
+                payloadPosition, kernelArg->getSize());
             break;
 
         case KernelArg::ArgType::IMPLICIT_ARG_BUFFER:
             zebin::ZEInfoBuilder::addPayloadArgumentImplicit(m_kernelInfo.m_zePayloadArgs,
                 zebin::PreDefinedAttrGetter::ArgType::implicit_arg_buffer,
-                payloadPosition, kernelArg->getAllocateSize());
+                payloadPosition, kernelArg->getSize());
             break;
 
         case KernelArg::ArgType::IMPLICIT_SYNC_BUFFER:
             zebin::ZEInfoBuilder::addPayloadArgumentImplicit(m_kernelInfo.m_zePayloadArgs,
                 zebin::PreDefinedAttrGetter::ArgType::sync_buffer,
-                payloadPosition, kernelArg->getAllocateSize());
+                payloadPosition, kernelArg->getSize());
             break;
 
         case KernelArg::ArgType::IMPLICIT_RT_GLOBAL_BUFFER:
             zebin::ZEInfoBuilder::addPayloadArgumentImplicit(m_kernelInfo.m_zePayloadArgs,
                 zebin::PreDefinedAttrGetter::ArgType::rt_global_buffer,
-                payloadPosition, kernelArg->getAllocateSize());
+                payloadPosition, kernelArg->getSize());
             break;
 
         case KernelArg::ArgType::IMPLICIT_ASSERT_BUFFER:
             zebin::ZEInfoBuilder::addPayloadArgumentImplicit(m_kernelInfo.m_zePayloadArgs,
                 zebin::PreDefinedAttrGetter::ArgType::assert_buffer,
-                payloadPosition, kernelArg->getAllocateSize());
+                payloadPosition, kernelArg->getSize());
             break;
 
         case KernelArg::ArgType::IMPLICIT_CONSTANT_BASE:
@@ -1415,7 +1424,7 @@ namespace IGC
             zebin::zeInfoPayloadArgument& arg =
                 zebin::ZEInfoBuilder::addPayloadArgumentImplicit(
                     m_kernelInfo.m_zePayloadArgs, zeArgType, payloadPosition,
-                    kernelArg->getAllocateSize(),
+                    kernelArg->getSize(),
                     kernelArg->isScalarAsPointer());
             SOpenCLKernelInfo::SResourceInfo resInfo =
                 getResourceInfo(kernelArg->getAssociatedArgNo());
@@ -1448,7 +1457,7 @@ namespace IGC
         case KernelArg::ArgType::IMPLICIT_BUFFER_SIZE: {
             zebin::zeInfoPayloadArgument& arg = zebin::ZEInfoBuilder::addPayloadArgumentImplicit(m_kernelInfo.m_zePayloadArgs,
                 zebin::PreDefinedAttrGetter::ArgType::buffer_size,
-                payloadPosition, kernelArg->getAllocateSize());
+                payloadPosition, kernelArg->getSize());
             arg.arg_index = kernelArg->getAssociatedArgNo();
             break;
         }
@@ -1511,9 +1520,11 @@ namespace IGC
             break;
 
         case KernelArg::ArgType::IMPLICIT_PAYLOAD_HEADER:
+        case KernelArg::ArgType::IMPLICIT_PAYLOAD_HEADER_SHORT:
             // PayloadHeader contains global work offset x,y,z and local size x,y,z -->
             // total of 6 annotations, 3 of each type
-            for (int i = 0; i < 6; ++i)
+            // Short PayloadHeader reduces it to only global work offset
+            for (int i = 0; i < (type == KernelArg::ArgType::IMPLICIT_PAYLOAD_HEADER ? 6 : 3); ++i)
             {
                 auto constInput = std::make_unique<iOpenCL::ConstantInputAnnotation>();
 
@@ -2302,7 +2313,7 @@ namespace IGC
                     break;
                 case GenISAIntrinsic::GenISA_dpas:
                 case GenISAIntrinsic::GenISA_sub_group_dpas:
-                    SetHasDPAS();
+                    m_State.SetHasDPAS();
                     break;
                 case GenISAIntrinsic::GenISA_ptr_to_pair:
                 case GenISAIntrinsic::GenISA_pair_to_ptr:
@@ -2315,7 +2326,7 @@ namespace IGC
             {
                 if (IA->getAsmString().find("dpas") != std::string::npos)
                 {
-                    SetHasDPAS();
+                    m_State.SetHasDPAS();
                 }
             }
             if (mayHasMemoryAccess)
@@ -2400,8 +2411,8 @@ namespace IGC
         }
 
 
-        m_ConstantBufferLength = 0;
-        m_NOSBufferSize = 0;
+        m_State.m_ConstantBufferLength = 0;
+        m_State.m_NOSBufferSize = 0;
 
         uint offset = 0;
 
@@ -2443,6 +2454,15 @@ namespace IGC
                 arg.getArgType() == KernelArg::ArgType::IMPLICIT_BUFFER_SIZE) &&
                 arg.getArg()->use_empty();
 
+            if (IGC_IS_FLAG_ENABLED(RemoveUnusedIdImplicitArguments))
+            {
+                IsUnusedArg |=
+                    (arg.getArgType() == KernelArg::ArgType::IMPLICIT_PAYLOAD_HEADER || // contains global_id_offset
+                    arg.getArgType() == KernelArg::ArgType::IMPLICIT_PAYLOAD_HEADER_SHORT ||
+                    arg.getArgType() == KernelArg::ArgType::IMPLICIT_ENQUEUED_LOCAL_WORK_SIZE) &&
+                    arg.getArg()->use_empty();
+            }
+
             // Runtime Values should not be processed any further. No annotations shall be created for them.
             // Only added to KernelArgs to enforce correct allocation order.
             bool isRuntimeValue = (arg.getArgType() == KernelArg::ArgType::RUNTIME_VALUE);
@@ -2475,6 +2495,9 @@ namespace IGC
                     // Align on the desired alignment for this argument
                     auto alignment = arg.getAlignment();
 
+                    if (arg.isArgPtrType())
+                        alignment = m_Context->getModule()->getDataLayout().getPointerTypeSize(arg.getArg()->getType());
+
                     // FIXME: move alignment checks to implicit arg creation
                     if ((arg.getArgType() == KernelArg::ArgType::IMPLICIT_LOCAL_IDS ||
                          arg.getArgType() == KernelArg::ArgType::RT_STACK_ID) &&
@@ -2482,7 +2505,7 @@ namespace IGC
                     {
                         alignment = 64;
                         // generate a single SIMD32 variable in this case
-                        if (m_dispatchSize == SIMDMode::SIMD16 && m_Platform->getGRFSize() == 64)
+                        if (m_State.m_dispatchSize == SIMDMode::SIMD16 && m_Platform->getGRFSize() == 64)
                         {
                             allocSize = 64;
                         }
@@ -2612,7 +2635,7 @@ namespace IGC
 
             if (arg.isConstantBuf())
             {
-                m_ConstantBufferLength += offset - prevOffset;
+                m_State.m_ConstantBufferLength += offset - prevOffset;
             }
         }
 
@@ -2631,8 +2654,8 @@ namespace IGC
         {
             if (loadThreadPayload)
             {
-                uint perThreadInputSize = SIZE_WORD * 3 * (m_dispatchSize == SIMDMode::SIMD32 ? 32 : 16);
-                if (m_dispatchSize == SIMDMode::SIMD16 && getGRFSize() == 64)
+                uint perThreadInputSize = SIZE_WORD * 3 * (m_State.m_dispatchSize == SIMDMode::SIMD32 ? 32 : 16);
+                if (m_State.m_dispatchSize == SIMDMode::SIMD16 && getGRFSize() == 64)
                 {
                     perThreadInputSize *= 2;
                 }
@@ -2645,7 +2668,7 @@ namespace IGC
         m_kernelInfo.m_threadPayload.OffsetToSkipPerThreadDataLoad = 0;
         m_kernelInfo.m_threadPayload.OffsetToSkipSetFFIDGP = 0;
 
-        m_ConstantBufferLength = iSTD::Align(m_ConstantBufferLength, getGRFSize());
+        m_State.m_ConstantBufferLength = iSTD::Align(m_State.m_ConstantBufferLength, getGRFSize());
 
         // FIXME: skip this function when EnableZEBinary
         CreateInlineSamplerAnnotations();
@@ -2833,21 +2856,21 @@ namespace IGC
         m_kernelInfo.m_executionEnvironment.PerThreadScratchSpace = pOutput->getScratchSpaceUsageInSlot0();
         m_kernelInfo.m_executionEnvironment.PerThreadScratchSpaceSlot1 = pOutput->getScratchSpaceUsageInSlot1();
         m_kernelInfo.m_executionEnvironment.PerThreadPrivateOnStatelessSize = m_perWIStatelessPrivateMemSize;
-        m_kernelInfo.m_kernelProgram.NOSBufferSize = m_NOSBufferSize / getMinPushConstantBufferAlignmentInBytes(); // in 256 bits
-        m_kernelInfo.m_kernelProgram.ConstantBufferLength = m_ConstantBufferLength / getMinPushConstantBufferAlignmentInBytes(); // in 256 bits
+        m_kernelInfo.m_kernelProgram.NOSBufferSize = m_State.m_NOSBufferSize / getMinPushConstantBufferAlignmentInBytes(); // in 256 bits
+        m_kernelInfo.m_kernelProgram.ConstantBufferLength = m_State.m_ConstantBufferLength / getMinPushConstantBufferAlignmentInBytes(); // in 256 bits
         m_kernelInfo.m_kernelProgram.MaxNumberOfThreads = m_Platform->getMaxGPGPUShaderThreads() / GetShaderThreadUsageRate();
 
         m_kernelInfo.m_executionEnvironment.SumFixedTGSMSizes = getSumFixedTGSMSizes(entry);
 
         // TODO: need to change misleading HasBarriers to NumberofBarriers
-        m_kernelInfo.m_executionEnvironment.HasBarriers = this->GetBarrierNumber();
-        m_kernelInfo.m_executionEnvironment.HasSample = this->GetHasSample();
+        m_kernelInfo.m_executionEnvironment.HasBarriers = m_State.GetBarrierNumber();
+        m_kernelInfo.m_executionEnvironment.HasSample = m_State.GetHasSample();
         m_kernelInfo.m_executionEnvironment.DisableMidThreadPreemption = GetDisableMidThreadPreemption();
         m_kernelInfo.m_executionEnvironment.SubgroupIndependentForwardProgressRequired =
             m_Context->getModuleMetaData()->compOpt.SubgroupIndependentForwardProgressRequired;
         m_kernelInfo.m_executionEnvironment.CompiledForGreaterThan4GBBuffers =
             m_Context->getModuleMetaData()->compOpt.GreaterThan4GBBufferRequired;
-        IGC_ASSERT(gatherMap.size() == 0);
+        IGC_ASSERT(m_State.gatherMap.size() == 0);
         m_kernelInfo.m_kernelProgram.gatherMapSize = 0;
         m_kernelInfo.m_kernelProgram.bindingTableEntryCount = 0;
 
@@ -2903,7 +2926,7 @@ namespace IGC
 
         m_kernelInfo.m_executionEnvironment.NumGRFRequired = ProgramOutput()->m_numGRFTotal;
 
-        m_kernelInfo.m_executionEnvironment.HasDPAS = GetHasDPAS();
+        m_kernelInfo.m_executionEnvironment.HasDPAS = m_State.GetHasDPAS();
         m_kernelInfo.m_executionEnvironment.StatelessWritesCount = GetStatelessWritesCount();
         m_kernelInfo.m_executionEnvironment.IndirectStatelessCount = GetIndirectStatelessCount();
         m_kernelInfo.m_executionEnvironment.numThreads = ProgramOutput()->m_numThreads;
@@ -2995,7 +3018,7 @@ namespace IGC
         unsigned int groupSize = IGCMetaDataHelper::getThreadGroupSize(*m_pMdUtils, entry);
         if (groupSize != 0)
         {
-            if (groupSize % numLanes(m_dispatchSize) == 0)
+            if (groupSize % numLanes(m_State.m_dispatchSize) == 0)
             {
                 return true;
             }
@@ -3252,7 +3275,7 @@ namespace IGC
             return RetryType::NO_Retry_Pick_Prv;
         }
         else if (
-            pOutput->m_scratchSpaceUsedBySpills == 0 ||
+            !ctx->hasSpills(pOutput->m_scratchSpaceUsedBySpills) ||
             ctx->getModuleMetaData()->compOpt.OptDisable ||
             ctx->m_retryManager.IsLastTry() ||
             (!ctx->m_retryManager.kernelSkip.empty() &&
@@ -3319,15 +3342,18 @@ namespace IGC
 
                 dumpName = dumpName.PostFix(shaderName);
 
-                std::ostringstream FullPath(dumpName.str(), std::ostringstream::ate);
-                FullPath << "_previous_kernel_pick.txt";
+                if (dumpName.allow())
+                {
+                    std::ostringstream FullPath(dumpName.str(), std::ostringstream::ate);
+                    FullPath << "_previous_kernel_pick.txt";
 
-                std::ofstream OutF(FullPath.str(), std::ofstream::out);
+                    std::ofstream OutF(FullPath.str(), std::ofstream::out);
 
 
-                if (OutF)
-                    OutF.write(reason.str().c_str(),
-                        reason.str().length());
+                    if (OutF)
+                        OutF.write(reason.str().c_str(),
+                            reason.str().length());
+                }
             }
 
             pSelectedKernel =
@@ -3443,7 +3469,8 @@ namespace IGC
 
         if (ctx->platform.getMinDispatchMode() == SIMDMode::SIMD16)
         {
-            AddCodeGenPasses(*ctx, shaders, Passes, SIMDMode::SIMD32, false);
+            bool abortOnSpills = IGC_GET_FLAG_VALUE(AllowSIMD16DropForXE2) && ctx->platform.isCoreXE2() && (ctx->getModuleMetaData()->csInfo.forcedSIMDSize != 32);
+            AddCodeGenPasses(*ctx, shaders, Passes, SIMDMode::SIMD32, abortOnSpills);
             AddCodeGenPasses(*ctx, shaders, Passes, SIMDMode::SIMD16, false);
 
             ctx->SetSIMDInfo(SIMD_SKIP_HW, SIMDMode::SIMD8, ShaderDispatchMode::NOT_APPLICABLE);
@@ -3748,9 +3775,23 @@ namespace IGC
             return SIMDStatus::SIMD_FUNC_FAIL;
         }
 
-        EP.m_canAbortOnSpill = false; // spill is always allowed since we don't do SIMD size lowering
         // Next we check if there is a required sub group size specified
         CodeGenContext* pCtx = GetContext();
+
+        CShader* simd16Program = m_parent->GetShader(SIMDMode::SIMD16);
+        CShader* simd32Program = m_parent->GetShader(SIMDMode::SIMD32);
+
+        bool compileFunctionVariants = pCtx->m_enableSimdVariantCompilation &&
+            (m_FGA && IGC::isIntelSymbolTableVoidProgram(m_FGA->getGroupHead(&F)));
+
+        if((simd16Program && simd16Program->ProgramOutput()->m_programSize > 0) ||
+                (simd32Program && simd32Program->ProgramOutput()->m_programSize > 0))
+        {
+            bool canCompileMultipleSIMD = compileFunctionVariants;
+            if (!(canCompileMultipleSIMD && (pCtx->getModuleMetaData()->csInfo.forcedSIMDSize == 0)))
+                return SIMDStatus::SIMD_FUNC_FAIL;
+        }
+
         MetaDataUtils* pMdUtils = EP.getAnalysis<MetaDataUtilsWrapper>().getMetaDataUtils();
         FunctionInfoMetaDataHandle funcInfoMD = pMdUtils->getFunctionsInfoItem(&F);
         uint32_t simd_size = getReqdSubGroupSize(F, pMdUtils);
@@ -3853,7 +3894,7 @@ namespace IGC
                 return SIMDStatus::SIMD_PASS;
             }
 
-            if (simdMode == SIMDMode::SIMD16 && !hasSubGroupForce && !forceLowestSIMDForStackCalls && !hasSubroutine)
+            if (simdMode == SIMDMode::SIMD16 && !pCtx->platform.isCoreXE2() && !hasSubGroupForce && !forceLowestSIMDForStackCalls && !hasSubroutine)
             {
                 pCtx->SetSIMDInfo(SIMD_SKIP_PERF, simdMode, ShaderDispatchMode::NOT_APPLICABLE);
                 return SIMDStatus::SIMD_FUNC_FAIL;
@@ -3944,8 +3985,22 @@ namespace IGC
             bool hasIndirectCall = FG && FG->hasIndirectCall();
             if (hasNestedCall || hasIndirectCall || isIndirectGroup)
             {
-                pCtx->SetSIMDInfo(SIMD_SKIP_HW, simdMode, ShaderDispatchMode::NOT_APPLICABLE);
-                return SIMDStatus::SIMD_FUNC_FAIL;
+                // Disable EU fusion if SIMD32 is requested
+                if (getReqdSubGroupSize(F, pMdUtils) == numLanes(SIMDMode::SIMD32))
+                {
+                    pCtx->getModuleMetaData()->compOpt.DisableEUFusion = true;
+                    if (FG->getHead() == &F)
+                    {
+                        pCtx->EmitWarning(
+                            std::string("EU fusion is disabled, it does not work on the current platform if SIMD32 mode specified by intel_reqd_sub_group_size(32)").c_str(),
+                            &F);
+                    }
+                }
+                else
+                {
+                    pCtx->SetSIMDInfo(SIMD_SKIP_HW, simdMode, ShaderDispatchMode::NOT_APPLICABLE);
+                    return SIMDStatus::SIMD_FUNC_FAIL;
+                }
             }
         }
 

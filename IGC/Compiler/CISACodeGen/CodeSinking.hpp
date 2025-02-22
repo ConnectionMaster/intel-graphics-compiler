@@ -17,9 +17,9 @@ See LICENSE.TXT for details.
 #include "Compiler/CISACodeGen/WIAnalysis.hpp"
 #include "Compiler/CISACodeGen/IGCLivenessAnalysis.h"
 #include "Compiler/CISACodeGen/TranslationTable.hpp"
+#include "Compiler/CodeGenContextWrapper.hpp"
 #include "Compiler/MetaDataUtilsWrapper.h"
 #include "Compiler/MetaDataApi/MetaDataApi.h"
-#include "Compiler/CodeGenContextWrapper.hpp"
 
 #include "common/LLVMWarningsPush.hpp"
 #include <llvm/Analysis/PostDominators.h>
@@ -90,12 +90,10 @@ namespace IGC {
 
     class CodeLoopSinking : public llvm::FunctionPass {
         llvm::DominatorTree* DT = nullptr;
-        llvm::PostDominatorTree* PDT = nullptr;
         llvm::LoopInfo* LI = nullptr;
         llvm::AliasAnalysis* AA = nullptr;
-        WIAnalysisRunner WI;
+        WIAnalysisRunner* WI;
         IGCMD::MetaDataUtils* MDUtils = nullptr;
-        ModuleMetaData* ModMD = nullptr;
         IGCLivenessAnalysis* RPE = nullptr;
         IGCFunctionExternalRegPressureAnalysis* FRPE = nullptr;
         CodeGenContext* CTX = nullptr;
@@ -112,25 +110,28 @@ namespace IGC {
             AU.setPreservesCFG();
 
             AU.addRequired<llvm::DominatorTreeWrapperPass>();
-            AU.addRequired<llvm::PostDominatorTreeWrapperPass>();
             AU.addRequired<llvm::LoopInfoWrapperPass>();
             AU.addRequired<llvm::AAResultsWrapperPass>();
-            AU.addRequired<MetaDataUtilsWrapper>();
-            AU.addRequired<TranslationTable>();
             AU.addRequired<IGCLivenessAnalysis>();
             AU.addRequired<IGCFunctionExternalRegPressureAnalysis>();
             AU.addRequired<TargetLibraryInfoWrapperPass>();
             AU.addRequired<CodeGenContextWrapper>();
 
             AU.addPreserved<llvm::DominatorTreeWrapperPass>();
-            AU.addPreserved<llvm::PostDominatorTreeWrapperPass>();
             AU.addPreserved<llvm::LoopInfoWrapperPass>();
             AU.addPreserved<llvm::AAResultsWrapperPass>();
-            AU.addPreservedID(TranslationTable::ID);
         }
     private:
 
+        typedef enum VerbosityLevel {
+            None = 0,
+            Low,
+            Medium,
+            High
+        } VerbosityLevel;
+
         typedef llvm::SmallPtrSet<llvm::Instruction*, 32> InstSet;
+        typedef llvm::SmallVector<llvm::Instruction*, 16> InstrVec;
 
         // Candidate for a sinking - POD structure to describe instructions to be sinked in a loop
 
@@ -146,7 +147,6 @@ namespace IGC {
         //         or scheduled within the basic block
 
         struct Candidate {
-            typedef llvm::SmallVector<llvm::Instruction*, 16> InstrVec;
 
             Candidate(const InstrVec& Instructions, BasicBlock* TgtBB, LoopSinkWorthiness Worthiness, llvm::Instruction* UndoPos)
                 : Instructions(Instructions), TgtBB(TgtBB), Worthiness(Worthiness), UndoPos(UndoPos) {}
@@ -198,18 +198,20 @@ namespace IGC {
             }
         };
 
-        typedef llvm::SmallVector<std::unique_ptr<Candidate>, 64> CandidateVec;
-        typedef llvm::SmallVector<Candidate*, 64> CandidatePtrVec;
-        typedef llvm::DenseMap<Instruction*, Candidate*> InstToCandidateMap;
+        using CandidateVec = llvm::SmallVector<std::unique_ptr<Candidate>, 64>;
+        using CandidatePtrVec = llvm::SmallVector<Candidate *, 64>;
+        using CandidatePtrSet = llvm::DenseSet<Candidate *>;
+        using InstToCandidateMap = llvm::MapVector<Instruction *, Candidate *>;
 
         /// sinking
         bool loopSink(llvm::Function& F);
         bool loopSink(llvm::Loop* LoopWithPressure, LoopSinkMode Mode);
 
-        bool localSink(llvm::BasicBlock* BB, InstToCandidateMap& InstToCandidate);
+        bool localSink(llvm::BasicBlock* BB, InstToCandidateMap& InstToCandidate, bool Aggressive=false);
 
         /// candidates creation
         bool tryCreateShufflePatternCandidates(
+            llvm::BasicBlock* BB,
             llvm::Loop* L,
             InstSet& SkipInstructions,
             CandidateVec& SinkCandidates

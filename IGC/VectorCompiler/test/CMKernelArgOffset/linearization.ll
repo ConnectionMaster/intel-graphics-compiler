@@ -1,13 +1,16 @@
 ;=========================== begin_copyright_notice ============================
 ;
-; Copyright (C) 2021-2024 Intel Corporation
+; Copyright (C) 2021-2025 Intel Corporation
 ;
 ; SPDX-License-Identifier: MIT
 ;
 ;============================ end_copyright_notice =============================
 
-; RUN: %opt_typed_ptrs %use_old_pass_manager% -cmkernelargoffset -march=genx64 -mcpu=Gen9 -S < %s | FileCheck %s --check-prefixes=CHECK,CHECK-TYPED-PTRS
-; RUN: %opt_opaque_ptrs %use_old_pass_manager% -cmkernelargoffset -march=genx64 -mcpu=Gen9 -S < %s | FileCheck %s --check-prefixes=CHECK,CHECK-OPAQUE-PTRS
+; RUN: %opt_typed_ptrs %use_old_pass_manager% -CMKernelArgOffset -march=genx64 -mcpu=XeHPG -S < %s | FileCheck %s --check-prefixes=CHECK,CHECK-TYPED-PTRS
+; RUN: %opt_opaque_ptrs %use_old_pass_manager% -CMKernelArgOffset -march=genx64 -mcpu=XeHPG -S < %s | FileCheck %s --check-prefixes=CHECK,CHECK-OPAQUE-PTRS
+
+; RUN: %opt_new_pm_typed -passes=CMKernelArgOffset -march=genx64 -mcpu=XeHPG -S < %s | FileCheck %s --check-prefixes=CHECK,CHECK-TYPED-PTRS
+; RUN: %opt_new_pm_opaque -passes=CMKernelArgOffset -march=genx64 -mcpu=XeHPG -S < %s | FileCheck %s --check-prefixes=CHECK,CHECK-OPAQUE-PTRS
 
 target datalayout = "e-p:64:64-i64:64-n8:16:32:64"
 target triple = "spir64-unknown-unknown"
@@ -100,8 +103,8 @@ attributes #0 = { nounwind "CMGenxMain" "oclrt"="1" }
 !8 = !{!"svmptr_t", !"svmptr_t"}
 !9 = !{void (%struct.state*, i32 addrspace(1)*, i64, i8, i32, i32, i32, float)* @foo, null, null, !10, null}
 ; COM: Check OffsetInArgs and ArgIndexes
-; CHECK-TYPED-PTRS: [[INTERNAL]] = !{[[FTYPE]] ([[STRUCT]]*, [[EXPARG2]], [[PRIVBASE]], [[IMPLIN1]], [[IMPLIN2]], [[IMPLIN3]], [[IMPLIN4]], [[IMPLIN5]])* @[[FNAME]], [[OFFSETINARGS:![0-9]+]], [[ARGINDEXES:![0-9]+]], [[LINMD:![0-9]+]], null}
-; CHECK-OPAQUE-PTRS: [[INTERNAL]] = !{ptr @[[FNAME]], [[OFFSETINARGS:![0-9]+]], [[ARGINDEXES:![0-9]+]], [[LINMD:![0-9]+]], null}
+; CHECK-TYPED-PTRS: [[INTERNAL]] = !{[[FTYPE]] ([[STRUCT]]*, [[EXPARG2]], [[PRIVBASE]], [[IMPLIN1]], [[IMPLIN2]], [[IMPLIN3]], [[IMPLIN4]], [[IMPLIN5]])* @[[FNAME]], [[OFFSETINARGS:![0-9]+]], [[ARGINDEXES:![0-9]+]], [[LINMD:![0-9]+]], null, i32 0}
+; CHECK-OPAQUE-PTRS: [[INTERNAL]] = !{ptr @[[FNAME]], [[OFFSETINARGS:![0-9]+]], [[ARGINDEXES:![0-9]+]], [[LINMD:![0-9]+]], null, i32 0}
 ; CHECK: [[OFFSETINARGS]] = !{i32 0, i32 0, i32 0, i32 0, i32 4, i32 8, i32 12, i32 16}
 ; CHECK: [[ARGINDEXES]] = !{i32 0, i32 1, i32 2, i32 0, i32 0, i32 0, i32 0, i32 0}
 !10 = !{!11}

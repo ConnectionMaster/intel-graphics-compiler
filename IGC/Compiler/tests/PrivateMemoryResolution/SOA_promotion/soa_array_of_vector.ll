@@ -8,7 +8,7 @@
 
 ; REQUIRES: regkeys
 ;
-; RUN: igc_opt --ocl --platformpvc --igc-private-mem-resolution --regkey EnablePrivMemNewSOATranspose=2  -S %s | FileCheck %s
+; RUN: igc_opt --typed-pointers --ocl --platformpvc --igc-private-mem-resolution --regkey EnablePrivMemNewSOATranspose=2  -S %s | FileCheck %s
 ;
 
 target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
@@ -44,7 +44,8 @@ entry:
 ; CHECK:       {{.*}} = load
 ;
 ; CHECK:       %idx = zext i32 %ix to i64
-; CHECK:       [[T10:%.*]] = mul i32 [[simdSize]], 0
+; CHECK:       [[T10_0:%.*]] = mul i32 [[simdSize]], 0
+; CHECK:       [[T10:%.*]] = add i32 0, [[T10_0]]
 ; CHECK:       [[T11:%.*]] = mul i32 [[simdLaneId]], 16
 ; CHECK:       [[T12:%.*]] = add i32 [[T10]], [[T11]]
 ; CHECK:       [[bufferOffset:%.*]] = add {{.*}} i32 [[perThreadOffset]], [[T12]]

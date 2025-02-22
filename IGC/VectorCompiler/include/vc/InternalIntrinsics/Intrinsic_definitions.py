@@ -113,6 +113,21 @@ Imported_Intrinsics = {
                                "memory_effects":
                                    { "access": "NoModRef" }, },
 
+## ``llvm.vc.internal.optimization.fence`` : optimization fence
+## ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+##
+## * arg0: input value
+##
+## * Return value: the same as arg0
+##
+## The purpose of the intrinsic is to prevent the compiler from
+## optimizing the value.
+##
+    "optimization_fence" : { "result": "any",
+                             "arguments": [0],
+                             "attributes": "None",
+                             "memory_effects": { "access": "NoModRef" }, },
+
 ### --------------
 ### ALU intrinsics
 ### --------------
@@ -172,6 +187,21 @@ Imported_Intrinsics = {
                                   "attributes": "None",
                                   "memory_effects":
                                       { "access": "NoModRef" }, },
+## ``llvm.vc.internal.stochastic.round.to.bf8`` : bf8 stochastic rounding operation
+## ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+##
+## * arg0: input data, f16 scalar or vector (overloaded)
+## * arg1: random number, i8 scalar or vector of the same width as arg0
+##
+## * Return value: i8 scalar or vector of the same width as arg0
+##
+## This intrinsic represents half->bf8 stochastic rounding operations
+    "stochastic_round_to_bf8" : { "result": "anyint",
+                                  "arguments": ["anyfloat", "anyint"],
+                                  "attributes": "None",
+                                  "memory_effects":
+                                      { "access": "NoModRef" }, },
+
 
 ## ``llvm.vc.internal.atomic.`` : intrinsics to represent SPIR-V atomic instructions
 ## ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

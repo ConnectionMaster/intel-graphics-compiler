@@ -1,12 +1,14 @@
 ;=========================== begin_copyright_notice ============================
 ;
-; Copyright (C) 2022 Intel Corporation
+; Copyright (C) 2022-2024 Intel Corporation
 ;
 ; SPDX-License-Identifier: MIT
 ;
 ;============================ end_copyright_notice =============================
 
-; RUN: llc %s -march=genx64 -mcpu=Gen9 -mattr=+ocl_runtime -vc-analyze=GenXOCLRuntimeInfo \
+; RUN: %llc_typed_ptrs %s -march=genx64 -mcpu=Gen9 -mattr=+ocl_runtime -vc-analyze=GenXOCLRuntimeInfo \
+; RUN: -vc-choose-pass-manager-override=false -o /dev/null 2>&1 | FileCheck %s
+; RUN: %llc_opaque_ptrs %s -march=genx64 -mcpu=Gen9 -mattr=+ocl_runtime -vc-analyze=GenXOCLRuntimeInfo \
 ; RUN: -vc-choose-pass-manager-override=false -o /dev/null 2>&1 | FileCheck %s
 
 target datalayout = "e-p:64:64-i64:64-n8:16:32"
@@ -19,10 +21,10 @@ target triple = "spir64-unknown-unknown"
 ; CHECK: Data:
 ; CHECK: Buffer: [
 ; CHECK-NOT: ,
-@rel.i64 = addrspace(2) constant i64 ptrtoint (void ()* @foo to i64), align 8
+@rel.i64 = addrspace(2) constant i64 ptrtoint (void () addrspace(9)* @foo to i64), align 8
 ; CHECK-SAME: 0, 0, 0, 0, 0, 0, 0, 0,
 ; CHECK-NOT: ,
-@rel.i32 = addrspace(2) constant i32 ptrtoint (void ()* @foo to i32), align 4
+@rel.i32 = addrspace(2) constant i32 ptrtoint (void () addrspace(9)* @foo to i32), align 4
 ; CHECK-SAME: 0, 0, 0, 0
 ; CHECK-NOT: ,
 ; CHECK-SAME: ]
@@ -49,8 +51,8 @@ target triple = "spir64-unknown-unknown"
 ; CHECK: Data:
 ; CHECK: Buffer: [
 ; CHECK-NOT: ,
-@rel.v2i64 = addrspace(1) global <2 x i64> <i64 ptrtoint (void ()* @bar to i64), i64 ptrtoint (void ()* @foo to i64)>, align 8
-@rel.v2i32 = addrspace(1) global <2 x i32> <i32 ptrtoint (void ()* @bar to i32), i32 ptrtoint (void ()* @foo to i32)>, align 4
+@rel.v2i64 = addrspace(1) global <2 x i64> <i64 ptrtoint (void () addrspace(9)* @bar to i64), i64 ptrtoint (void () addrspace(9)* @foo to i64)>, align 8
+@rel.v2i32 = addrspace(1) global <2 x i32> <i32 ptrtoint (void () addrspace(9)* @bar to i32), i32 ptrtoint (void () addrspace(9)* @foo to i32)>, align 4
 ; CHECK-COUNT-23: 0,
 ; CHECK-SAME: 0 ]
 ; CHECK: Symbols:
@@ -78,11 +80,11 @@ target triple = "spir64-unknown-unknown"
 ; CHECK-NEXT:   r_symbol: foo
 ; CHECK-NOT: r_
 
-define spir_func void @foo() #0 {
+define spir_func void @foo() addrspace(9) #0 {
   ret void
 }
 
-define spir_func void @bar() #0 {
+define spir_func void @bar() addrspace(9) #0 {
   ret void
 }
 

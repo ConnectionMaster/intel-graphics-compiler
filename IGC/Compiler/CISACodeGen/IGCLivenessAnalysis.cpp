@@ -17,6 +17,7 @@ SPDX-License-Identifier: MIT
 #include "GenISAIntrinsics/GenIntrinsicInst.h"
 #include "common/debug/Debug.hpp"
 #include "common/igc_regkeys.hpp"
+#include "llvmWrapper/IR/Function.h"
 
 #include <fstream>
 #include <queue>
@@ -96,20 +97,14 @@ ValueSet IGCLivenessAnalysisBase::getDefs(llvm::BasicBlock &BB) {
     return Difference;
 }
 
-// for every successor we take all of it's IN values
-// and the PHI values that are coming from our BB
-void IGCLivenessAnalysisBase::mergeSets(ValueSet *OutSet, llvm::BasicBlock *Succ) {
-    for (auto elem : In[Succ])
-        OutSet->insert(elem);
-}
-
 // we scan through all successors and merge their INSETs as our OUTSET
-void IGCLivenessAnalysisBase::combineOut(llvm::BasicBlock *BB, ValueSet *Set) {
+void IGCLivenessAnalysisBase::combineOut(llvm::BasicBlock *BB) {
     ValueSet *OutSet = &Out[BB];
     for (llvm::succ_iterator SI = llvm::succ_begin(BB), SE = llvm::succ_end(BB);
          SI != SE; ++SI) {
-        llvm::BasicBlock *Successor = *SI;
-        mergeSets(OutSet, Successor);
+        // for every successor we take all of it's IN values
+        // and the PHI values that are coming from our BB
+        OutSet->insert(In[*SI].begin(),In[*SI].end());
     }
 }
 
@@ -238,8 +233,9 @@ void IGCLivenessAnalysisBase::livenessAnalysis(llvm::Function &F, BBSet *StartBB
     {
         // Start with adding all BBs to the Worklist
         // to make sure In set is populated for every BB
-        for (BasicBlock &BB : F)
-            Worklist.push(&BB);
+        for (auto BBIt = IGCLLVM::rbegin(&F); BBIt != IGCLLVM::rend(&F); ++BBIt) {
+            Worklist.push(&*BBIt);
+        }
     }
 
     while (!Worklist.empty()) {
@@ -251,7 +247,7 @@ void IGCLivenessAnalysisBase::livenessAnalysis(llvm::Function &F, BBSet *StartBB
         ValueSet *OutSet = &Out[BB];
         PhiSet *InPhiSet = &InPhi[BB];
 
-        combineOut(BB, OutSet);
+        combineOut(BB);
 
         unsigned int SizeBefore = InSet->size();
         unsigned int SizeBeforePhi = InPhiSet->size();
@@ -398,14 +394,42 @@ void IGCRegisterPressurePrinter::dumpRegPressure(llvm::Function &F,
 
     IGC::Debug::DumpLock();
     {
+        const int MaxFunctionLength = 100;
+
         std::stringstream ss;
-        ss << F.getName().str() << "_" << DumpFileName << "_RegEst";
+        std::string FunctionName = F.getName().str();
+
+        std::replace_if(FunctionName.begin(), FunctionName.end(), [](char c) {
+            return !std::isalnum(c) && c != '_';
+        }, '_');
+
+        if (FunctionName.length() > MaxFunctionLength) {
+            FunctionName = FunctionName.substr(0, MaxFunctionLength);
+        }
+
+        ss << FunctionName << "_" << DumpFileName << "_RegEst";
         auto Name = Debug::DumpName(IGC::Debug::GetShaderOutputName())
                         .Hash(CGCtx->hash)
                         .Type(CGCtx->type)
                         .Retry(CGCtx->m_retryManager.GetRetryId())
                         .Pass(ss.str().c_str())
                         .Extension("ll");
+
+        int Counter = 1;
+        std::string originalName = Name.str();
+        std::ifstream FileToCheck(Name.str());
+        while (FileToCheck.good()) {
+            FileToCheck.close();
+            Name = Debug::DumpName(IGC::Debug::GetShaderOutputName())
+                .Hash(CGCtx->hash)
+                .Type(CGCtx->type)
+                .Retry(CGCtx->m_retryManager.GetRetryId())
+                .Pass((ss.str() + "_" + std::to_string(Counter)).c_str())
+                .Extension("ll");
+            FileToCheck.open(Name.str());
+            Counter++;
+        }
+        FileToCheck.close();
 
         std::ofstream OutputFile(Name.str());
         OutputFile << "SIMD: " << SIMD << ", external pressure: " << ExternalPressure << "\n";

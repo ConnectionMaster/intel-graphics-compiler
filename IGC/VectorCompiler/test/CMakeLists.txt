@@ -1,6 +1,6 @@
 #=========================== begin_copyright_notice ============================
 #
-# Copyright (C) 2020-2023 Intel Corporation
+# Copyright (C) 2020-2025 Intel Corporation
 #
 # SPDX-License-Identifier: MIT
 #
@@ -36,6 +36,9 @@ if(LLVM_ON_UNIX)
     llc
     VCBackendPlugin
     )
+  if (${LLVM_VERSION_MAJOR} GREATER 15)
+    list(APPEND TEST_DEPS NewPMPlugin)
+  endif()
 endif()
 
 file(GLOB_RECURSE _tests "${VC_TEST_SOURCE_DIR}/*.ll" "${VC_TEST_SOURCE_DIR}/*.s")

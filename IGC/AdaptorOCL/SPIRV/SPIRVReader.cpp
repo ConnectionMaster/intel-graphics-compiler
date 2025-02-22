@@ -727,7 +727,7 @@ public:
           elements.push_back(enumerator);
       }
 
-      auto nodeArray = Builder.getOrCreateArray(llvm::makeArrayRef(elements));
+      auto nodeArray = Builder.getOrCreateArray(ArrayRef<llvm::Metadata*>(elements));
 
       return addMDNode(inst, Builder.createEnumerationType(scope, name, file, line, size, 0, nodeArray, type));
   }
@@ -4261,7 +4261,7 @@ SPIRVToLLVM::transFunction(SPIRVFunction *BF) {
   BF->foreachReturnValueAttr([&](SPIRVFuncParamAttrKind Kind){
     if (Kind == FunctionParameterAttributeCount || Kind == FunctionParameterAttributeNoWrite)
       return;
-    IGCLLVM::addRetAttr(F, SPIRSPIRVFuncParamAttrMap::rmap(Kind));
+    F->addRetAttr(SPIRSPIRVFuncParamAttrMap::rmap(Kind));
   });
 
   // Creating all basic blocks before creating instructions.
@@ -5197,7 +5197,7 @@ SPIRVToLLVM::transOCLBuiltinFromExtInst(SPIRVExtInst *BC, BasicBlock *BB) {
       BC->getName(),
       BB);
   setCallingConv(Call);
-  IGCLLVM::addFnAttr(Call, Attribute::NoUnwind);
+  Call->addFnAttr(Attribute::NoUnwind);
   return Call;
 }
 

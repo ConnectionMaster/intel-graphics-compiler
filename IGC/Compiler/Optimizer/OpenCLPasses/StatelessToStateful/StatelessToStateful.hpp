@@ -32,7 +32,7 @@ namespace IGC
         BINDLESS
     };
 
-    class StatelessToStateful : public llvm::FunctionPass, public llvm::InstVisitor<StatelessToStateful>
+    class StatelessToStateful : public llvm::ModulePass, public llvm::InstVisitor<StatelessToStateful>
     {
     public:
         typedef llvm::DenseMap<const KernelArg*, int> ArgInfoMap;
@@ -57,13 +57,11 @@ namespace IGC
             return "StatelessToStateful";
         }
 
-        virtual bool runOnFunction(llvm::Function& F) override;
+        virtual bool runOnModule(llvm::Module &M) override;
 
         void visitLoadInst(llvm::LoadInst& I);
         void visitStoreInst(llvm::StoreInst& I);
         void visitCallInst(llvm::CallInst& I);
-
-        static bool WA_ForcedUsedOfBindfulMode(const llvm::Function& F);
 
     private:
         struct InstructionInfo {
@@ -86,6 +84,11 @@ namespace IGC
             std::optional<unsigned> statefulAddrSpace;
         };
 
+        void handleFunction(llvm::Function& F);
+
+        void setModuleUsesBindless();
+        bool getModuleUsesBindless();
+
         void findPromotableInstructions();
         void addToPromotionMap(llvm::Instruction& I, llvm::Value* Ptr);
 
@@ -97,6 +100,14 @@ namespace IGC
 
         bool doPromoteUntypedAtomics(const llvm::GenISAIntrinsic::ID intrinID, const llvm::GenIntrinsicInst* Inst);
         bool isUntypedAtomic(const llvm::GenISAIntrinsic::ID intrinID);
+
+        // LLVM InstCombine pass replaces multiple loads that have a single phi instruction as their user,
+        // with a phi on the addresses followed by a single load. This prevents StatelessToStateful from making loads
+        // statefull.
+        // These functions are aimed to revert this change which was made by InstCombine.
+        bool hoistLoad();
+        bool canWriteToMemoryTill(llvm::Instruction* Till);
+        bool isItSafeToHoistLoad(llvm::LoadInst* LI, llvm::PHINode* Phi);
 
         // pointerIsPositiveOffsetFromKernelArgument - check if V can trace back to a kernel argument and
         // has positive offset from that argument.

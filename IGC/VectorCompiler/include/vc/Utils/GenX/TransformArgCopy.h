@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2022 Intel Corporation
+Copyright (C) 2022-2024 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -13,9 +13,10 @@ SPDX-License-Identifier: MIT
 
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/ADT/SetVector.h>
-#include <llvm/ADT/SmallPtrSet.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Analysis/CallGraph.h>
+#include <llvm/Analysis/CallGraphSCCPass.h>
+#include <llvm/Analysis/LazyCallGraph.h>
 #include <llvm/IR/Argument.h>
 #include <llvm/IR/Attributes.h>
 #include <llvm/IR/Function.h>
@@ -30,7 +31,7 @@ SPDX-License-Identifier: MIT
 namespace vc {
 
 // Collect arguments that should be transformed.
-llvm::SmallPtrSet<llvm::Argument *, 8>
+llvm::SmallDenseMap<llvm::Argument *, llvm::Type *>
 collectArgsToTransform(llvm::Function &F, vc::TypeSizeWrapper MaxStructSize);
 
 void replaceUsesWithinFunction(
@@ -140,8 +141,9 @@ class TransformedFuncInfo {
   GlobalArgsInfo GlobalArgs;
 
 public:
-  TransformedFuncInfo(llvm::Function &OrigFunc,
-                      llvm::SmallPtrSetImpl<llvm::Argument *> &ArgsToTransform);
+  TransformedFuncInfo(
+      llvm::Function &OrigFunc,
+      llvm::SmallDenseMap<llvm::Argument *, llvm::Type *> &ArgsToTransform);
   void appendGlobals(llvm::SetVector<llvm::GlobalVariable *> &Globals);
   // Gather attributes for new function type according to transformations.
   llvm::AttributeList gatherAttributes(llvm::LLVMContext &Context,
@@ -157,9 +159,9 @@ public:
   const GlobalArgsInfo &getGlobalArgsInfo() const { return GlobalArgs; }
 
 private:
-  void
-  fillOrigArgInfo(llvm::Function &OrigFunc,
-                  llvm::SmallPtrSetImpl<llvm::Argument *> &ArgsToTransform);
+  void fillOrigArgInfo(
+      llvm::Function &OrigFunc,
+      llvm::SmallDenseMap<llvm::Argument *, llvm::Type *> &ArgsToTransform);
 
   void inheritAttributes(llvm::Function &OrigFunc);
 
@@ -185,6 +187,25 @@ public:
                    llvm::CallGraphNode &NewFuncCGNIn, llvm::CallGraph &CGIn)
       : OrigFunc{OrigFuncIn}, NewFunc{NewFuncIn}, NewFuncInfo{NewFuncInfoIn},
         NewFuncCGN{NewFuncCGNIn}, CG{CGIn} {}
+
+  void run();
+
+private:
+  llvm::CallInst *updateFuncDirectUser(llvm::CallInst &OrigCall);
+};
+
+class FuncUsersUpdaterNewPM {
+  llvm::Function &OrigFunc;
+  llvm::Function &NewFunc;
+  const TransformedFuncInfo &NewFuncInfo;
+  llvm::LazyCallGraph &CG;
+
+public:
+  FuncUsersUpdaterNewPM(llvm::Function &OrigFuncIn, llvm::Function &NewFuncIn,
+                        const TransformedFuncInfo &NewFuncInfoIn,
+                        llvm::LazyCallGraph &CGIn)
+      : OrigFunc{OrigFuncIn}, NewFunc{NewFuncIn},
+        NewFuncInfo{NewFuncInfoIn}, CG{CGIn} {}
 
   void run();
 

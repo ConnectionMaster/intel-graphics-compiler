@@ -22,7 +22,6 @@ SPDX-License-Identifier: MIT
 
 #include "GenerateBlockMemOpsPass.hpp"
 #include "IGCIRBuilder.h"
-#include "IGC/WrapperLLVM/include/llvmWrapper/IR/Attributes.h"
 
 using namespace llvm;
 using namespace IGC;
@@ -50,7 +49,6 @@ bool GenerateBlockMemOpsPass::runOnFunction(Function &F) {
         return false;
 
     bool Changed = false;
-
     // Load / store instructions which are not in code divergence and can be optimized.
     SmallVector<Instruction*, 32> LoadStoreToProcess;
     // Load / store instructions which are inside the loop and can be optimized.
@@ -95,7 +93,6 @@ bool GenerateBlockMemOpsPass::runOnFunction(Function &F) {
             } else if (Loop *L = LI->getLoopFor(I.getParent())) {
                 // In some cases IGC can't proof that there is no code divergence in the loop.
                 // Handle these cases here.
-
                 // Check that the loop has been already analyzed.
                 if (LoadStoreInLoop.find(L) == LoadStoreInLoop.end()) {
                     if (!isLoopPattern(L))
@@ -516,12 +513,12 @@ bool GenerateBlockMemOpsPass::doesLoopHaveExternUse(Loop *L) {
     return false;
 }
 
-bool GenerateBlockMemOpsPass::isAddressAligned(Value *Ptr, const alignment_t &CurrentAlignment, Type *DataType) {
+bool GenerateBlockMemOpsPass::isDataTypeSupported(Value *Ptr, Type *DataType) {
     unsigned ScalarSize = DataType->getScalarSizeInBits();
 
     // The list of possible alignments should be expanded.
     if (CGCtx->platform.isProductChildOf(IGFX_PVC))
-        if ((ScalarSize == 32) && (CurrentAlignment == 4))
+        if (ScalarSize == 32 || ScalarSize == 64)
             return true;
 
     return false;
@@ -570,17 +567,19 @@ bool GenerateBlockMemOpsPass::isIndexContinuous(Value *Indx) {
                 }
                 VisitedPhi = Phi;
             } else if (Instruction *Inst = dyn_cast<Instruction>(NonUnifOp)) {
-                if (Inst->getOpcode() != Instruction::Add)
+                if (Inst->getOpcode() != Instruction::Add && Inst->getOpcode() != Instruction::Sub)
                     return false;
 
                 Value *Op0 = Inst->getOperand(0);
                 Value *Op1 = Inst->getOperand(1);
 
-
                 if (!WI->isUniform(Op1) && !WI->isUniform(Op0))
                     return false;
 
                 if (WI->isUniform(Op0)) {
+                    if (Inst->getOpcode() == Instruction::Sub)
+                        return false;
+
                     NonUniformInstVector.push_back(Op1);
                 } else {
                     NonUniformInstVector.push_back(Op0);
@@ -630,17 +629,14 @@ bool GenerateBlockMemOpsPass::canOptLoadStore(Instruction *I) {
     Value *Ptr = nullptr;
     Value *ValOp = nullptr;
     Type *DataType = nullptr;
-    alignment_t CurrentAlignment = 0;
 
     if (LoadInst *LI = dyn_cast<LoadInst>(I)) {
         Ptr = LI->getPointerOperand();
-        CurrentAlignment = IGCLLVM::getAlignmentValue(LI);
         DataType = cast<Value>(LI)->getType();
     } else {
         StoreInst* SI = cast<StoreInst>(I);
         Ptr = SI->getPointerOperand();
         ValOp = SI->getValueOperand();
-        CurrentAlignment = IGCLLVM::getAlignmentValue(SI);
         DataType = ValOp->getType();
     }
 
@@ -648,7 +644,7 @@ bool GenerateBlockMemOpsPass::canOptLoadStore(Instruction *I) {
         return false;
 
     // Need to check what alignment block load/store requires for the specific architecture.
-    if (!isAddressAligned(Ptr, CurrentAlignment, DataType))
+    if (!isDataTypeSupported(Ptr, DataType))
         return false;
 
     // Get the last index from the getelementptr instruction if it is not uniform in the subgroup.
@@ -722,35 +718,28 @@ bool GenerateBlockMemOpsPass::changeToBlockInst(Instruction *I) {
 }
 
 void GenerateBlockMemOpsPass::setAlignmentAttr(CallInst *CI, const unsigned &Alignment) {
-    llvm::Attribute CustomAttr = llvm::Attribute::get(CI->getContext(), "alignmentrequirements", std::to_string(Alignment));
-    auto B = IGCLLVM::makeAttrBuilder(CI->getContext());
-    B.addAttribute("alignmentrequirements", std::to_string(Alignment));
-    llvm::AttributeList CurrentAttrs = CI->getAttributes();
-    llvm::AttributeList NewAttrs = IGCLLVM::addFnAttributes(CurrentAttrs, CI->getContext(), B);
-    CI->setAttributes(NewAttrs);
+    auto CustomAttr = llvm::Attribute::get(CI->getContext(), "alignmentrequirements", std::to_string(Alignment));
+    CI->addFnAttr(CustomAttr);
 }
 
 Value *GenerateBlockMemOpsPass::checkGep(Instruction *PtrInstr) {
     if (!PtrInstr)
         return nullptr;
 
-    PHINode *Phi = dyn_cast<PHINode>(PtrInstr);
     GetElementPtrInst *Gep = nullptr;
-    if (Phi) {
+    if (PHINode *Phi = dyn_cast<PHINode>(PtrInstr)) {
         unsigned NumIncomingValues = Phi->getNumIncomingValues();
-        if (NumIncomingValues != 2)
+        if (NumIncomingValues != 2) {
             return nullptr;
+        }
 
         BasicBlock *BB = PtrInstr->getParent();
-        Loop *L = LI->getLoopFor(BB);
-        BasicBlock *Preheader = L->getLoopPreheader();
-
-        Value *IncomingVal1 = Phi->getIncomingValueForBlock(Preheader);
-
-        Gep = dyn_cast<GetElementPtrInst>(IncomingVal1);
-
-        if (!Gep)
-            return nullptr;
+        // If this is not a loop, we can't be sure of the flow. Better do nothing.
+        if (Loop *L = LI->getLoopFor(BB)) {
+            BasicBlock *Preheader = L->getLoopPreheader();
+            Value *IncomingVal1 = Phi->getIncomingValueForBlock(Preheader);
+            Gep = dyn_cast<GetElementPtrInst>(IncomingVal1);
+        }
     } else {
         Gep = dyn_cast<GetElementPtrInst>(PtrInstr);
     }

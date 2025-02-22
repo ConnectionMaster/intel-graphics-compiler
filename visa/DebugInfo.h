@@ -22,6 +22,7 @@ SPDX-License-Identifier: MIT
 
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace vISA {
@@ -203,6 +204,8 @@ private:
   G4_INST *setupFP;
   // Instruction that destroys BE_FP for current frame
   G4_INST *restoreSP;
+  // Instruction that stores CE in prolog
+  G4_INST *saveCE;
 
   // Current frame size in bytes
   uint32_t frameSize;
@@ -211,14 +214,25 @@ private:
   // NULL for kernel.
   G4_Declare *fretVar;
 
+  // Offset from FP where CE is stored
+  uint16_t CEStoreOffset;
+
   // Caller save/restore
   // std::vector<std::pair<fcall inst BB, std::pair<first caller save, last
   // caller restore>>> One entry per fcall inst in current compilation unit
-  typedef std::pair<std::vector<G4_INST *>, std::vector<G4_INST *>> SaveRestore;
+  using SaveRestore = std::pair<std::vector<G4_INST *>, std::vector<G4_INST *>>;
   std::unordered_map<G4_BB *, SaveRestore> callerSaveRestore;
   SaveRestore calleeSaveRestore;
 
-  INST_LIST oldInsts;
+  // Cache used to quickly check if intrinsic is in
+  // callerSaveRestore/calleeSaveRestore.
+  struct SaveRestoreIndex {
+    bool isSave;
+    G4_BB *bb;
+  };
+  std::unordered_map<vISA::G4_INST *, SaveRestoreIndex> isSaveRestoreInst;
+
+  std::unordered_set<vISA::G4_INST *>  oldInsts;
 
   // Store pair of cisa byte offset and gen byte offset in vector
   std::vector<IDX_VDbgCisaByte2Gen> mapCISAOffsetGenOffset;
@@ -303,7 +317,13 @@ public:
   G4_Declare *getFretVar() const { return fretVar; }
   void setFretVar(G4_Declare *dcl) { fretVar = dcl; }
 
-  void updateExpandedIntrinsic(G4_InstIntrinsic *spillOrFill, G4_INST *inst);
+  G4_INST *getCESaveInst() const { return saveCE; }
+  void setSaveCEInst(G4_INST *i) { saveCE = i; }
+
+  void setCESaveOffset(uint16_t Off) { CEStoreOffset = Off; }
+  uint16_t getCESaveOffset() const { return CEStoreOffset; }
+
+  void updateExpandedIntrinsic(G4_InstIntrinsic *spillOrFill, INST_LIST &insts);
   void addCallerSaveInst(G4_BB *fcallBB, G4_INST *inst);
   void addCallerRestoreInst(G4_BB *fcallBB, G4_INST *inst);
   void addCalleeSaveInst(G4_INST *inst);
@@ -315,7 +335,7 @@ public:
   std::vector<G4_INST *> &getCalleeSaveInsts();
   std::vector<G4_INST *> &getCalleeRestoreInsts();
 
-  void setOldInstList(G4_BB *bb) { oldInsts.assign(bb->begin(), bb->end()); }
+  void setOldInstList(G4_BB *bb) { oldInsts.insert(bb->begin(), bb->end()); }
   void clearOldInstList() { oldInsts.clear(); }
   INST_LIST getDeltaInstructions(G4_BB *bb);
 
@@ -540,10 +560,14 @@ struct CallFrameInfo
     uint8_t befpValid;
     VarLiveIntervalGenISA befp; // Validity depends on flag befpValid
     uint8_t callerbefpValid;
-    VarLiveIntervalGenISA callerbefp; // Validity depends on flag
-callerbefpValid uint8_t retAddrValid; VarLiveIntervalGenISA retAddr; // Validity
-depends on flag retAddrValid uint16_t numCalleeSaveEntries; PhyRegSaveInfoPerIP
-calleeSaveEntry[numCalleeSaveEntries];
+    VarLiveIntervalGenISA callerbefp; // Validity depends on flag callerbefpValid
+    uint8_t retAddrValid;
+    VarLiveIntervalGenISA retAddr; // Validity depends on flag retAddrValid
+    uint16_t CEOffsetFromFPOff; // -1 means CE not saved offset
+    uint16_t CEStoreIP; // This field stores IP where CE is stored.
+                       // Valid only if CEOffsetFromFPOff != -1.
+    uint16_t numCalleeSaveEntries;
+    PhyRegSaveInfoPerIP calleeSaveEntry[numCalleeSaveEntries];
     // Need this because of following:
     //
     // V10 -> r2, r3, r4, r5, r6, r7

@@ -9,7 +9,6 @@ SPDX-License-Identifier: MIT
 #define DEBUG_TYPE "vc-transform-arg-copy"
 
 #include "llvmWrapper/Analysis/CallGraph.h"
-#include "llvmWrapper/IR/Attributes.h"
 #include "llvmWrapper/IR/CallSite.h"
 #include "llvmWrapper/IR/Function.h"
 #include "llvmWrapper/IR/Instructions.h"
@@ -113,10 +112,7 @@ static bool isPtrArgModified(const Value &Arg) {
 }
 
 // Check if it is safe to pass structure by value.
-static bool structSafeToPassByVal(const Argument &Arg) {
-  StructType *StrTy =
-      cast<StructType>(IGCLLVM::getNonOpaquePtrEltTy(Arg.getType()));
-
+static bool structSafeToPassByVal(const Argument &Arg, StructType *StrTy) {
   if (!containsOnlySuitableTypes(*StrTy))
     return false;
 
@@ -150,13 +146,99 @@ static bool structSafeToPassByVal(const Argument &Arg) {
   return llvm::all_of(Arg.users(), UserChecker) && !isPtrArgModified(Arg);
 }
 
+static Type *getPtrArgElementType(const Argument &PtrArg) {
+  auto *PtrArgTy = cast<PointerType>(PtrArg.getType());
+  if (!PtrArgTy->isOpaque())
+    return IGCLLVM::getNonOpaquePtrEltTy(PtrArgTy);
+  if (auto *ByValTy = PtrArg.getParamByValType())
+    return ByValTy;
+  if (auto *StructRetTy = PtrArg.getParamStructRetType())
+    return StructRetTy;
+  SmallPtrSet<Type *, 2> ElemTys;
+  for (auto *U : PtrArg.users()) {
+    if (ElemTys.size() > 1)
+      return nullptr;
+    auto *I = dyn_cast<Instruction>(U);
+    if (!I)
+      continue;
+    if (auto *LI = dyn_cast<LoadInst>(I)) {
+      if (&PtrArg == LI->getPointerOperand())
+        ElemTys.insert(LI->getType());
+    } else if (auto *SI = dyn_cast<StoreInst>(I)) {
+      if (&PtrArg == SI->getPointerOperand())
+        ElemTys.insert(SI->getValueOperand()->getType());
+    } else if (auto *GEPI = dyn_cast<GetElementPtrInst>(I)) {
+      if (&PtrArg == GEPI->getPointerOperand())
+        ElemTys.insert(GEPI->getSourceElementType());
+    } else if (auto *PTII = dyn_cast<PtrToIntInst>(I)) {
+      const Value *Addr = PTII;
+      for (auto *AddrUser : Addr->users()) {
+        switch (GenXIntrinsic::getAnyIntrinsicID(AddrUser)) {
+        case GenXIntrinsic::genx_gather_scaled:
+          if (Addr != AddrUser->getOperand(4))
+            continue;
+          ElemTys.insert(AddrUser->getType());
+          break;
+        case GenXIntrinsic::genx_scatter_scaled:
+          if (Addr != AddrUser->getOperand(4))
+            continue;
+          ElemTys.insert(AddrUser->getOperand(6)->getType());
+          break;
+        case GenXIntrinsic::genx_svm_block_ld:
+        case GenXIntrinsic::genx_svm_block_ld_unaligned:
+          if (Addr != AddrUser->getOperand(0))
+            continue;
+          ElemTys.insert(AddrUser->getType());
+          break;
+        case GenXIntrinsic::genx_svm_block_st:
+          if (Addr != AddrUser->getOperand(0))
+            continue;
+          ElemTys.insert(AddrUser->getOperand(1)->getType());
+          break;
+        default:
+          break;
+        }
+      }
+      if (!PTII->hasOneUse())
+        continue;
+      auto *IEI = dyn_cast<InsertElementInst>(PTII->user_back());
+      if (!IEI)
+        continue;
+      const Value *AddrVec = IEI;
+      if (IEI->hasOneUse())
+        if (auto *SVI = dyn_cast<ShuffleVectorInst>(IEI->user_back()))
+          if (SVI->hasOneUse())
+            if (auto *BO = dyn_cast<BinaryOperator>(SVI->user_back()))
+              AddrVec = BO;
+      for (auto *AddrVecUser : AddrVec->users()) {
+        switch (GenXIntrinsic::getAnyIntrinsicID(AddrVecUser)) {
+        case GenXIntrinsic::genx_svm_gather:
+          if (AddrVec != AddrVecUser->getOperand(2))
+            continue;
+          ElemTys.insert(AddrVecUser->getType());
+          break;
+        case GenXIntrinsic::genx_svm_scatter:
+          if (AddrVec != AddrVecUser->getOperand(2))
+            continue;
+          ElemTys.insert(AddrVecUser->getOperand(3)->getType());
+          break;
+        default:
+          break;
+        }
+      }
+    }
+  }
+  return ElemTys.empty() ? nullptr : *ElemTys.begin();
+}
+
 // Check if argument should be transformed.
-static bool argToTransform(const Argument &Arg,
-                           vc::TypeSizeWrapper MaxStructSize) {
-  auto *PtrTy = dyn_cast<PointerType>(Arg.getType());
-  if (!PtrTy)
-    return false;
-  Type *ElemTy = IGCLLVM::getNonOpaquePtrEltTy(PtrTy);
+static Type *argToTransform(const Argument &Arg,
+                            vc::TypeSizeWrapper MaxStructSize) {
+  if (!isa<PointerType>(Arg.getType()))
+    return nullptr;
+  auto *ElemTy = getPtrArgElementType(Arg);
+  if (!ElemTy)
+    return nullptr;
   if (ElemTy->isIntOrIntVectorTy() || ElemTy->isFPOrFPVectorTy()) {
     if (ElemTy->isVectorTy()) {
       for (auto *U : Arg.users()) {
@@ -167,28 +249,28 @@ static bool argToTransform(const Argument &Arg,
           continue;
         auto *ConstIdx = dyn_cast<ConstantInt>(*GEP->idx_begin());
         if (!ConstIdx || ConstIdx->getZExtValue() != 0)
-          return false;
+          return nullptr;
       }
-      return true;
-    }
-    return onlyUsedBySimpleValueLoadStore(Arg);
+    } else if (!onlyUsedBySimpleValueLoadStore(Arg))
+      return nullptr;
+    return ElemTy;
   }
   if (auto *StrTy = dyn_cast<StructType>(ElemTy)) {
     const DataLayout &DL = Arg.getParent()->getParent()->getDataLayout();
-    if (structSafeToPassByVal(Arg) &&
+    if (structSafeToPassByVal(Arg, StrTy) &&
         vc::getTypeSize(StrTy, &DL) <= MaxStructSize)
-      return true;
+      return ElemTy;
   }
-  return false;
+  return nullptr;
 }
 
 // Collect arguments that should be transformed.
-SmallPtrSet<Argument *, 8>
+SmallDenseMap<Argument *, Type *>
 vc::collectArgsToTransform(Function &F, vc::TypeSizeWrapper MaxStructSize) {
-  SmallPtrSet<Argument *, 8> ArgsToTransform;
+  SmallDenseMap<Argument *, Type *> ArgsToTransform;
   for (auto &Arg : F.args())
-    if (argToTransform(Arg, MaxStructSize))
-      ArgsToTransform.insert(&Arg);
+    if (auto *ArgElemTy = argToTransform(Arg, MaxStructSize))
+      ArgsToTransform.insert(std::make_pair(&Arg, ArgElemTy));
   return ArgsToTransform;
 }
 
@@ -287,7 +369,7 @@ int vc::OrigArgInfo::getNewIdx() const {
 }
 
 vc::TransformedFuncInfo::TransformedFuncInfo(
-    Function &OrigFunc, SmallPtrSetImpl<Argument *> &ArgsToTransform) {
+    Function &OrigFunc, SmallDenseMap<Argument *, Type *> &ArgsToTransform) {
   fillOrigArgInfo(OrigFunc, ArgsToTransform);
   inheritAttributes(OrigFunc);
 
@@ -336,7 +418,7 @@ void vc::TransformedFuncInfo::appendGlobals(
 }
 
 void vc::TransformedFuncInfo::fillOrigArgInfo(
-    Function &OrigFunc, SmallPtrSetImpl<Argument *> &ArgsToTransform) {
+    Function &OrigFunc, SmallDenseMap<Argument *, Type *> &ArgsToTransform) {
   IGC_ASSERT_MESSAGE(OrigArgs.empty(),
                      "shouldn't be filled before this method");
 
@@ -359,7 +441,9 @@ void vc::TransformedFuncInfo::fillOrigArgInfo(
 
     // Update type for transformed arguments.
     if (Kind != ArgKind::General) {
-      Ty = IGCLLVM::getNonOpaquePtrEltTy(Ty);
+      auto It = ArgsToTransform.find(&Arg);
+      IGC_ASSERT_EXIT(It != ArgsToTransform.end());
+      Ty = It->second;
     }
 
     if (Kind == ArgKind::CopyOut) {
@@ -385,20 +469,15 @@ vc::TransformedFuncInfo::gatherAttributes(LLVMContext &Context,
     if (OrigArgInfoEntry.getKind() == ArgKind::General) {
       IGC_ASSERT_MESSAGE(!OrigArgInfoEntry.isOmittedArg(),
                          "unexpected omitted argument");
-      AttributeSet ArgAttrs = IGCLLVM::getParamAttrs(AL, OrigIdx);
-      if (ArgAttrs.hasAttributes())
-        GatheredAttrs = GatheredAttrs.addParamAttributes(
-            Context, OrigArgInfoEntry.getNewIdx(),
-            IGCLLVM::makeAttrBuilder(Context, ArgAttrs));
+      AttrBuilder ArgAttrB(Context, AL.getParamAttrs(OrigIdx));
+      GatheredAttrs = GatheredAttrs.addParamAttributes(
+          Context, OrigArgInfoEntry.getNewIdx(), ArgAttrB);
     }
   }
 
   // Gather function attributes.
-  AttributeSet FnAttrs = IGCLLVM::getFnAttrs(AL);
-  if (FnAttrs.hasAttributes()) {
-    auto B = IGCLLVM::makeAttrBuilder(Context, FnAttrs);
-    GatheredAttrs = IGCLLVM::addAttributesAtIndex(GatheredAttrs, Context, AttributeList::FunctionIndex, B);
-  }
+  AttrBuilder B(Context, AL.getFnAttrs());
+  GatheredAttrs = GatheredAttrs.addFnAttributes(Context, B);
 
   return GatheredAttrs;
 }
@@ -495,8 +574,8 @@ getTransformedFuncCallArgs(CallInst &OrigCall,
       IGC_ASSERT_MESSAGE(Kind == ArgKind::CopyIn || Kind == ArgKind::CopyInOut,
                          "unexpected arg kind");
       LoadInst *Load =
-          new LoadInst(IGCLLVM::getNonOpaquePtrEltTy(OrigArg.get()->getType()),
-                       OrigArg.get(), OrigArg.get()->getName() + ".val",
+          new LoadInst(OrigArgData.getTransformedOrigType(), OrigArg.get(),
+                       OrigArg.get()->getName() + ".val",
                        /* isVolatile */ false, &OrigCall);
       NewCallOps.push_back(Load);
       break;
@@ -766,6 +845,65 @@ CallInst *vc::FuncUsersUpdater::updateFuncDirectUser(CallInst &OrigCall) {
   auto CalleeNode =
       static_cast<IGCLLVM::CallGraphNode *>(CG[OrigCall.getFunction()]);
   CalleeNode->replaceCallEdge(OrigCall, *NewCall, &NewFuncCGN);
+
+  IRBuilder<> Builder(&OrigCall);
+  for (auto &RetToArg : enumerate(NewFuncInfo.getRetToArgInfo()))
+    handleRetValuePortion(RetToArg.index(), RetToArg.value(), OrigCall,
+                          *NewCall, Builder, NewFuncInfo);
+  return NewCall;
+}
+
+void vc::FuncUsersUpdaterNewPM::run() {
+  std::vector<CallInst *> DirectUsers;
+
+  for (auto *U : OrigFunc.users()) {
+    IGC_ASSERT_MESSAGE(
+        isa<CallInst>(U),
+        "the transformation is not applied to indirectly called functions");
+    DirectUsers.push_back(cast<CallInst>(U));
+  }
+
+  std::vector<CallInst *> NewDirectUsers;
+  // Loop over all of the callers of the function, transforming the call sites
+  // to pass in the loaded pointers.
+  for (auto *OrigCall : DirectUsers) {
+    IGC_ASSERT(OrigCall->getCalledFunction() == &OrigFunc);
+    auto *NewCall = updateFuncDirectUser(*OrigCall);
+    NewDirectUsers.push_back(NewCall);
+  }
+
+  for (auto *OrigCall : DirectUsers)
+    OrigCall->eraseFromParent();
+}
+
+CallInst *vc::FuncUsersUpdaterNewPM::updateFuncDirectUser(CallInst &OrigCall) {
+  std::vector<Value *> NewCallOps =
+      getTransformedFuncCallArgs(OrigCall, NewFuncInfo);
+
+  AttributeList NewCallAttrs = inheritCallAttributes(
+      OrigCall, OrigFunc.getFunctionType()->getNumParams(), NewFuncInfo);
+
+  // Push any localized globals.
+  IGC_ASSERT_MESSAGE(NewCallOps.size() ==
+                         NewFuncInfo.getGlobalArgsInfo().FirstGlobalArgIdx,
+                     "call operands and called function info are inconsistent");
+  llvm::transform(NewFuncInfo.getGlobalArgsInfo().Globals,
+                  std::back_inserter(NewCallOps),
+                  [&OrigCall](GlobalArgInfo GAI) {
+                    return passGlobalAsCallArg(GAI, OrigCall);
+                  });
+
+  IGC_ASSERT_EXIT_MESSAGE(!isa<InvokeInst>(OrigCall),
+                          "InvokeInst not supported");
+
+  CallInst *NewCall = CallInst::Create(&NewFunc, NewCallOps, "", &OrigCall);
+  IGC_ASSERT(nullptr != NewCall);
+  NewCall->setCallingConv(OrigCall.getCallingConv());
+  NewCall->setAttributes(NewCallAttrs);
+  if (cast<CallInst>(OrigCall).isTailCall())
+    NewCall->setTailCall();
+  NewCall->setDebugLoc(OrigCall.getDebugLoc());
+  NewCall->takeName(&OrigCall);
 
   IRBuilder<> Builder(&OrigCall);
   for (auto &RetToArg : enumerate(NewFuncInfo.getRetToArgInfo()))

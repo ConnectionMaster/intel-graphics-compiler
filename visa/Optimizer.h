@@ -121,6 +121,7 @@ class Optimizer {
   void reverseOffsetProp(AddrSubReg_Node addrRegInfo[8], int subReg,
                          unsigned int srcNum, INST_LIST_ITER lastIter,
                          INST_LIST_ITER iend);
+  void removePseudoMov();
   void FoldAddrImmediate();
   bool foldCmpSel(G4_BB *BB, G4_INST *selInst, INST_LIST_ITER &selInst_II);
   bool foldPseudoNot(G4_BB *bb, INST_LIST_ITER &iter);
@@ -156,7 +157,10 @@ class Optimizer {
     unsigned KernelPressure = 0;
     preRA_Scheduler Sched(kernel);
     if (kernel.useAutoGRFSelection()) {
+      unsigned InitialGRFNumber = kernel.getNumRegTotal();
       Sched.runWithGRFSelection(KernelPressure);
+      if (InitialGRFNumber != kernel.getNumRegTotal())
+        Sched.run(KernelPressure);
     } else {
       Sched.run(KernelPressure);
     }
@@ -191,6 +195,7 @@ class Optimizer {
 
   void HWDebug();
 
+  void s0SubAfterRA();
 
   // return true if BuiltInR0 gets a different allocation than r0
   bool R0CopyNeeded();
@@ -264,6 +269,7 @@ private:
   void applyNamedBarrierWA(INST_LIST_ITER it, G4_BB *bb);
   void insertIEEEExceptionTrap();
   void expandIEEEExceptionTrap(INST_LIST_ITER it, G4_BB *bb);
+  void fixDirectAddrBoundOnDst();
 
   typedef std::vector<vISA::G4_INST *> InstListType;
   // create instruction sequence to calculate call offset from ip
@@ -299,6 +305,7 @@ private:
   void insertDummyMovForHWRSWA();
   void insertHashMovs();
   void insertDummyCompactInst();
+  void swapSrc1Src2OfMadForCompaction();
   void removeLifetimeOps();
   void recomputeBound(std::unordered_set<G4_Declare *> &declares);
 
@@ -370,6 +377,7 @@ public:
     PI_HWDebug,
     PI_insertDummyMovForHWRSWA,
     PI_insertDummyCompactInst,
+    PI_swapSrc1Src2OfMadForCompaction,
     PI_mergeScalarInst,
     PI_lowerMadSequence,
     PI_LVN,
@@ -385,6 +393,8 @@ public:
     PI_changeMoveType,
     PI_accSubBeforeRA,
     PI_accSubPostSchedule,
+    PI_s0SubAfterRA,
+    PI_removePseudoMov,
     PI_dce,
     PI_reassociateConst,
     PI_split4GRFVars,

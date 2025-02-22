@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2017-2024 Intel Corporation
+Copyright (C) 2017-2025 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -21,16 +21,15 @@ SPDX-License-Identifier: MIT
 ///
 //===----------------------------------------------------------------------===//
 
-
 #include "llvmWrapper/Analysis/CallGraph.h"
-#include "llvmWrapper/IR/Attributes.h"
 #include "llvmWrapper/IR/DerivedTypes.h"
+#include "llvmWrapper/IR/Function.h"
 #include "llvmWrapper/IR/Instructions.h"
 #include "llvmWrapper/Support/Alignment.h"
-#include "llvmWrapper/IR/Function.h"
 
 #include "Probe/Assertion.h"
 
+#include "vc/GenXOpts/CMABIAnalysis.h"
 #include "vc/GenXOpts/GenXOpts.h"
 #include "vc/Support/GenXDiagnostic.h"
 #include "vc/Utils/GenX/BreakConst.h"
@@ -41,6 +40,7 @@ SPDX-License-Identifier: MIT
 #include "vc/Utils/GenX/TypeSize.h"
 #include "vc/Utils/General/DebugInfo.h"
 #include "vc/Utils/General/FunctionAttrs.h"
+#include "vc/Utils/General/IndexFlattener.h"
 #include "vc/Utils/General/InstRebuilder.h"
 #include "vc/Utils/General/STLExtras.h"
 #include "vc/Utils/General/Types.h"
@@ -50,11 +50,13 @@ SPDX-License-Identifier: MIT
 #include "llvm/ADT/SCCIterator.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/CallGraphSCCPass.h"
 #include "llvm/Analysis/PostDominators.h"
 #include "llvm/GenXIntrinsics/GenXIntrinsics.h"
 #include "llvm/GenXIntrinsics/GenXMetadata.h"
+#include "llvm/IR/Attributes.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/DiagnosticInfo.h"
@@ -74,7 +76,10 @@ SPDX-License-Identifier: MIT
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Utils/CallGraphUpdater.h"
 #include "llvm/Transforms/Utils/Local.h"
+
+#include "llvm/ADT/PriorityWorklist.h"
 
 #include <algorithm>
 #include <functional>
@@ -84,7 +89,7 @@ SPDX-License-Identifier: MIT
 #include <unordered_set>
 #include <vector>
 
-#define DEBUG_TYPE "cmabi"
+#define DEBUG_TYPE "CMABI"
 
 using namespace llvm;
 
@@ -97,9 +102,38 @@ STATISTIC(NumArgumentsTransformed, "Number of pointer arguments transformed");
 
 namespace llvm {
 void initializeCMABIAnalysisPass(PassRegistry &);
+void initializeCMABILegacyPass(PassRegistry &);
 void initializeCMABIPass(PassRegistry &);
 void initializeCMLowerVLoadVStorePass(PassRegistry &);
-}
+} // namespace llvm
+
+// \brief Collect necessary information for global variable localization.
+class LocalizationInfo {
+public:
+  typedef SetVector<GlobalVariable *> GlobalSetTy;
+
+  explicit LocalizationInfo(Function *F) : Fn(F) {}
+  LocalizationInfo() : Fn(0) {}
+
+  Function *getFunction() const { return Fn; }
+  bool empty() const { return Globals.empty(); }
+  GlobalSetTy &getGlobals() { return Globals; }
+
+  // \brief Add a global.
+  void addGlobal(GlobalVariable *GV) { Globals.insert(GV); }
+
+  // \brief Add all globals from callee.
+  void addGlobals(LocalizationInfo &LI) {
+    Globals.insert(LI.getGlobals().begin(), LI.getGlobals().end());
+  }
+
+private:
+  // \brief The function being analyzed.
+  Function *Fn;
+
+  // \brief Global variables that are used directly or indirectly.
+  GlobalSetTy Globals;
+};
 
 /// Localizing global variables
 /// ^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -189,50 +223,17 @@ void initializeCMLowerVLoadVStorePass(PassRegistry &);
 ///
 namespace {
 
-// \brief Collect necessary information for global variable localization.
-class LocalizationInfo {
-public:
-  typedef SetVector<GlobalVariable *> GlobalSetTy;
-
-  explicit LocalizationInfo(Function *F) : Fn(F) {}
-  LocalizationInfo() : Fn(0) {}
-
-  Function *getFunction() const { return Fn; }
-  bool empty() const { return Globals.empty(); }
-  GlobalSetTy &getGlobals() { return Globals; }
-
-  // \brief Add a global.
-  void addGlobal(GlobalVariable *GV) {
-    Globals.insert(GV);
-  }
-
-  // \brief Add all globals from callee.
-  void addGlobals(LocalizationInfo &LI) {
-    Globals.insert(LI.getGlobals().begin(), LI.getGlobals().end());
-  }
-
-private:
-  // \brief The function being analyzed.
-  Function *Fn;
-
-  // \brief Global variables that are used directly or indirectly.
-  GlobalSetTy Globals;
-};
-
 class CMABIAnalysis : public ModulePass {
-  // This map captures all global variables to be localized.
-  std::vector<LocalizationInfo *> LocalizationInfoObjs;
-
 public:
   static char ID;
 
-  // Kernels in the module being processed.
-  SmallPtrSet<Function *, 8> Kernels;
+  using GIType = SmallDenseMap<Function *, LocalizationInfo *>;
 
-  // Map from function to the index of its LI in LI storage
-  SmallDenseMap<Function *, LocalizationInfo *> GlobalInfo;
+  CMABIAnalysisPassResult Info;
 
   CMABIAnalysis() : ModulePass{ID} {}
+
+  CMABIAnalysis(CallGraph *CGa) : ModulePass{ID}, CGa(CGa) {}
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.addRequired<CallGraphWrapperPass>();
@@ -244,24 +245,26 @@ public:
   bool runOnModule(Module &M) override;
 
   void releaseMemory() override {
-    for (auto *LI : LocalizationInfoObjs)
-      delete LI;
-    LocalizationInfoObjs.clear();
-    Kernels.clear();
-    GlobalInfo.clear();
+    Info.Kernels.clear();
+    Info.GlobalInfo.clear();
   }
 
-  // \brief Returns the localization info associated to a function.
-  LocalizationInfo &getLocalizationInfo(Function *F) {
+  static LocalizationInfo &getLocalizationInfo(Function *F,
+                                               GIType &GlobalInfo) {
     if (GlobalInfo.count(F))
       return *GlobalInfo[F];
     LocalizationInfo *LI = new LocalizationInfo{F};
-    LocalizationInfoObjs.push_back(LI);
     GlobalInfo[F] = LI;
     return *LI;
   }
 
+  // \brief Returns the localization info associated to a function.
+  LocalizationInfo &getLocalizationInfo(Function *F) {
+    return getLocalizationInfo(F, Info.GlobalInfo);
+  }
+
 private:
+  CallGraph *CGa = nullptr;
   bool runOnCallGraph(CallGraph &CG);
   void analyzeGlobals(CallGraph &CG);
 
@@ -277,31 +280,30 @@ private:
   void defineGVDirectUsers(GlobalVariable &GV);
 };
 
-struct CMABI : public CallGraphSCCPass {
-  static char ID;
+template <class CallGraphImpl> struct CMABIBase : public CallGraphSCCPass {
 
-  CMABI() : CallGraphSCCPass(ID) {
-    initializeCMABIPass(*PassRegistry::getPassRegistry());
-  }
+  CMABIBase(char ID, CMABIAnalysisPassResult *Res = nullptr,
+            LazyCallGraph *CG = nullptr)
+      : CallGraphSCCPass(ID), Info(Res), CG(CG) {}
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     CallGraphSCCPass::getAnalysisUsage(AU);
     AU.addRequired<CMABIAnalysis>();
   }
 
-  bool runOnSCC(CallGraphSCC &SCC) override;
+  bool runOnCallGraphImpl(CallGraphImpl &SCC);
 
-private:
-
-  CallGraphNode *ProcessNode(CallGraphNode *CGN);
+protected:
+  template <class NodeType> NodeType *ProcessNode(NodeType *CGN);
 
   // Fix argument passing for kernels.
-  CallGraphNode *TransformKernel(Function *F);
+  template <class NodeType> NodeType *TransformKernel(Function *F);
 
   // Major work is done in this method.
-  CallGraphNode *TransformNode(Function &F,
-                               SmallPtrSet<Argument *, 8> &ArgsToTransform,
-                               LocalizationInfo &LI);
+  template <class NodeType>
+  NodeType *TransformNode(Function &F,
+                          SmallDenseMap<Argument *, Type *> &ArgsToTransform,
+                          LocalizationInfo &LI);
 
   // \brief Create allocas for globals and replace their uses.
   void LocalizeGlobals(LocalizationInfo &LI);
@@ -311,20 +313,62 @@ private:
 
   // Already visited functions.
   SmallPtrSet<Function *, 8> AlreadyVisited;
-  CMABIAnalysis *Info = nullptr;
+  CMABIAnalysisPassResult *Info = nullptr;
+  LazyCallGraph *CG;
 };
 
+struct CMABILegacy : public CMABIBase<CallGraphSCC> {
+  static char ID;
+  CMABILegacy() : CMABIBase<CallGraphSCC>(ID) {
+    initializeCMABILegacyPass(*PassRegistry::getPassRegistry());
+  };
+
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    CallGraphSCCPass::getAnalysisUsage(AU);
+    AU.addRequired<CMABIAnalysis>();
+  }
+
+  bool runOnSCC(CallGraphSCC &SCC) override;
+
+private:
+  // \brief Diagnose illegal overlapping by-ref args.
+  void diagnoseOverlappingArgs(CallInst *CI);
+};
+
+#if LLVM_VERSION_MAJOR >= 16
+struct CMABI : public CMABIBase<LazyCallGraph::SCC> {
+  static char ID;
+
+  CMABI(CMABIAnalysisPassResult *Res = nullptr, LazyCallGraph *CG = nullptr)
+      : CMABIBase(ID, Res, CG) {
+    initializeCMABIPass(*PassRegistry::getPassRegistry());
+  }
+
+  bool runOnSCC(CallGraphSCC &SCC) override;
+  bool runOnCG(LazyCallGraph::SCC &SCC);
+};
+
+bool CMABI::runOnCG(LazyCallGraph::SCC &SCC) { return runOnCallGraphImpl(SCC); }
+
+bool CMABI::runOnSCC(CallGraphSCC &SCC) {
+  IGC_ASSERT_EXIT_MESSAGE(0, "Invalid call");
+  // TODO: implement?
+  return false;
+}
+#endif
 } // namespace
 
 char CMABIAnalysis::ID = 0;
-INITIALIZE_PASS_BEGIN(CMABIAnalysis, "cmabi-analysis",
+INITIALIZE_PASS_BEGIN(CMABIAnalysis, "CMABIAnalysis",
                       "helper analysis pass to get info for CMABI", false, true)
 INITIALIZE_PASS_DEPENDENCY(CallGraphWrapperPass)
-INITIALIZE_PASS_END(CMABIAnalysis, "cmabi-analysis",
+INITIALIZE_PASS_END(CMABIAnalysis, "CMABIAnalysis",
                     "Fix ABI issues for the genx backend", false, true)
 
 bool CMABIAnalysis::runOnModule(Module &M) {
-  runOnCallGraph(getAnalysis<CallGraphWrapperPass>().getCallGraph());
+  if (!CGa)
+    CGa = &getAnalysis<CallGraphWrapperPass>().getCallGraph();
+  runOnCallGraph(*CGa);
   return false;
 }
 
@@ -347,7 +391,7 @@ bool CMABIAnalysis::runOnCallGraph(CallGraph &CG) {
       MDNode *Node = Named->getOperand(I);
       if (Function *F =
               dyn_cast_or_null<Function>(getValue(Node->getOperand(0))))
-        Kernels.insert(F);
+        Info.Kernels.insert(F);
     }
   }
 
@@ -355,14 +399,102 @@ bool CMABIAnalysis::runOnCallGraph(CallGraph &CG) {
   return false;
 }
 
-bool CMABI::runOnSCC(CallGraphSCC &SCC) {
-  Info = &getAnalysis<CMABIAnalysis>();
+bool CMABILegacy::runOnSCC(CallGraphSCC &SCC) {
+  auto &CMABIa = getAnalysis<CMABIAnalysis>();
+  Info = &CMABIa.Info;
+  return runOnCallGraphImpl(SCC);
+}
+
+template <class NodeType> Function *getFunction(NodeType i) {
+  if constexpr (std::is_same_v<NodeType, CallGraphNode *const *>) {
+    return (*i)->getFunction();
+  }
+  if constexpr (std::is_same_v<NodeType, CallGraphNode *>) {
+    return (*i).getFunction();
+  }
+  if constexpr (std::is_same_v<NodeType, llvm::LazyCallGraph::Node *>) {
+    return &i->getFunction();
+  }
+  if constexpr (std::is_same_v<NodeType, llvm::LazyCallGraph::Node>) {
+    return &i.getFunction();
+  }
+  IGC_ASSERT_EXIT(false);
+  return nullptr;
+}
+
+// Analyzes the uses of a ByVal argument to determine if it is written to.
+static inline bool isReadOnlyArg(Argument &Arg) {
+  SmallVector<Use *, 8> Uses;
+  for (auto &U : Arg.uses())
+    Uses.push_back(&U);
+
+  while (!Uses.empty()) {
+    auto *U = Uses.back();
+    Uses.pop_back();
+    if (auto *SI = dyn_cast<StoreInst>(U->getUser())) {
+      if (SI->getPointerOperand() == U->get())
+        return false;
+      continue; // sutable usage
+    }
+
+    if (auto *LI = dyn_cast<LoadInst>(U->getUser()))
+      continue; // sutable usage
+
+    if (auto *GEP = dyn_cast<GetElementPtrInst>(U->getUser())) {
+      if (GEP->getPointerOperand() == U->get())
+        for (auto &GU : GEP->uses())
+          Uses.push_back(&GU);
+
+      continue;
+    }
+
+    if (auto *Cast = dyn_cast<CastInst>(U->getUser())) {
+      for (auto &CU : Cast->uses())
+        Uses.push_back(&CU);
+      continue;
+    }
+
+    return false;
+  }
+  return true;
+}
+
+// Mark SIMD-CF argument+ret functions
+static inline void CheckRMEM(Function *F) {
+  if (F->isDeclaration())
+    return;
+  for (Argument &Arg : F->args()) {
+    // Find SIMD_CF EM/RM in arguments
+    if (Arg.getType()->isVectorTy() &&
+        Arg.getType()->getScalarType()->isIntegerTy(1)) {
+      // Add a dummy attribute so that the conformance-pass can recognize a call
+      // with simd-sf
+      F->addFnAttr(vc::FunctionMD::VCSimdCFArg);
+      break;
+    }
+  }
+  auto *RetTy = F->getReturnType();
+  if (auto *ST = dyn_cast<StructType>(RetTy)) {
+    unsigned RetIdx = 0;
+    for (unsigned End = IndexFlattener::getNumElements(ST); RetIdx < End;
+         ++RetIdx) {
+      auto *Ty = IndexFlattener::getElementType(ST, RetIdx);
+      if (Ty->isVectorTy() && Ty->getScalarType()->isIntegerTy(1)) {
+        F->addFnAttr(vc::FunctionMD::VCSimdCFRet);
+        break;
+      }
+    }
+  }
+}
+
+template <class CallGraphImpl>
+bool CMABIBase<CallGraphImpl>::runOnCallGraphImpl(CallGraphImpl &SCC) {
   bool Changed = false;
   bool LocalChange;
 
   // Diagnose overlapping by-ref args.
   for (auto i = SCC.begin(), e = SCC.end(); i != e; ++i) {
-    Function *F = (*i)->getFunction();
+    Function *F = getFunction(&*i);
     if (!F || F->empty())
       continue;
     for (auto ui = F->use_begin(), ue = F->use_end(); ui != ue; ++ui) {
@@ -375,10 +507,18 @@ bool CMABI::runOnSCC(CallGraphSCC &SCC) {
   // Iterate until we stop transforming from this SCC.
   do {
     LocalChange = false;
-    for (CallGraphSCC::iterator I = SCC.begin(), E = SCC.end(); I != E; ++I) {
-      if (CallGraphNode *CGN = ProcessNode(*I)) {
-        LocalChange = true;
-        SCC.ReplaceNode(*I, CGN);
+    for (auto I = SCC.begin(), E = SCC.end(); I != E; ++I) {
+      if constexpr (std::is_same_v<CallGraphImpl, CallGraphSCC>) {
+        if (auto *CGN = ProcessNode(*I)) {
+          LocalChange = true;
+          SCC.ReplaceNode(*I, CGN);
+        }
+      } else {
+        if (auto *CGN = ProcessNode(&*I)) {
+          LocalChange = true;
+          auto *NewF = getFunction(CGN);
+          SCC.getOuterRefSCC().replaceNodeFunction(*I, *NewF);
+        }
       }
     }
     Changed |= LocalChange;
@@ -386,12 +526,14 @@ bool CMABI::runOnSCC(CallGraphSCC &SCC) {
 
   // Create a local copies for leftover byval arguments
   for (auto i = SCC.begin(), e = SCC.end(); i != e; ++i) {
-    Function *F = (*i)->getFunction();
+    Function *F = getFunction(&*i);
     if (!F || F->empty())
       continue;
+    CheckRMEM(F);
     for (auto &Arg : F->args()) {
       auto *ArgTy = Arg.getType();
-      if (!Arg.hasAttribute(Attribute::ByVal) || !ArgTy->isPointerTy())
+      if (!Arg.hasAttribute(Attribute::ByVal) || !ArgTy->isPointerTy() ||
+          isReadOnlyArg(Arg))
         continue;
       auto *M = F->getParent();
       auto *InsertBefore = F->getEntryBlock().getFirstNonPHI();
@@ -425,7 +567,8 @@ bool CMABI::runOnSCC(CallGraphSCC &SCC) {
 // FIXME: it is not always posible to localize globals with addrspace different
 // from private. In some cases type info link is lost - casts, stores of
 // pointers.
-void CMABI::LocalizeGlobals(LocalizationInfo &LI) {
+template <class CallGraphImpl>
+void CMABIBase<CallGraphImpl>::LocalizeGlobals(LocalizationInfo &LI) {
   const LocalizationInfo::GlobalSetTy &Globals = LI.getGlobals();
   typedef LocalizationInfo::GlobalSetTy::const_iterator IteratorTy;
 
@@ -454,8 +597,11 @@ void CMABI::LocalizeGlobals(LocalizationInfo &LI) {
   vc::replaceUsesWithinFunction(GlobalsToReplace, Fn);
 }
 
-CallGraphNode *CMABI::ProcessNode(CallGraphNode *CGN) {
-  Function *F = CGN->getFunction();
+// template <class CallGraphImpl>
+template <class CallGraphImpl>
+template <class NodeType>
+NodeType *CMABIBase<CallGraphImpl>::ProcessNode(NodeType *CGN) {
+  Function *F = getFunction(CGN); // <CallGraphImpl>
 
   // Nothing to do for declarations or already visited functions.
   if (!F || F->isDeclaration() || AlreadyVisited.count(F))
@@ -464,8 +610,8 @@ CallGraphNode *CMABI::ProcessNode(CallGraphNode *CGN) {
   vc::breakConstantExprs(F, vc::LegalizationStage::NotLegalized);
 
   // Variables to be localized.
-  LocalizationInfo &LI = Info->getLocalizationInfo(F);
-
+  LocalizationInfo &LI =
+      CMABIAnalysis::getLocalizationInfo(F, Info->GlobalInfo);
   // This is a kernel.
   if (Info->Kernels.count(F)) {
     // Localize globals for kernels.
@@ -475,7 +621,7 @@ CallGraphNode *CMABI::ProcessNode(CallGraphNode *CGN) {
     // Check whether there are i1 or vxi1 kernel arguments.
     for (auto AI = F->arg_begin(), AE = F->arg_end(); AI != AE; ++AI)
       if (AI->getType()->getScalarType()->isIntegerTy(1))
-        return TransformKernel(F);
+        return TransformKernel<NodeType>(F);
 
     // No changes to this kernel's prototype.
     return 0;
@@ -493,17 +639,18 @@ CallGraphNode *CMABI::ProcessNode(CallGraphNode *CGN) {
 
   // Check transformable arguments.
   vc::TypeSizeWrapper MaxStructSize = vc::ByteSize * MaxCMABIByvalSize;
-  SmallPtrSet<Argument *, 8> ArgsToTransform =
-      vc::collectArgsToTransform(*F, MaxStructSize);
+  auto ArgsToTransform = vc::collectArgsToTransform(*F, MaxStructSize);
 
   if (ArgsToTransform.empty() && LI.empty())
     return 0;
 
-  return TransformNode(*F, ArgsToTransform, LI);
+  return TransformNode<NodeType>(*F, ArgsToTransform, LI);
 }
 
 // \brief Fix argument passing for kernels: i1 -> i8.
-CallGraphNode *CMABI::TransformKernel(Function *F) {
+template <class CallGraphImpl>
+template <class NodeType>
+NodeType *CMABIBase<CallGraphImpl>::TransformKernel(Function *F) {
   IGC_ASSERT(F->getReturnType()->isVoidTy());
   LLVMContext &Context = F->getContext();
 
@@ -526,25 +673,19 @@ CallGraphNode *CMABI::TransformKernel(Function *F) {
         ArgTys.push_back(Ty);
     } else {
       // Unchanged argument
-      AttributeSet attrs = IGCLLVM::getParamAttrs(PAL, ArgIndex);
-      if (attrs.hasAttributes()) {
-        auto B = IGCLLVM::makeAttrBuilder(Context, attrs);
-        AttrVec = AttrVec.addParamAttributes(Context, ArgTys.size(), B);
-      }
+      AttrBuilder ArgAttrB(Context, PAL.getParamAttrs(ArgIndex));
+      AttrVec = AttrVec.addParamAttributes(Context, ArgTys.size(), ArgAttrB);
       ArgTys.push_back(I->getType());
     }
   }
 
   FunctionType *NFTy = FunctionType::get(F->getReturnType(), ArgTys, false);
   IGC_ASSERT_MESSAGE((NFTy != F->getFunctionType()),
-    "type out of sync, expect bool arguments");
+                     "type out of sync, expect bool arguments");
 
   // Add any function attributes.
-  AttributeSet FnAttrs = IGCLLVM::getFnAttrs(PAL);
-  if (FnAttrs.hasAttributes()) {
-    auto B = IGCLLVM::makeAttrBuilder(Context, FnAttrs);
-    AttrVec = IGCLLVM::addAttributesAtIndex(AttrVec, Context, AttributeList::FunctionIndex, B);
-  }
+  AttrBuilder B(Context, PAL.getFnAttrs());
+  AttrVec = AttrVec.addFnAttributes(Context, B);
 
   // Create the new function body and insert it into the module.
   Function *NF = Function::Create(NFTy, F->getLinkage(), F->getName());
@@ -576,29 +717,47 @@ CallGraphNode *CMABI::TransformKernel(Function *F) {
     }
   }
 
-  CallGraph &CG = getAnalysis<CallGraphWrapperPass>().getCallGraph();
-  CallGraphNode *NF_CGN = CG.getOrInsertFunction(NF);
+  if constexpr (std::is_same_v<std::remove_cv_t<NodeType>, CallGraphNode>) {
+    CallGraph &CG = getAnalysis<CallGraphWrapperPass>().getCallGraph();
+    NodeType *NF_CGN = CG.getOrInsertFunction(NF);
 
-  // Update the metadata entry.
-  if (F->hasDLLExportStorageClass())
-    NF->setDLLStorageClass(F->getDLLStorageClass());
+    // Update the metadata entry.
+    if (F->hasDLLExportStorageClass())
+      NF->setDLLStorageClass(F->getDLLStorageClass());
 
-  vc::replaceFunctionRefMD(*F, *NF);
+    vc::replaceFunctionRefMD(*F, *NF);
 
-  // Update kernel list's entry
-  Info->Kernels.erase(F);
-  Info->Kernels.insert(NF);
+    // Update kernel list's entry
+    Info->Kernels.erase(F);
+    Info->Kernels.insert(NF);
 
-  // Now that the old function is dead, delete it. If there is a dangling
-  // reference to the CallgraphNode, just leave the dead function around.
-  NF_CGN->stealCalledFunctionsFrom(CG[F]);
-  CallGraphNode *CGN = CG[F];
-  if (CGN->getNumReferences() == 0)
-    delete CG.removeFunctionFromModule(CGN);
-  else
-    F->setLinkage(Function::ExternalLinkage);
+    // Now that the old function is dead, delete it. If there is a dangling
+    // reference to the CallgraphNode, just leave the dead function around.
+    NF_CGN->stealCalledFunctionsFrom(CG[F]);
+    NodeType *CGN = CG[F];
+    if (CGN->getNumReferences() == 0)
+      delete CG.removeFunctionFromModule(CGN);
+    else
+      F->setLinkage(Function::ExternalLinkage);
 
-  return NF_CGN;
+    return NF_CGN;
+  }
+  if constexpr (std::is_same_v<NodeType, llvm::LazyCallGraph::Node>) {
+    // Update the metadata entry.
+    if (F->hasDLLExportStorageClass())
+      NF->setDLLStorageClass(F->getDLLStorageClass());
+    vc::replaceFunctionRefMD(*F, *NF);
+
+    // Update kernel list's entry
+    Info->Kernels.erase(F);
+    Info->Kernels.insert(NF);
+
+    if (!CG->get(*F).isDead())
+      F->setLinkage(Function::ExternalLinkage);
+
+    return &CG->get(*NF);
+  }
+  return nullptr;
 }
 
 // \brief Actually performs the transformation of the specified arguments, and
@@ -626,9 +785,12 @@ CallGraphNode *CMABI::TransformKernel(Function *F) {
 // argument that is referenced may overlap with a global variable that is
 // written to in the subprogram.
 //
-CallGraphNode *CMABI::TransformNode(Function &OrigFunc,
-                                    SmallPtrSet<Argument *, 8> &ArgsToTransform,
-                                    LocalizationInfo &LI) {
+template <class CallGraphImpl>
+template <class NodeType>
+NodeType *CMABIBase<CallGraphImpl>::TransformNode(
+    Function &OrigFunc, SmallDenseMap<Argument *, Type *> &ArgsToTransform,
+    LocalizationInfo &LI) {
+
   NumArgumentsTransformed += ArgsToTransform.size();
   vc::TransformedFuncInfo NewFuncInfo{OrigFunc, ArgsToTransform};
   NewFuncInfo.appendGlobals(LI.getGlobals());
@@ -636,30 +798,56 @@ CallGraphNode *CMABI::TransformNode(Function &OrigFunc,
   // Create the new function declaration and insert it into the module.
   Function *NewFunc = vc::createTransformedFuncDecl(OrigFunc, NewFuncInfo);
 
-  // Get a new callgraph node for NF.
-  CallGraph &CG = getAnalysis<CallGraphWrapperPass>().getCallGraph();
-  CallGraphNode *NewFuncCGN = CG.getOrInsertFunction(NewFunc);
+  if constexpr (std::is_same_v<std::remove_cv_t<NodeType>,
+                               llvm::CallGraphNode *> ||
+                std::is_same_v<std::remove_cv_t<NodeType>,
+                               llvm::CallGraphNode>) {
 
-  vc::FuncUsersUpdater{OrigFunc, *NewFunc, NewFuncInfo, *NewFuncCGN, CG}.run();
-  vc::FuncBodyTransfer{OrigFunc, *NewFunc, NewFuncInfo}.run();
+    // Get a new callgraph node for NF.
+    CallGraph &CG = getAnalysis<CallGraphWrapperPass>().getCallGraph();
+    NodeType *NewFuncCGN = CG.getOrInsertFunction(NewFunc);
 
-  // It turns out sometimes llvm will recycle function pointers which confuses
-  // this pass. We delete its localization info and mark this function as
-  // already visited.
-  Info->GlobalInfo.erase(&OrigFunc);
-  AlreadyVisited.insert(&OrigFunc);
+    vc::FuncUsersUpdater{OrigFunc, *NewFunc, NewFuncInfo, *NewFuncCGN, CG}
+        .run();
+    vc::FuncBodyTransfer{OrigFunc, *NewFunc, NewFuncInfo}.run();
 
-  NewFuncCGN->stealCalledFunctionsFrom(CG[&OrigFunc]);
+    // It turns out sometimes llvm will recycle function pointers which confuses
+    // this pass. We delete its localization info and mark this function as
+    // already visited.
+    Info->GlobalInfo.erase(&OrigFunc);
+    AlreadyVisited.insert(&OrigFunc);
 
-  // Now that the old function is dead, delete it. If there is a dangling
-  // reference to the CallgraphNode, just leave the dead function around.
-  CallGraphNode *CGN = CG[&OrigFunc];
-  if (CGN->getNumReferences() == 0)
-    delete CG.removeFunctionFromModule(CGN);
-  else
-    OrigFunc.setLinkage(Function::ExternalLinkage);
+    NewFuncCGN->stealCalledFunctionsFrom(CG[&OrigFunc]);
 
-  return NewFuncCGN;
+    // Now that the old function is dead, delete it. If there is a dangling
+    // reference to the CallgraphNode, just leave the dead function around.
+    NodeType *CGN = CG[&OrigFunc];
+    if (CGN->getNumReferences() == 0)
+      delete CG.removeFunctionFromModule(CGN);
+    else
+      OrigFunc.setLinkage(Function::ExternalLinkage);
+
+    return NewFuncCGN;
+  }
+  if constexpr (std::is_same_v<NodeType, llvm::LazyCallGraph::Node>) {
+
+    vc::FuncUsersUpdaterNewPM{OrigFunc, *NewFunc, NewFuncInfo, *CG}.run();
+    vc::FuncBodyTransfer{OrigFunc, *NewFunc, NewFuncInfo}.run();
+
+    // It turns out sometimes llvm will recycle function pointers which confuses
+    // this pass. We delete its localization info and mark this function as
+    // already visited.
+    Info->GlobalInfo.erase(&OrigFunc);
+    AlreadyVisited.insert(&OrigFunc);
+
+    // Now that the old function is dead, delete it. If there is a dangling
+    // reference to the CallgraphNode, just leave the dead function around.
+    if (!CG->get(OrigFunc).isDead())
+      OrigFunc.setLinkage(Function::ExternalLinkage);
+
+    return &CG->get(*NewFunc);
+  }
+  return nullptr;
 }
 
 static void fillStackWithUsers(std::stack<User *> &Stack, User &CurUser) {
@@ -737,8 +925,8 @@ void CMABIAnalysis::analyzeGlobals(CallGraph &CG) {
  * This ignores variable index wrregions, and only traces through instructions
  * with the same debug location as the call, so does not work with -g0.
  */
-void CMABI::diagnoseOverlappingArgs(CallInst *CI)
-{
+template <class CallGraphImpl>
+void CMABIBase<CallGraphImpl>::diagnoseOverlappingArgs(CallInst *CI) {
   LLVM_DEBUG(dbgs() << "diagnoseOverlappingArgs " << *CI << "\n");
   auto DL = CI->getDebugLoc();
   if (!DL)
@@ -941,14 +1129,24 @@ void CMABI::diagnoseOverlappingArgs(CallInst *CI)
   }
 }
 
-char CMABI::ID = 0;
-INITIALIZE_PASS_BEGIN(CMABI, "cmabi", "Fix ABI issues for the genx backend", false, false)
+char CMABILegacy::ID = 0;
+// Can't template CMABILegacy here
+INITIALIZE_PASS_BEGIN(CMABILegacy, "CMABILegacy",
+                      "Fix ABI issues for the genx backend", false, false)
 INITIALIZE_PASS_DEPENDENCY(CallGraphWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(CMABIAnalysis)
-INITIALIZE_PASS_END(CMABI, "cmabi", "Fix ABI issues for the genx backend", false, false)
+INITIALIZE_PASS_END(CMABILegacy, "CMABILegacy",
+                    "Fix ABI issues for the genx backend", false, false)
 
-Pass *llvm::createCMABIPass() { return new CMABI(); }
-
+#if LLVM_VERSION_MAJOR >= 16
+char CMABI::ID = 0;
+INITIALIZE_PASS_BEGIN(CMABI, "CMABI", "Fix ABI issues for the genx backend",
+                      false, false)
+INITIALIZE_PASS_DEPENDENCY(CallGraphWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(CMABIAnalysis)
+INITIALIZE_PASS_END(CMABI, "CMABI", "Fix ABI issues for the genx backend",
+                    false, false)
+#endif
 namespace {
 
 // A well-formed passing argument by reference pattern.
@@ -991,9 +1189,15 @@ struct ArgRefPattern {
 
 struct CMLowerVLoadVStore : public FunctionPass {
   static char ID;
+  CMLowerVLoadVStore(DominatorTree *DT, PostDominatorTree *PDT)
+      : FunctionPass(ID), DT(DT), PDT(PDT) {
+    initializeCMLowerVLoadVStorePass(*PassRegistry::getPassRegistry());
+  }
+
   CMLowerVLoadVStore() : FunctionPass(ID) {
     initializeCMLowerVLoadVStorePass(*PassRegistry::getPassRegistry());
   }
+
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.addRequired<DominatorTreeWrapperPass>();
     AU.addRequired<PostDominatorTreeWrapperPass>();
@@ -1003,6 +1207,8 @@ struct CMLowerVLoadVStore : public FunctionPass {
   bool runOnFunction(Function &F) override;
 
 private:
+  DominatorTree *DT = nullptr;
+  PostDominatorTree *PDT = nullptr;
   bool promoteAllocas(Function &F);
   bool lowerLoadStore(Function &F);
 };
@@ -1011,12 +1217,12 @@ private:
 
 char CMLowerVLoadVStore::ID = 0;
 INITIALIZE_PASS_BEGIN(CMLowerVLoadVStore, "CMLowerVLoadVStore",
-                      "Lower CM reference vector loads and stores", false, false)
+                      "Lower CM reference vector loads and stores", false,
+                      false)
 INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(PostDominatorTreeWrapperPass)
 INITIALIZE_PASS_END(CMLowerVLoadVStore, "CMLowerVLoadVStore",
                     "Lower CM reference vector loads and stores", false, false)
-
 
 bool CMLowerVLoadVStore::runOnFunction(Function &F) {
   bool Changed = false;
@@ -1029,12 +1235,12 @@ bool CMLowerVLoadVStore::runOnFunction(Function &F) {
 // instructions.
 bool CMLowerVLoadVStore::lowerLoadStore(Function &F) {
   auto M = F.getParent();
-  DenseMap<AllocaInst*, GlobalVariable*> AllocaMap;
+  DenseMap<AllocaInst *, GlobalVariable *> AllocaMap;
   // collect all the allocas that store the address of genx-volatile variable
-  for (auto& G : M->getGlobalList()) {
+  for (auto &G : M->getGlobalList()) {
     if (!G.hasAttribute("genx_volatile"))
       continue;
-    std::vector<User*> WL;
+    std::vector<User *> WL;
     for (auto UI = G.user_begin(); UI != G.user_end();) {
       auto U = *UI++;
       WL.push_back(U);
@@ -1366,8 +1572,10 @@ void ArgRefPattern::process(DominatorTree &DT) {
 // Allocas that are used in reference argument passing may be promoted into the
 // base region.
 bool CMLowerVLoadVStore::promoteAllocas(Function &F) {
-  auto &DT = getAnalysis<DominatorTreeWrapperPass>().getDomTree();
-  auto &PDT = getAnalysis<PostDominatorTreeWrapperPass>().getPostDomTree();
+  if (!DT && !PDT) {
+    DT = &getAnalysis<DominatorTreeWrapperPass>().getDomTree();
+    PDT = &getAnalysis<PostDominatorTreeWrapperPass>().getPostDomTree();
+  }
   bool Modified = false;
 
   SmallVector<AllocaInst *, 8> Allocas;
@@ -1378,8 +1586,8 @@ bool CMLowerVLoadVStore::promoteAllocas(Function &F) {
 
   for (auto AI : Allocas) {
     ArgRefPattern ArgRef(AI);
-    if (ArgRef.match(DT, PDT)) {
-      ArgRef.process(DT);
+    if (ArgRef.match(*DT, *PDT)) {
+      ArgRef.process(*DT);
       Modified = true;
     }
   }
@@ -1387,4 +1595,50 @@ bool CMLowerVLoadVStore::promoteAllocas(Function &F) {
   return Modified;
 }
 
-Pass *llvm::createCMLowerVLoadVStorePass() { return new CMLowerVLoadVStore; }
+namespace llvm {
+Pass *createCMABILegacyPass() { return new CMABILegacy(); }
+Pass *createCMLowerVLoadVStorePass() { return new CMLowerVLoadVStore; }
+} // namespace llvm
+
+#if LLVM_VERSION_MAJOR >= 16
+// PreservedAnalyses
+CMABIAnalysisPass::Result
+CMABIAnalysisPass::run(llvm::Module &M,
+                       llvm::AnalysisManager<llvm::Module> &AM) {
+  auto &CG = AM.getResult<CallGraphAnalysis>(M);
+  CMABIAnalysis CMAbiAn(&CG);
+  CMAbiAn.runOnModule(M);
+  return CMABIAnalysisPass::Result{CMAbiAn.Info.Kernels,
+                                   CMAbiAn.Info.GlobalInfo};
+}
+
+AnalysisKey CMABIAnalysisPass::Key;
+
+llvm::PreservedAnalyses CMABIPass::run(llvm::Module &M,
+                                       llvm::ModuleAnalysisManager &AM) {
+
+  auto &LCG = AM.getResult<LazyCallGraphAnalysis>(M);
+  LCG.buildRefSCCs();
+  bool Changed = false;
+  PreservedAnalyses PassPA;
+  for (LazyCallGraph::RefSCC &RC : LCG.postorder_ref_sccs()) {
+    for (LazyCallGraph::SCC &SCC : RC) {
+      CMABIAnalysisPass::Result &CMAn = AM.getResult<CMABIAnalysisPass>(M);
+      CMABI CMAbi(&CMAn, &LCG);
+      Changed |= CMAbi.runOnCG(SCC);
+    }
+  }
+  return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
+}
+
+PreservedAnalyses CMLowerVLoadVStorePass::run(Function &F,
+                                              FunctionAnalysisManager &AM) {
+  auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
+  auto &PDT = AM.getResult<PostDominatorTreeAnalysis>(F);
+  CMLowerVLoadVStore GenXLower(&DT, &PDT);
+  if (GenXLower.runOnFunction(F))
+    return PreservedAnalyses::none();
+  return PreservedAnalyses::all();
+}
+
+#endif

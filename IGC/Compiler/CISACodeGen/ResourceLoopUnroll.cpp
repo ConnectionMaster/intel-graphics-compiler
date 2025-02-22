@@ -152,12 +152,6 @@ bool ResourceLoopUnroll::emitResourceLoop(llvm::CallInst* CI)
 
             GetResourceOperand(inst, resource, pairTexture, texture, sampler);
 
-            // either resource (ld instr), or sample instr must be available
-            if (!resource && (!pairTexture || !texture || !sampler))
-            {
-                IGC_ASSERT(0);
-            }
-
             // Fill UniformSendBB
             builder.SetInsertPoint(checkBB);
 
@@ -170,15 +164,14 @@ bool ResourceLoopUnroll::emitResourceLoop(llvm::CallInst* CI)
                 resourceNew->setName("firstActiveRes");
                 cond = builder.CreateICmpEQ(resource, resourceNew);
             }
-            else // then must be sampler
+            else if (pairTexture && texture && sampler) // then must be sampler
             {
                 samplerNew = sampler;
                 textureNew = texture;
                 pairTextureNew = pairTexture;
 
-                // initially, they are true in CreateICmpEQ
-                Value* textureCond = builder.getTrue();
-                Value* samplerCond = builder.getTrue();
+                Value* textureCond = nullptr;
+                Value* samplerCond = nullptr;
 
                 // need care about pairTexture uniform???
                 if (!m_WIAnalysis->isUniform(pairTexture))
@@ -211,20 +204,58 @@ bool ResourceLoopUnroll::emitResourceLoop(llvm::CallInst* CI)
                     samplerCond = builder.CreateICmpEQ(sampler, samplerNew);
                 }
 
-                // if textureNew == uniform && samplerNew == uniform
-                cond = builder.CreateAnd(textureCond, samplerCond);
+                if (textureCond && samplerCond)
+                {
+                    // if textureNew == uniform && samplerNew == uniform
+                    cond = builder.CreateAnd(textureCond, samplerCond);
+                }
+                else if (textureCond)
+                {
+                    cond = textureCond;
+                }
+                else if (samplerCond)
+                {
+                    cond = samplerCond;
+                }
+            }
+            else
+            {
+                IGC_ASSERT(0);
             }
 
-            builder.CreateCondBr(cond, sendBB, nextBB);
+            // Here we swap the last loop load and goto, such as
+            // From
+            // (P89) lsc_load.ugm.ca.ca(M1, 16)  V1395:d32x3  bss(firstActiveRes)[V1385] : a32 /// $1953
+            // (!P89) goto (M1, 16) ___realTimePathTracingRayGeneration__YAXXZ_093_partial_check1736 /// $1954
+            // To
+            // (!P89) goto (M1, 16) ___realTimePathTracingRayGeneration__YAXXZ_093_partial_check1736 /// $1954
+            // (P89) lsc_load.ugm.ca.ca(M1, 16)  V1395:d32x3  bss(firstActiveRes)[V1385] : a32 /// $1953
+            // However, as CreateCondBr is generating terminator, we put the last send into a BB.
+            // Without swapping, each iteration, the load is loading some channels.
+            if (sendBB)
+            {
+                builder.CreateCondBr(cond, sendBB, nextBB);
+                builder.SetInsertPoint(sendBB);
+            }
 
-            // Fill sendBB
-            builder.SetInsertPoint(sendBB);
-            llvm::Instruction* clonedSend = inst->clone();
-            SetResourceOperand(clonedSend, resourceNew, pairTextureNew, textureNew, samplerNew);
-            clonedSend->setName("resLoopSubIterSend");
-            builder.Insert(clonedSend);
-            builder.CreateBr(exitBB);
-            return clonedSend;
+            llvm::Instruction* predSendInstr = inst->clone();
+            SetResourceOperand(predSendInstr, resourceNew, pairTextureNew, textureNew, samplerNew);
+            predSendInstr->setName("resLoopSubIterSend");
+            builder.Insert(predSendInstr);
+
+            if (sendBB)
+            {
+                builder.CreateBr(exitBB);
+            }
+            else
+            {
+                builder.CreateCondBr(cond, exitBB, nextBB);
+            }
+
+            // add the cmp/instruction combo to our predication map
+            m_pCodeGenContext->getModuleMetaData()->predicationMap[predSendInstr] = cond;
+
+            return predSendInstr;
         };
 
     //////////////////////////////////////////////////////////////////////////
@@ -239,17 +270,23 @@ bool ResourceLoopUnroll::emitResourceLoop(llvm::CallInst* CI)
 
     //we create it "from the end", adding new blocks before previously inserted
     BasicBlock* before = latch;
+    Instruction* send = nullptr;
     for (int i = 0; i < LOOP_COUNT; i++)
     {
         // Basicblocks for loop
         BasicBlock* partialCheckBB = BasicBlock::Create(context, "partial_check", BB->getParent(), before);
-        BasicBlock* partialSendBB = BasicBlock::Create(context, "partial_send", BB->getParent(), before);
+        // Since it's created from the end, the i == 0 is the last loop
+        BasicBlock* lastSendBB = (i == 0) ? BasicBlock::Create(context, "last_send", BB->getParent(), before) : nullptr;
 
-        auto send = createResLoopIter(CI, partialCheckBB, partialSendBB, before, mergeBB);
+        send = createResLoopIter(CI, partialCheckBB, lastSendBB, before, mergeBB);
 
-        PN->addIncoming(send, partialSendBB);
+        PN->addIncoming(send, lastSendBB ? lastSendBB : partialCheckBB);
         before = partialCheckBB;
     }
+
+    // save the first unroll BB and the send use (the use is for all unroll BB in this loop)
+    m_pCodeGenContext->getModuleMetaData()->lifeTimeStartMap[before] = send;
+
     // latch goes back to last created BB, which actually will be first BB due to ordering of creating and "before" poitner
     builder.SetInsertPoint(latch);
     builder.CreateBr(before);

@@ -17,9 +17,9 @@ SPDX-License-Identifier: MIT
 #ifndef GENXTARGETMACHINE_H
 #define GENXTARGETMACHINE_H
 
-#include "llvmWrapper/Target/TargetMachine.h"
-#include <llvmWrapper/ADT/Optional.h>
+#include "llvmWrapper/ADT/Optional.h"
 #include "llvmWrapper/Analysis/TargetTransformInfo.h"
+#include "llvmWrapper/Target/TargetMachine.h"
 
 #include "GenXIntrinsics.h"
 #include "GenXSubtarget.h"
@@ -49,14 +49,16 @@ class GenXTargetMachine : public IGCLLVM::LLVMTargetMachine {
 public:
   GenXTargetMachine(const Target &T, const Triple &TT, StringRef CPU,
                     StringRef FS, const TargetOptions &Options,
-                    llvm::Optional<Reloc::Model> RM, llvm::Optional<CodeModel::Model> CM,
+                    IGCLLVM::optional<Reloc::Model> RM,
+                    IGCLLVM::optional<CodeModel::Model> CM,
                     CodeGenOpt::Level OL, bool Is64Bit)
       : GenXTargetMachine(T, TT, CPU, FS, Options, RM, CM, OL, Is64Bit,
                           std::make_unique<GenXBackendConfig>()) {}
 
   GenXTargetMachine(const Target &T, const Triple &TT, StringRef CPU,
                     StringRef FS, const TargetOptions &Options,
-                    llvm::Optional<Reloc::Model> RM, llvm::Optional<CodeModel::Model> CM,
+                    IGCLLVM::optional<Reloc::Model> RM,
+                    IGCLLVM::optional<CodeModel::Model> CM,
                     CodeGenOpt::Level OL, bool Is64Bit,
                     std::unique_ptr<GenXBackendConfig> BC);
 
@@ -69,7 +71,11 @@ public:
                            bool /*DisableVerify*/ = true,
                            MachineModuleInfo *MMI = nullptr) override;
 
+#if LLVM_VERSION_MAJOR < 16
   void adjustPassManager(PassManagerBuilder &PMBuilder) override;
+#else
+  void registerPassBuilderCallbacks(PassBuilder &PB) override;
+#endif
 
   TargetPassConfig *createPassConfig(PassManagerBase &PM) override;
 
@@ -83,20 +89,32 @@ public:
       LLVM_GET_TTI_API_QUAL override;
 
   const GenXSubtarget &getGenXSubtarget() const { return Subtarget; }
+
+  void setBackendConfig(GenXBackendConfig *pBC) {
+    IGC_ASSERT(!BC.get());
+    BC.reset(pBC);
+  }
+
+  GenXBackendConfig *getBackendConfig() const {
+    IGC_ASSERT(BC.get());
+    return BC.get();
+  }
 };
 
 class GenXTargetMachine32 : public GenXTargetMachine {
 public:
   GenXTargetMachine32(const Target &T, const Triple &TT, StringRef CPU,
                       StringRef FS, const TargetOptions &Options,
-                      llvm::Optional<Reloc::Model> RM, llvm::Optional<CodeModel::Model> CM,
+                      IGCLLVM::optional<Reloc::Model> RM,
+                      IGCLLVM::optional<CodeModel::Model> CM,
                       CodeGenOpt::Level OL, bool JIT)
       : GenXTargetMachine32(T, TT, CPU, FS, Options, RM, CM, OL, JIT,
                             std::make_unique<GenXBackendConfig>()) {}
 
   GenXTargetMachine32(const Target &T, const Triple &TT, StringRef CPU,
                       StringRef FS, const TargetOptions &Options,
-                      llvm::Optional<Reloc::Model> RM, llvm::Optional<CodeModel::Model> CM,
+                      IGCLLVM::optional<Reloc::Model> RM,
+                      IGCLLVM::optional<CodeModel::Model> CM,
                       CodeGenOpt::Level OL, bool JIT,
                       std::unique_ptr<GenXBackendConfig> BC);
 };
@@ -105,14 +123,16 @@ class GenXTargetMachine64 : public GenXTargetMachine {
 public:
   GenXTargetMachine64(const Target &T, const Triple &TT, StringRef CPU,
                       StringRef FS, const TargetOptions &Options,
-                      llvm::Optional<Reloc::Model> RM, llvm::Optional<CodeModel::Model> CM,
+                      IGCLLVM::optional<Reloc::Model> RM,
+                      IGCLLVM::optional<CodeModel::Model> CM,
                       CodeGenOpt::Level OL, bool JIT)
       : GenXTargetMachine64(T, TT, CPU, FS, Options, RM, CM, OL, JIT,
                             std::make_unique<GenXBackendConfig>()) {}
 
   GenXTargetMachine64(const Target &T, const Triple &TT, StringRef CPU,
                       StringRef FS, const TargetOptions &Options,
-                      llvm::Optional<Reloc::Model> RM, llvm::Optional<CodeModel::Model> CM,
+                      IGCLLVM::optional<Reloc::Model> RM,
+                      IGCLLVM::optional<CodeModel::Model> CM,
                       CodeGenOpt::Level OL, bool JIT,
                       std::unique_ptr<GenXBackendConfig> BC);
 };
@@ -214,7 +234,6 @@ void initializeGenXLowerAggrCopiesPass(PassRegistry &);
 void initializeGenXLoweringPass(PassRegistry &);
 void initializeGenXModulePass(PassRegistry &);
 void initializeGenXNumberingWrapperPass(PassRegistry &);
-void initializeGenXPacketizePass(PassRegistry &);
 void initializeGenXPatternMatchPass(PassRegistry &);
 void initializeGenXPostLegalizationPass(PassRegistry &);
 void initializeGenXPostLegalizationPass(PassRegistry &);
@@ -234,7 +253,6 @@ void initializeGenXAggregatePseudoLoweringPass(PassRegistry &);
 void initializeGenXVectorCombinerPass(PassRegistry &);
 void initializeGenXPromoteStatefulToBindlessPass(PassRegistry &);
 void initializeGenXStackUsagePass(PassRegistry &);
-void initializeCMLowerVLoadVStorePass(PassRegistry &);
 void initializeGenXStructSplitterPass(PassRegistry &);
 void initializeGenXPredRegionLoweringPass(PassRegistry &);
 void initializeGenXPredToSimdCFPass(PassRegistry &);
@@ -252,6 +270,7 @@ void initializeGenXLscAddrCalcFoldingPass(PassRegistry &);
 void initializeGenXDetectPointerArgPass(PassRegistry &);
 void initializeGenXLCECalculationPass(PassRegistry &);
 void initializeGenXFloatControlPass(PassRegistry &);
+void initializeGenXCountIndirectStatelessPass(PassRegistry &);
 } // End llvm namespace
 
 #endif

@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2017-2023 Intel Corporation
+Copyright (C) 2017-2024 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -109,6 +109,9 @@ namespace
         void replaceLRound(IntrinsicInst* I);
         void replaceLRint(IntrinsicInst* I);
         void replaceCountTheLeadingZeros(IntrinsicInst* I);
+        void replaceMinMax(IntrinsicInst* I);
+        void replaceI1MinMax(IntrinsicInst* I);
+        void replaceI64MinMax(IntrinsicInst* I);
 
         static const std::map< Intrinsic::ID, MemFuncPtr_t > m_intrinsicToFunc;
     };
@@ -137,7 +140,11 @@ const std::map< Intrinsic::ID, ReplaceUnsupportedIntrinsics::MemFuncPtr_t > Repl
     { Intrinsic::llround,    &ReplaceUnsupportedIntrinsics::replaceLRound },
     { Intrinsic::lrint,      &ReplaceUnsupportedIntrinsics::replaceLRint },
     { Intrinsic::llrint,     &ReplaceUnsupportedIntrinsics::replaceLRint },
-    { Intrinsic::ctlz,       &ReplaceUnsupportedIntrinsics::replaceCountTheLeadingZeros }
+    { Intrinsic::ctlz,       &ReplaceUnsupportedIntrinsics::replaceCountTheLeadingZeros },
+    { Intrinsic::smax,       &ReplaceUnsupportedIntrinsics::replaceMinMax },
+    { Intrinsic::smin,       &ReplaceUnsupportedIntrinsics::replaceMinMax },
+    { Intrinsic::umax,       &ReplaceUnsupportedIntrinsics::replaceMinMax },
+    { Intrinsic::umin,       &ReplaceUnsupportedIntrinsics::replaceMinMax }
 };
 
 ReplaceUnsupportedIntrinsics::ReplaceUnsupportedIntrinsics() : FunctionPass(ID)
@@ -475,9 +482,9 @@ void ReplaceUnsupportedIntrinsics::replaceMemcpy(IntrinsicInst* I)
     Value* Dst = MC->getRawDest();
     Value* Src = MC->getRawSource();
     Value* LPCount = MC->getLength();
-    uint32_t Align = MC->getDestAlignment();
+    uint32_t Align = MC->getDestAlign().valueOrOne().value();
     Align = Align != 0 ? Align : 1;
-    uint32_t SrcAlign = MC->getSourceAlignment();
+    uint32_t SrcAlign = MC->getSourceAlign().valueOrOne().value();
     SrcAlign = SrcAlign != 0 ? SrcAlign : 1;
     const bool IsVolatile = MC->isVolatile();
     const uint32_t SrcAS = MC->getSourceAddressSpace();
@@ -604,7 +611,7 @@ void ReplaceUnsupportedIntrinsics::replaceMemMove(IntrinsicInst* I)
     Value* Dst = MM->getRawDest();
     Value* Src = MM->getRawSource();
     Value* LPCount = MM->getLength();
-    uint32_t Align = MM->getDestAlignment();
+    uint32_t Align = MM->getDestAlign().valueOrOne().value();
     if (Align == 0)
         Align = 1;
     const bool IsVolatile = MM->isVolatile();
@@ -792,7 +799,7 @@ void ReplaceUnsupportedIntrinsics::replaceMemset(IntrinsicInst* I)
     Value* Dst = MS->getRawDest();
     Value* Src = MS->getValue();
     Value* LPCount = MS->getLength();
-    uint32_t Align = MS->getDestAlignment();
+    uint32_t Align = MS->getDestAlign().valueOrOne().value();
     const bool IsVolatile = MS->isVolatile();
     const uint32_t AS = MS->getDestAddressSpace();
 
@@ -804,7 +811,9 @@ void ReplaceUnsupportedIntrinsics::replaceMemset(IntrinsicInst* I)
     // BaseSize == 32 if we want to handle algorithm in general way
     // or different value if want to keep size of base type to further optimizations
     uint32_t BaseSize = 0;
-    Type* RawDstType = IGCLLVM::getNonOpaquePtrEltTy(Dst->stripPointerCasts()->getType());
+    PointerType* ptrTy = cast<PointerType>(Dst->stripPointerCasts()->getType());
+    Type* RawDstType = IGCLLVM::isOpaquePointerTy(ptrTy) ? Builder.getInt8Ty() : IGCLLVM::getNonOpaquePtrEltTy(ptrTy);  // Legacy code: getNonOpaquePtrEltTy
+
     if (Type* BaseType = GetBaseType(RawDstType))
         BaseSize = BaseType->getScalarSizeInBits();
 
@@ -1026,6 +1035,49 @@ void ReplaceUnsupportedIntrinsics::replaceLRint(IntrinsicInst* I) {
     Value* FPToInt = Builder.CreateFPToSI(inVal, dstType, inValName + suffix);
     I->replaceAllUsesWith(FPToInt);
     I->eraseFromParent();
+}
+
+void ReplaceUnsupportedIntrinsics::replaceMinMax(IntrinsicInst* I)
+{
+    if(I->getType()->isIntegerTy(64))
+        replaceI64MinMax(I);
+
+    if(I->getType()->isIntegerTy(1))
+        replaceI1MinMax(I);
+}
+/*
+    Replaces i64 calls to llvm.smax, llvm.smin, llvm.umax, llvm.umin to
+    icmp + select instructionc that can be emulated.
+*/
+void ReplaceUnsupportedIntrinsics::replaceI64MinMax(IntrinsicInst* I)
+{
+    const SmallDenseMap<Intrinsic::ID, CmpInst::Predicate, 4> CmpPredMap {
+        {Intrinsic::smax, CmpInst::Predicate::ICMP_SGT},
+        {Intrinsic::smin, CmpInst::Predicate::ICMP_SLT},
+        {Intrinsic::umax, CmpInst::Predicate::ICMP_UGT},
+        {Intrinsic::umin, CmpInst::Predicate::ICMP_ULT}
+    };
+
+    IGCLLVM::IRBuilder<> Builder(I);
+
+    Value* LHS = I->getArgOperand(0), * RHS = I->getArgOperand(1);
+    auto Cmp = cast<Instruction>(
+        Builder.CreateICmp(CmpPredMap.lookup(I->getIntrinsicID()), LHS, RHS));
+    I->replaceAllUsesWith(Builder.CreateSelect(Cmp, LHS, RHS));
+}
+
+void ReplaceUnsupportedIntrinsics::replaceI1MinMax(IntrinsicInst* I)
+{
+    IGCLLVM::IRBuilder<> Builder(I);
+
+    Value* LHS = I->getArgOperand(0), * RHS = I->getArgOperand(1);
+
+    auto IntrId = I->getIntrinsicID();
+
+    if (IntrId == Intrinsic::smax || IntrId == Intrinsic::umax)
+        I->replaceAllUsesWith(Builder.CreateOr(LHS, RHS));
+    else // Intrinsic::smin || Intrinsic::umin
+        I->replaceAllUsesWith(Builder.CreateAnd(LHS, RHS));
 }
 
 /*

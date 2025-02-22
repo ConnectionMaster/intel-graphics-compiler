@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2021-2024 Intel Corporation
+Copyright (C) 2021-2025 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -36,7 +36,7 @@ SPDX-License-Identifier: MIT
 #include <llvm/Pass.h>
 #include <optional>
 
-#define DEBUG_TYPE "GENX_SPIRV_BUILTINS"
+#define DEBUG_TYPE "GenXTranslateSPIRVBuiltins"
 
 using namespace llvm;
 
@@ -69,6 +69,7 @@ private:
                            ArrayRef<Value *> Args, bool AFN = false);
   Value *emitFDiv(IRBuilder<> &Builder, Value *L, Value *R, bool ARCP = false);
   Value *emitAddcSubb(IRBuilder<> &Builder, unsigned IID, CallInst &CI);
+  Value *emitMulExtended(IRBuilder<> &Builder, unsigned IID, CallInst &CI);
   Value *emitDot(IRBuilder<> &Builder, unsigned IID, CallInst &CI);
 
   Module *M;
@@ -117,6 +118,7 @@ Value *SPIRVExpander::emitAddcSubb(IRBuilder<> &Builder, unsigned IID,
   if (ArgTy->getScalarType()->getPrimitiveSizeInBits() < 32) {
     vc::diagnose(CI.getFunction()->getContext(), "GenXTranslateSPIRV",
                  "only 32/64-bit addc/subb supported", &CI);
+    return nullptr;
   }
   auto *Instr = emitIntrinsic(Builder, IID, {ArgTy, ArgTy},
                               {CI.getArgOperand(1), CI.getArgOperand(2)});
@@ -144,6 +146,34 @@ Value *SPIRVExpander::emitAddcSubb(IRBuilder<> &Builder, unsigned IID,
   Builder.CreateStore(ExtRes, ResPtr);
   return Builder.CreateStore(Carry, CarryPtr);
 }
+
+Value *SPIRVExpander::emitMulExtended(IRBuilder<> &Builder, unsigned IID,
+                                      CallInst &CI) {
+  auto *Res = CI.getArgOperand(0);
+
+  auto *Ty = CI.getArgOperand(1)->getType();
+  if (Ty->getScalarType()->getPrimitiveSizeInBits() != 32) {
+    vc::diagnose(CI.getFunction()->getContext(), "GenXTranslateSPIRV",
+                 "only 32 MulExtended supported", &CI);
+    return nullptr;
+  }
+
+  auto *Zero = Constant::getNullValue(Ty);
+  auto *Instr = emitIntrinsic(Builder, IID, {Ty, Ty},
+                              {CI.getArgOperand(1), CI.getArgOperand(2), Zero});
+
+  auto *Lo = Builder.CreateExtractValue(Instr, {0});
+  auto *Hi = Builder.CreateExtractValue(Instr, {1});
+
+  unsigned int AddrSpace = cast<PointerType>(Res->getType())->getAddressSpace();
+  Res = Builder.CreateBitCast(Res, PointerType::get(Ty, AddrSpace));
+  auto *LoPtr = Builder.CreateGEP(Ty, Res, Builder.getInt32(0));
+  auto *HiPtr = Builder.CreateGEP(Ty, Res, Builder.getInt32(1));
+
+  Builder.CreateStore(Lo, LoPtr);
+  return Builder.CreateStore(Hi, HiPtr);
+}
+
 Value *SPIRVExpander::emitDot(IRBuilder<> &Builder, unsigned IID,
                               CallInst &CI) {
   auto *Ty = CI.getType();
@@ -247,6 +277,14 @@ Value *SPIRVExpander::visitCallInst(CallInst &CI) {
 
   if (IID != Intrinsic::not_intrinsic)
     return emitAddcSubb(Builder, IID, CI);
+
+  IID = StringSwitch<unsigned>(CalleeName)
+            .StartsWith("UMulExtended", GenXIntrinsic::genx_uimad)
+            .StartsWith("SMulExtended", GenXIntrinsic::genx_simad)
+            .Default(Intrinsic::not_intrinsic);
+
+  if (IID != Intrinsic::not_intrinsic)
+    return emitMulExtended(Builder, IID, CI);
 
   if (CalleeName.startswith("Dot")) {
     return emitDot(Builder, IID, CI);
@@ -357,9 +395,18 @@ Value *SPIRVExpander::visitCallInst(CallInst &CI) {
 }
 
 class GenXTranslateSPIRVBuiltins final : public ModulePass {
+#if LLVM_VERSION_MAJOR >= 16
+  GenXBackendConfigPass::Result &BC;
+#endif
 public:
   static char ID;
+
+#if LLVM_VERSION_MAJOR >= 16
+  GenXTranslateSPIRVBuiltins(GenXBackendConfigPass::Result &BC)
+      : BC(BC), ModulePass(ID), Expander(nullptr) {}
+#else  // LLVM_VERSION_MAJOR >= 16
   GenXTranslateSPIRVBuiltins() : ModulePass(ID), Expander(nullptr) {}
+#endif // LLVM_VERSION_MAJOR >= 16
   StringRef getPassName() const override {
     return "GenX translate SPIR-V builtins";
   }
@@ -380,10 +427,25 @@ INITIALIZE_PASS_DEPENDENCY(GenXBackendConfig)
 INITIALIZE_PASS_END(GenXTranslateSPIRVBuiltins, "GenXTranslateSPIRVBuiltins",
                     "GenXTranslateSPIRVBuiltins", false, false)
 
-ModulePass *llvm::createGenXTranslateSPIRVBuiltinsPass() {
+#if LLVM_VERSION_MAJOR < 16
+namespace llvm {
+ModulePass *createGenXTranslateSPIRVBuiltinsPass() {
   initializeGenXTranslateSPIRVBuiltinsPass(*PassRegistry::getPassRegistry());
   return new GenXTranslateSPIRVBuiltins;
 }
+} // namespace llvm
+#endif
+
+#if LLVM_VERSION_MAJOR >= 16
+PreservedAnalyses
+GenXTranslateSPIRVBuiltinsPass::run(llvm::Module &M,
+                                    llvm::AnalysisManager<llvm::Module> &AM) {
+  GenXTranslateSPIRVBuiltins GenXTrans(BC);
+  if (GenXTrans.runOnModule(M))
+    return PreservedAnalyses::none();
+  return PreservedAnalyses::all();
+}
+#endif
 
 void GenXTranslateSPIRVBuiltins::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.addRequired<GenXBackendConfig>();
@@ -517,7 +579,11 @@ bool GenXTranslateSPIRVBuiltins::runOnFunction(Function &F) {
 
 std::unique_ptr<Module>
 GenXTranslateSPIRVBuiltins::getBiFModule(BiFKind Kind, LLVMContext &Ctx) {
+#if LLVM_VERSION_MAJOR >= 16
+  MemoryBufferRef BiFModuleBuffer = BC.getBiFModule(Kind);
+#else
   MemoryBufferRef BiFModuleBuffer =
       getAnalysis<GenXBackendConfig>().getBiFModule(Kind);
+#endif
   return vc::getLazyBiFModuleOrReportError(BiFModuleBuffer, Ctx);
 }

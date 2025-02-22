@@ -19,17 +19,17 @@ SPDX-License-Identifier: MIT
 #include "CastToGASAnalysis.h"
 #include "ResourceLoopAnalysis.h"
 #include "Compiler/MetaDataUtilsWrapper.h"
+#include "Probe/Assertion.h"
+
 #include "common/LLVMWarningsPush.hpp"
 #include <llvm/IR/DataLayout.h>
 #include <llvm/IR/InlineAsm.h>
-#include "llvm/IR/GetElementPtrTypeIterator.h"
-#include "llvm/Analysis/CallGraph.h"
-#include <optional>
+#include <llvm/IR/GetElementPtrTypeIterator.h>
+#include <llvm/Analysis/CallGraph.h>
 #include "common/LLVMWarningsPop.hpp"
-#include "Compiler/IGCPassSupport.h"
-#include "Probe/Assertion.h"
-#include <functional>
 
+#include <functional>
+#include <optional>
 #include <type_traits>
 
 namespace llvm
@@ -101,6 +101,10 @@ public:
     void Select(const SSource sources[3], const DstModifier& modifier);
     void PredAdd(const SSource& pred, bool invert, const SSource sources[2], const DstModifier& modifier);
     void Mul(const SSource[2], const DstModifier& modifier);
+    void Div(const SSource[2], const DstModifier& modifier);
+    void Inv(const SSource[2], const DstModifier& modifier);
+    void Add(const SSource[2], const DstModifier& modifier);
+    void FPTrunc(const SSource[2], const DstModifier& modifier);
     void Powi(const SSource[2], const DstModifier& modifier);
     void Mov(const SSource& source, const DstModifier& modifier);
     void Unary(e_opcode opCode, const SSource sources[1], const DstModifier& modifier);
@@ -142,6 +146,7 @@ public:
     void EmitMulPair(llvm::GenIntrinsicInst* GII, const SSource Sources[4], const DstModifier& DstMod);
     void EmitPtrToPair(llvm::GenIntrinsicInst* GII, const SSource Sources[1], const DstModifier& DstMod);
     void EmitInlineAsm(llvm::CallInst* inst);
+    void EmitInitializePHI(llvm::PHINode* phi);
 
     void emitPairToPtr(llvm::GenIntrinsicInst* GII);
 
@@ -243,6 +248,7 @@ public:
     void emitSimdLaneIdReplicate(llvm::Instruction* inst);
     void emitSimdSize(llvm::Instruction* inst);
     void emitSimdShuffle(llvm::Instruction* inst);
+    void emitSimdClusteredBroadcast(llvm::Instruction* inst);
     void emitCrossInstanceMov(const SSource& source, const DstModifier& modifier);
     void emitSimdShuffleDown(llvm::Instruction* inst);
     void emitSimdShuffleXor(llvm::Instruction* inst);
@@ -319,6 +325,19 @@ public:
         bool negate,
         CVariable* src,
         CVariable* dst);
+    void emitReductionTree(
+        e_opcode op,
+        VISA_Type type,
+        CVariable* src,
+        CVariable* dst );
+    void emitReductionTrees(
+        e_opcode op,
+        VISA_Type type,
+        SIMDMode simdMode,
+        CVariable* src,
+        CVariable* dst,
+        unsigned int startIdx,
+        unsigned int endIdx );
     void emitReductionClustered(
         const e_opcode op,
         const uint64_t identityValue,
@@ -362,7 +381,8 @@ public:
         CVariable* result[2],
         CVariable* Flag = nullptr,
         bool isPrefix = false,
-        bool isQuad = false);
+        bool isQuad = false,
+        int clusterSize = 0);
     void emitPreOrPostFixOpScalar(
         e_opcode op,
         uint64_t identityValue,
@@ -371,7 +391,8 @@ public:
         CVariable* src,
         CVariable* result[2],
         CVariable* Flag,
-        bool isPrefix);
+        bool isPrefix,
+        int clusterSize = 0);
 
     bool IsUniformAtomic(llvm::Instruction* pInst);
     void emitAtomicRaw(llvm::GenIntrinsicInst *pInst, Value *varOffset,
@@ -419,9 +440,7 @@ public:
 
     void emitf32tof16_rtz(llvm::GenIntrinsicInst* inst);
     void emitfitof(llvm::GenIntrinsicInst* inst);
-    void emitFPOrtz(llvm::GenIntrinsicInst* inst);
-    void emitFMArtp(llvm::GenIntrinsicInst* inst);
-    void emitFMArtn(llvm::GenIntrinsicInst* inst);
+    void emitFPOWithNonDefaultRoundingMode(llvm::GenIntrinsicInst* inst);
     void emitftoi(llvm::GenIntrinsicInst* inst);
     void emitCtlz(const SSource& source);
 
@@ -454,10 +473,13 @@ public:
 
     // CrossLane Instructions
     void emitWaveBallot(llvm::GenIntrinsicInst* inst);
+    void emitWaveClusteredBallot(llvm::GenIntrinsicInst* inst);
+    void emitBallotUniform(llvm::GenIntrinsicInst* inst, CVariable** destination, bool disableHelperLanes);
     void emitWaveInverseBallot(llvm::GenIntrinsicInst* inst);
     void emitWaveShuffleIndex(llvm::GenIntrinsicInst* inst);
     void emitWavePrefix(llvm::WavePrefixIntrinsic* I);
     void emitQuadPrefix(llvm::QuadPrefixIntrinsic* I);
+    void emitWaveClusteredPrefix(llvm::GenIntrinsicInst* I);
     void emitWaveAll(llvm::GenIntrinsicInst* inst);
     void emitWaveClustered(llvm::GenIntrinsicInst* inst);
     void emitWaveInterleave(llvm::GenIntrinsicInst* inst);
@@ -688,6 +710,7 @@ public:
     void MovPhiSources(llvm::BasicBlock* bb);
 
     void InitConstant(llvm::BasicBlock* BB);
+    void emitLifetimeStartResourceLoopUnroll(llvm::BasicBlock* BB);
     void emitLifetimeStartAtEndOfBB(llvm::BasicBlock* BB);
     void emitDebugPlaceholder(llvm::GenIntrinsicInst* I);
     void emitDummyInst(llvm::GenIntrinsicInst* GII);
@@ -715,7 +738,8 @@ public:
     template<size_t N>
     void JoinSIMD(CVariable* (&tempdst)[N], uint responseLength, SIMDMode mode);
     CVariable* BroadcastIfUniform(CVariable* pVar, bool nomask = false);
-    bool IsNoMaskAllowed(SDAG& sdag);
+    bool IsNoMaskAllowed(llvm::Instruction* inst);
+    bool IsSubspanDestination(llvm::Instruction* inst);
     uint DecideInstanceAndSlice(const llvm::BasicBlock& blk, SDAG& sdag, bool& slicing);
     bool IsUndefOrZeroImmediate(const llvm::Value* value);
     inline bool isUndefOrConstInt0(const llvm::Value* val)
@@ -780,6 +804,7 @@ public:
 
     // generate loop header to process sample instruction with varying resource/sampler
     bool ResourceLoopHeader(
+        const CVariable* destination,
         ResourceDescriptor& resource,
         SamplerDescriptor& sampler,
         CVariable*& flag,
@@ -787,6 +812,7 @@ public:
         uint ResourceLoopMarker = 0,
         int* subInteration = nullptr);
     bool ResourceLoopHeader(
+        const CVariable* destination,
         ResourceDescriptor& resource,
         CVariable*& flag,
         uint& label,
@@ -848,10 +874,12 @@ public:
             }
 
             // label resource loop
-            ResourceLoopHeader(resource, sampler, flag, label, ResourceLoopMarker, &subInteration);
+            ResourceLoopHeader(currentDestination, resource, sampler, flag, label, ResourceLoopMarker, &subInteration);
         }
 
-        if (subInteration == 0)
+        // subInteration == 0 could mean no resource loop tag indicated
+        // iterations == 1 could mean no subiteration unroll
+        if (subInteration == 0 || iterations == 1)
         {
             // get exclusive load info from nested loop unroll meta data
             if (m_encoder->GetUniqueExclusiveLoad() && m_destination &&
@@ -901,19 +929,22 @@ public:
                 // need a temp (iter > 0) to save the unroll dst result to avoid shared SBID
                 Fn(flagSameLaneFlag, currentDestination, resource, needLoop);
 
-                m_encoder->SetNoMask();
-                // Sum lanes that did something (for correct goto at the end)
-                m_encoder->Or(flagSumMask, flagSumMask, flagSameLaneFlag);
-                m_encoder->Push();
-
-                // Last iteration does not need this
-                if ((iter < (iterations - 1)) && flagExecMask)
+                if (flagSameLaneFlag)
                 {
                     m_encoder->SetNoMask();
-                    // mask out handled lanes out of remaining ExecMask
-                    m_encoder->Xor(flagExecMask, flagExecMask, flagSameLaneFlag);
-                    m_encoder->Cast(dwordPrevFlag, flagExecMask);
+                    // Sum lanes that did something (for correct goto at the end)
+                    m_encoder->Or(flagSumMask, flagSumMask, flagSameLaneFlag);
                     m_encoder->Push();
+
+                    // Last iteration does not need this
+                    if ((iter < (iterations - 1)) && flagExecMask)
+                    {
+                        m_encoder->SetNoMask();
+                        // mask out handled lanes out of remaining ExecMask
+                        m_encoder->Xor(flagExecMask, flagExecMask, flagSameLaneFlag);
+                        m_encoder->Cast(dwordPrevFlag, flagExecMask);
+                        m_encoder->Push();
+                    }
                 }
             }
 
@@ -1066,7 +1097,7 @@ private:
     void emitSetMessagePhaseType_legacy(llvm::GenIntrinsicInst* inst, VISA_Type type);
 
     void emitScan(llvm::Value* Src, IGC::WaveOps Op,
-        bool isInclusiveScan, llvm::Value* Mask, bool isQuad);
+        bool isInclusiveScan, llvm::Value* Mask, bool isQuad, bool noMask = false);
 
     // Cached per lane offset variables. This is a per basic block data
     // structure. For each entry, the first item is the scalar type size in
@@ -1138,6 +1169,8 @@ private:
 
     // Helper function to check if A64 WA is required
     bool hasA64WAEnable() const;
+
+    bool shouldForceEarlyRecompile(IGCMD::MetaDataUtils* pMdUtils, llvm::Function* F);
 
     bool isHalfGRFReturn(CVariable* dst, SIMDMode simdMode);
 

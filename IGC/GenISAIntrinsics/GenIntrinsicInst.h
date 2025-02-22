@@ -46,7 +46,12 @@ See LICENSE.TXT for details.
 
 #include "llvmWrapper/IR/Instructions.h"
 #include "llvmWrapper/Support/Alignment.h"
+#include "llvmWrapper/IR/Type.h"
 #include "usc_gen7_types.h"
+
+namespace IGC {
+    enum CallableShaderTypeMD : uint32_t;
+} // namespace IGC
 
 namespace llvm {
 /// IntrinsicInst - A useful wrapper class for inspecting calls to intrinsic
@@ -499,6 +504,11 @@ public:
             return false;
         }
     }
+
+    Type* getTexturePtrEltTy() const {
+        Value* textureVal = this->getTextureValue();
+        return textureVal ? IGCLLVM::getNonOpaquePtrEltTy(textureVal->getType()) : nullptr;
+    }
 };
 
 class LdMSIntrinsic : public SamplerLoadIntrinsic {
@@ -851,6 +861,11 @@ public:
         }
         return false;
     }
+
+    Type* getTexturePtrEltTy() const {
+        Value* textureVal = this->getTextureValue();
+        return textureVal ? IGCLLVM::getNonOpaquePtrEltTy(textureVal->getType()) : nullptr;
+    }
 };
 
 class LdRawIntrinsic : public GenIntrinsicInst {
@@ -1194,6 +1209,25 @@ public:
     }
 };
 
+class WaveShuffleIndexIntrinsic : public GenIntrinsicInst
+{
+public:
+    Value* getSrc() const { return getOperand( 0 ); }
+    Value* getChannel() const { return getOperand( 1 ); }
+
+    void setSrc( Value* src ) { setOperand( 0, src ); }
+
+    // Methods for support type inquiry through isa, cast, and dyn_cast:
+    static inline bool classof( const GenIntrinsicInst* I )
+    {
+        return I->getIntrinsicID() == GenISAIntrinsic::GenISA_WaveShuffleIndex;
+    }
+    static inline bool classof( const Value* V )
+    {
+        return isa<GenIntrinsicInst>( V ) && classof( cast<GenIntrinsicInst>( V ) );
+    }
+};
+
 class QuadPrefixIntrinsic : public GenIntrinsicInst
 {
 public:
@@ -1216,6 +1250,24 @@ public:
     }
 };
 
+class WaveAllIntrinsic : public GenIntrinsicInst
+{
+public:
+    Value *getSrc() const { return getOperand(0); }
+    IGC::WaveOps getOpKind() const
+    {
+        return static_cast<IGC::WaveOps>(getImm64Operand(1));
+    }
+
+    // Methods for support type inquiry through isa, cast, and dyn_cast:
+    static inline bool classof(const GenIntrinsicInst *I) {
+        return I->getIntrinsicID() == GenISAIntrinsic::GenISA_WaveAll;
+    }
+    static inline bool classof(const Value *V) {
+        return isa<GenIntrinsicInst>(V) && classof(cast<GenIntrinsicInst>(V));
+    }
+};
+
 // This is just a meta intrinsic that encapsulates the idea of intrinsics
 // that contain continuation IDs.
 class ContinuationHLIntrinsic : public GenIntrinsicInst {
@@ -1227,6 +1279,7 @@ public:
         {
         case GenISAIntrinsic::GenISA_TraceRayAsyncHL:
         case GenISAIntrinsic::GenISA_CallShaderHL:
+        case GenISAIntrinsic::GenISA_SyncDispatchRaysSplitPoint:
             return true;
         default:
             break;
@@ -1326,6 +1379,45 @@ public:
     Value* getParameter()           const { return getOperand(3); }
 };
 
+class SyncDispatchRaysSplitPointIntrinsic : public ContinuationHLIntrinsic {
+public:
+    // Methods for support type inquiry through isa, cast, and dyn_cast:
+    static inline bool classof(const ContinuationHLIntrinsic* I) {
+        GenISAIntrinsic::ID ID = I->getIntrinsicID();
+        return ID == GenISAIntrinsic::GenISA_SyncDispatchRaysSplitPoint;
+    }
+
+    static inline bool classof(const Value* V) {
+        return isa<ContinuationHLIntrinsic>(V) &&
+            classof(cast<ContinuationHLIntrinsic>(V));
+    }
+
+    Value* getRTStack()
+    {
+        return getOperand(2);
+    }
+
+    Value* getPayload()
+    {
+        return getOperand(3);
+    }
+
+    Value* getState()
+    {
+        return getOperand(4);
+    }
+
+    Value* getShaderRecordAddress()
+    {
+        return getOperand(5);
+    }
+
+    IGC::CallableShaderTypeMD getShaderType()
+    {
+        return static_cast<IGC::CallableShaderTypeMD>(cast<ConstantInt>(getOperand(6))->getZExtValue());
+    }
+};
+
 
 class TraceRayIntrinsic : public GenIntrinsicInst {
 public:
@@ -1352,6 +1444,7 @@ public:
     void setGlobalBufferPointer(Value* V) { return setOperand(0, V); }
 
     Value* getPayload()             const { return getOperand(1); }
+    void setPayload(Value* V)             { return setOperand(1, V); }
 };
 
 class TraceRayAsyncIntrinsic : public TraceRayIntrinsic {

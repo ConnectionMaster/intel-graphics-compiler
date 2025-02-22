@@ -34,7 +34,7 @@ using namespace RTStackFormat;
 //Lowering pass for Synchronous raytracing intrinsics known as TraceRayInline/RayQuery
 class TraceRayInlineLoweringPass : public FunctionPass
 {
-    LoopInfo* LI;
+    LoopInfo* LI = nullptr;
 public:
     TraceRayInlineLoweringPass() : FunctionPass(ID) {
         initializeTraceRayInlineLoweringPassPass(*PassRegistry::getPassRegistry());
@@ -55,16 +55,15 @@ private:
     //m_ShMemRTCtrls  is an array of RTStackFormat::RTCtrl in ShadowMemory
     //together, they are RayQueryObjects[n]
     //RTStack2/SMStack2 m_ShMemRTStacks[n]
-    Value* m_ShMemRTStacks = nullptr;
+    AllocaInst* m_ShMemRTStacks = nullptr;
     //RayQueryStateInfo m_ShMemRTCtrls[n]
-    Value* m_ShMemRTCtrls = nullptr;
+    AllocaInst* m_ShMemRTCtrls = nullptr;
     CodeGenContext* m_CGCtx = nullptr;
     bool singleRQMemRayStore = false;
     //if there is only one Proceed and it's not in a loop, then, we only need to prepare data for Proceed() once
     //where it's for initialization
     //FIXME: hack code, fix this hack in stage 2.
     bool singleRQProceed = true;
-    bool usesDeprecatedCopyMemHitInRQProceed = true;
 
     void LowerAllocateRayQuery(Function& F, unsigned numProceeds);
     void LowerTraceRayInline(Function& F);
@@ -78,14 +77,14 @@ private:
     void LowerCommitProceduralPrimitiveHit(Function& F);
 
     //return m_ShMemRTCtrls[index]
-    Value* getShMemRTCtrl(RTBuilder& builder, unsigned queryIndex) {
+    GetElementPtrInst* getShMemRTCtrl(RTBuilder& builder, unsigned queryIndex) {
         return getShMemRTCtrl(builder, builder.getInt32(queryIndex));
     }
 
     //return m_ShMemRTCtrls[index]
-    Value* getShMemRTCtrl(RTBuilder& builder, Value* queryIndex) {
-        return builder.CreateGEP(cast<llvm::AllocaInst>(m_ShMemRTCtrls)->getAllocatedType(),
-            m_ShMemRTCtrls, { builder.getInt32(0), queryIndex }, VALUE_NAME("&shadowMem.RTCtrl"));
+    GetElementPtrInst* getShMemRTCtrl(RTBuilder& builder, Value* queryIndex) {
+        return GetElementPtrInst::Create(m_ShMemRTCtrls->getAllocatedType(),
+            m_ShMemRTCtrls, { builder.getInt32(0), queryIndex }, VALUE_NAME("&shadowMem.RTCtrl"), &(*builder.GetInsertPoint()));
     }
 
     //return rtStacks[index]
@@ -96,7 +95,7 @@ private:
     //return rtStacks[index]
     RTBuilder::SyncStackPointerVal* getShMemRayQueryRTStack(RTBuilder& builder, Value* queryIndex) {
         return static_cast<RTBuilder::SyncStackPointerVal*>(
-            builder.CreateGEP(cast<llvm::AllocaInst>(m_ShMemRTStacks)->getAllocatedType(),
+            builder.CreateGEP(m_ShMemRTStacks->getAllocatedType(),
                 m_ShMemRTStacks, { builder.getInt32(0), queryIndex }, VALUE_NAME("&shadowMem.RTStack")));
     }
 
@@ -112,13 +111,12 @@ private:
     Value* emitProceedMainBody(RTBuilder& builder, Value* queryObjIndex);
 
     bool forceShortCurcuitingOR_CommittedGeomIdx(RTBuilder& builder, Instruction* I);
-
 };
 
 char TraceRayInlineLoweringPass::ID = 0;
 
 // Register pass to igc-opt
-#define PASS_FLAG "tracerayinline-lowering"
+#define PASS_FLAG "igc-tracerayinline-lowering-pass"
 #define PASS_DESCRIPTION "Lower tracerayinline intrinsics"
 #define PASS_CFG_ONLY false
 #define PASS_ANALYSIS false
@@ -153,7 +151,6 @@ bool TraceRayInlineLoweringPass::runOnFunction(Function& F)
     DumpLLVMIR(m_CGCtx, "TraceRayInlineLoweringPass");
     return true;
 }
-
 
 
 void TraceRayInlineLoweringPass::LowerAllocateRayQuery(
@@ -359,11 +356,11 @@ Value* TraceRayInlineLoweringPass::emitProceedMainBody(
     auto* const HWStackPointer = builder.getSyncStackPointer();
     auto* const ShadowMemStackPointer = getShMemRayQueryRTStack(builder, queryObjIndex);
 
-    builder.copyMemHitInProceed(HWStackPointer, ShadowMemStackPointer, singleRQProceed, usesDeprecatedCopyMemHitInRQProceed);
+    builder.copyMemHitInProceed(HWStackPointer, ShadowMemStackPointer, singleRQProceed);
 
     //get ray Current ray control for object
-    Value* ShdowMemRTCtrlPtr = getShMemRTCtrl(builder, queryObjIndex);
-    Value* traceRayCtrl = builder.getSyncTraceRayControl(ShdowMemRTCtrlPtr);
+    GetElementPtrInst* ShdowMemRTCtrlPtr = getShMemRTCtrl(builder, queryObjIndex);
+    LoadInst* traceRayCtrl = builder.getSyncTraceRayControl(ShdowMemRTCtrlPtr);
 
     if (IGC_IS_FLAG_ENABLED(DisableLoadAsFenceOpInRaytracing))
     {

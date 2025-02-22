@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2017-2023 Intel Corporation
+Copyright (C) 2017-2025 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -330,10 +330,13 @@ struct SinkCandidate {
 // GenX depressurizer pass
 class GenXDepressurizer : public FGPassImplInterface,
                           public IDMixin<GenXDepressurizer> {
-  enum { FlagThreshold = 6, AddrThreshold = 32, GRFThreshold = 2560,
-         FlagGRFTolerance = 3840 };
+  const unsigned FlagThreshold = 6;
+  const unsigned AddrThreshold = 32;
+  unsigned GRFThreshold = 0;
+  unsigned FlagGRFTolerance = 0;
   bool Modified = false;
   GenXGroupBaling *Baling = nullptr;
+  const GenXBackendConfig *BC = nullptr;
   DominatorTree *DT = nullptr;
   LoopInfoBase<BasicBlock, Loop> *LI = nullptr;
   PseudoCFG *PCFG = nullptr;
@@ -388,6 +391,7 @@ INITIALIZE_PASS_BEGIN(GenXDepressurizerWrapper, "GenXDepressurizerWrapper",
 INITIALIZE_PASS_DEPENDENCY(DominatorTreeGroupWrapperPassWrapper)
 INITIALIZE_PASS_DEPENDENCY(GenXLivenessWrapper)
 INITIALIZE_PASS_DEPENDENCY(GenXGroupBalingWrapper)
+INITIALIZE_PASS_DEPENDENCY(GenXBackendConfig)
 INITIALIZE_PASS_END(GenXDepressurizerWrapper, "GenXDepressurizerWrapper",
                     "GenXDepressurizerWrapper", false, false)
 
@@ -399,10 +403,12 @@ ModulePass *llvm::createGenXDepressurizerWrapperPass() {
 void GenXDepressurizer::getAnalysisUsage(AnalysisUsage &AU) {
   AU.addRequired<DominatorTreeGroupWrapperPass>();
   AU.addRequired<GenXGroupBaling>();
+  AU.addRequired<GenXBackendConfig>();
   AU.addPreserved<DominatorTreeGroupWrapperPass>();
   AU.addPreserved<GenXModule>();
   AU.addPreserved<GenXLiveness>();
   AU.addPreserved<GenXGroupBaling>();
+  AU.addPreserved<GenXBackendConfig>();
   AU.addPreserved<FunctionGroupAnalysis>();
   AU.setPreservesCFG();
 }
@@ -418,6 +424,9 @@ bool GenXDepressurizer::runOnFunctionGroup(FunctionGroup &FG) {
   Modified = false;
   SunkCount = 0;
   Baling = &getAnalysis<GenXGroupBaling>();
+  BC = &getAnalysis<GenXBackendConfig>();
+  GRFThreshold = BC->getDepressurizerGRFThreshold();
+  FlagGRFTolerance = BC->getDepressurizerFlagGRFTolerance();
   // Process functions in the function group in reverse order, so we know the
   // max pressure in a subroutine when we see a call to it.
   for (auto fgi = FG.rbegin(), fge = FG.rend(); fgi != fge; ++fgi) {

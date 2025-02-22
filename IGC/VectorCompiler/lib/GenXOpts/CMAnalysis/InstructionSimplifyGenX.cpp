@@ -44,7 +44,7 @@ SPDX-License-Identifier: MIT
 
 #include "Probe/Assertion.h"
 
-#define DEBUG_TYPE "genx-simplify"
+#define DEBUG_TYPE "GenXSimplify"
 
 using namespace llvm;
 
@@ -435,10 +435,17 @@ Value *llvm::SimplifyGenX(CallInst *I, const DataLayout &DL) {
 
 namespace {
 class GenXSimplify : public FunctionPass {
+#if LLVM_VERSION_MAJOR >= 16
+  DominatorTree &DT;
+#endif
 public:
   static char ID;
 
+#if LLVM_VERSION_MAJOR < 16
   GenXSimplify() : FunctionPass(ID) {
+#else
+  GenXSimplify(DominatorTree &DT) : DT(DT), FunctionPass(ID) {
+#endif
     initializeGenXSimplifyPass(*PassRegistry::getPassRegistry());
   }
 
@@ -456,7 +463,9 @@ private:
 
 bool GenXSimplify::runOnFunction(Function &F) {
   const DataLayout &DL = F.getParent()->getDataLayout();
+#if LLVM_VERSION_MAJOR < 16
   const auto &DT = getAnalysis<DominatorTreeWrapperPass>().getDomTree();
+#endif
   bool Changed = false;
 
   auto replaceWithNewValue = [](Instruction &Inst, Value &V) {
@@ -505,10 +514,23 @@ bool GenXSimplify::runOnFunction(Function &F) {
 }
 
 char GenXSimplify::ID = 0;
-INITIALIZE_PASS_BEGIN(GenXSimplify, "genx-simplify",
+INITIALIZE_PASS_BEGIN(GenXSimplify, "GenXSimplify",
                       "simplify genx specific instructions", false, false)
 INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
-INITIALIZE_PASS_END(GenXSimplify, "genx-simplify",
+INITIALIZE_PASS_END(GenXSimplify, "GenXSimplify",
                     "simplify genx specific instructions", false, false)
 
-FunctionPass *llvm::createGenXSimplifyPass() { return new GenXSimplify; }
+#if LLVM_VERSION_MAJOR < 16
+namespace llvm {
+FunctionPass *createGenXSimplifyPass() { return new GenXSimplify; }
+} // namespace llvm
+#else
+PreservedAnalyses GenXSimplifyPass::run(Function &F,
+                                        FunctionAnalysisManager &AM) {
+  auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
+  GenXSimplify GenXSimpl(DT);
+  if (GenXSimpl.runOnFunction(F))
+    return PreservedAnalyses::none();
+  return PreservedAnalyses::all();
+}
+#endif

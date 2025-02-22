@@ -372,6 +372,9 @@ BinaryEncodingIGA::getIGAInternalPlatform(TARGET_PLATFORM genxPlatform) {
   case Xe2:
     platform = Platform::XE2;
     break;
+  case Xe3:
+    platform = Platform::XE3;
+    break;
   default:
     break;
   }
@@ -966,6 +969,9 @@ void BinaryEncodingIGA::SetSWSB(G4_INST *inst, SWSB &sw) {
       case DistanceType::DISTMATH:
         sw.distType = SWSB::DistType::REG_DIST_MATH;
         break;
+      case DistanceType::DISTS0:
+        sw.distType = SWSB::DistType::REG_DIST_SCALAR;
+        break;
       default:
         break;
       }
@@ -995,7 +1001,7 @@ void BinaryEncodingIGA::SetSWSB(G4_INST *inst, SWSB &sw) {
   // - send has only distance     --> $0 and distance
   // This workaround can be removed once vISA doesn't produce such SWSB.
   // Currently this could happen only on EOT send.
-  if (inst->isSend() && !sw.hasBothDistAndToken() &&
+  if (inst->isSend() &&
       !sw.verify(getIGASWSBEncodeMode(), SWSB::InstType::SEND)) {
     sw.tokenType = SWSB::TokenType::SET;
     if (sw.hasDist()) {
@@ -1492,6 +1498,8 @@ void BinaryEncodingIGA::translateInstructionSrcs(G4_INST *inst,
         regRef.subRegNum = (uint8_t)srcRegion->ExIndSubRegNum(valid);
         // set to GRF for indirect register access
         iga::RegName regName = iga::RegName::GRF_R;
+        if (getIGARegName(srcRegion) == iga::RegName::ARF_S)
+          regName = iga::RegName::ARF_S;
 
         igaInst->setIndirectSource(opIx, srcMod, regName, regRef,
                                    srcRegion->getAddrImm(), region, type);
@@ -1743,8 +1751,8 @@ void *BinaryEncodingIGA::EmitBinary(size_t &binarySize) {
         std::string errStr;
         errStr = "BinaryEncodingIGA: unable to open output path for write: " +
                  binFileName + "\n";
-        vISA_ASSERT(false, errStr);
-        return nullptr;
+        // vISA_ASSERT(false, errStr);
+        return m_kernelBuffer;
       }
       os.write((const char *)m_kernelBuffer, binarySize);
     }
@@ -1836,6 +1844,8 @@ RegName BinaryEncodingIGA::getIGAARFName(G4_ArchRegKind areg) {
     return RegName::ARF_TDR;
   case AREG_SP:
     return RegName::ARF_SP;
+  case AREG_S0:
+    return RegName::ARF_S;
   default:
     vISA_ASSERT_UNREACHABLE("illegal ARF");
     return RegName::INVALID;

@@ -30,9 +30,10 @@ SPDX-License-Identifier: MIT
 #include <llvm/IR/Function.h>
 #include <llvm/IR/InstIterator.h>
 #include <llvm/IR/InstVisitor.h>
+#include <llvm/IR/PassManager.h>
 #include <llvm/Pass.h>
 
-#define DEBUG_TYPE "GENX_TYPE_LEGALIZATION"
+#define DEBUG_TYPE "GenXTypeLegalization"
 
 using namespace llvm;
 
@@ -78,10 +79,23 @@ INITIALIZE_PASS_BEGIN(GenXTypeLegalization, "GenXTypeLegalization",
                       "GenXTypeLegalization", false, false)
 INITIALIZE_PASS_END(GenXTypeLegalization, "GenXTypeLegalization",
                     "GenXTypeLegalization", false, false)
-FunctionPass *llvm::createGenXTypeLegalizationPass() {
+
+namespace llvm {
+FunctionPass *createGenXTypeLegalizationPass() {
   initializeGenXTypeLegalizationPass(*PassRegistry::getPassRegistry());
   return new GenXTypeLegalization;
 }
+} // namespace llvm
+
+#if LLVM_VERSION_MAJOR >= 16
+PreservedAnalyses GenXTypeLegalizationPass::run(Function &F,
+                                                FunctionAnalysisManager &AM) {
+  GenXTypeLegalization GenXType;
+  if (GenXType.runOnFunction(F))
+    return PreservedAnalyses::none();
+  return PreservedAnalyses::all();
+}
+#endif
 
 static Twine getLegalizedName(StringRef OldN) { return OldN + ".l"; }
 

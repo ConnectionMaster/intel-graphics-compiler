@@ -177,7 +177,8 @@ struct ISA_Inst_Info ISA_Inst_Table[ISA_OPCODE_ENUM_SIZE] = {
     {ISA_RESERVED_99, ISA_Inst_Reserved, "reserved99", 0, 0},
     {ISA_RESERVED_9A, ISA_Inst_Reserved, "reserved9a", 0, 0},
     {ISA_INVM,  ISA_Inst_Arith, "invm",  2, 2},
-    {ISA_RSQTM, ISA_Inst_Arith, "rsqtm", 1, 2}
+    {ISA_RSQTM, ISA_Inst_Arith, "rsqtm", 1, 2},
+    {ISA_RESERVED_9D, ISA_Inst_Reserved, "reserved9d", 0, 0}
 };
 
 VISA_INST_Desc CISA_INST_table[ISA_NUM_OPCODE] = {
@@ -2816,6 +2817,17 @@ VISA_INST_Desc CISA_INST_table[ISA_NUM_OPCODE] = {
         },
 
     },
+
+    // 157 (0x9D)
+    {
+        ALL,
+        ISA_RESERVED_9D,
+        ISA_Inst_Reserved,
+        "reserved_9d",
+        0,
+        0,
+        {},
+    },
 };
 
 static const ISA_SubInst_Desc VASubOpcodeDesc[] = {
@@ -3456,7 +3468,12 @@ static const ISA_SubInst_Desc LscUntypedSubOpcodeDescs[] {
       LSC_OP_INVALID,
       LSC_OP_INVALID,
       LSC_OP_INVALID,
-      LSC_OP_INVALID,
+      // msrt instructions need to be recorded under untyped as the parser logic
+      // by default queries the untyped table to get the opcode string
+      // todo: need to change this as this is uncessary for msrt instructions
+      // which are only applicable for typed surfaces
+      LSC_TYPED_OP(LSC_LOAD_QUAD_MSRT, "lsc_load_quad_msrt"),
+      LSC_TYPED_OP(LSC_STORE_QUAD_MSRT, "lsc_store_quad_msrt"),
       LSC_OP_INVALID,
 };
 
@@ -3511,8 +3528,8 @@ static const ISA_SubInst_Desc LscTypedSubOpcodeDescs[] {
       LSC_OP_INVALID,
       LSC_OP_INVALID,
       LSC_OP_INVALID,
-      LSC_OP_INVALID,
-      LSC_OP_INVALID,
+      LSC_TYPED_OP(LSC_LOAD_QUAD_MSRT, "lsc_load_quad_msrt"),
+      LSC_TYPED_OP(LSC_STORE_QUAD_MSRT, "lsc_store_quad_msrt"),
 };
 
 LscOpInfo LscOpInfoGet(LSC_OP op) {
@@ -3661,6 +3678,12 @@ bool LscOpInfoFind(LSC_OP op, LscOpInfo &opInfo) {
     atomicOp("lsc_apndctr_atomic_store", 0x30, 1);
     break;
 
+ case LSC_LOAD_QUAD_MSRT:
+    loadOp("lsc_load_quad_msrt", 0x31);
+    break;
+ case LSC_STORE_QUAD_MSRT:
+    storeOp("lsc_store_quad_msrt", 0x32);
+    break;
   default:
     return false;
   }

@@ -51,6 +51,13 @@ const llvm::StringRef SubGroupFuncsResolution::SUB_GROUP_BROADCAST_US = "__built
 const llvm::StringRef SubGroupFuncsResolution::SUB_GROUP_BROADCAST_F = "__builtin_IB_simd_broadcast_f";
 const llvm::StringRef SubGroupFuncsResolution::SUB_GROUP_BROADCAST_H = "__builtin_IB_simd_broadcast_h";
 const llvm::StringRef SubGroupFuncsResolution::SUB_GROUP_BROADCAST_DF = "__builtin_IB_simd_broadcast_df";
+const llvm::StringRef SubGroupFuncsResolution::SUB_GROUP_CLUSTERED_BROADCAST = "__builtin_IB_simd_clustered_broadcast";
+const llvm::StringRef SubGroupFuncsResolution::SUB_GROUP_CLUSTERED_BROADCAST_B = "__builtin_IB_simd_clustered_broadcast_b";
+const llvm::StringRef SubGroupFuncsResolution::SUB_GROUP_CLUSTERED_BROADCAST_C = "__builtin_IB_simd_clustered_broadcast_c";
+const llvm::StringRef SubGroupFuncsResolution::SUB_GROUP_CLUSTERED_BROADCAST_US = "__builtin_IB_simd_clustered_broadcast_us";
+const llvm::StringRef SubGroupFuncsResolution::SUB_GROUP_CLUSTERED_BROADCAST_F = "__builtin_IB_simd_clustered_broadcast_f";
+const llvm::StringRef SubGroupFuncsResolution::SUB_GROUP_CLUSTERED_BROADCAST_H = "__builtin_IB_simd_clustered_broadcast_h";
+const llvm::StringRef SubGroupFuncsResolution::SUB_GROUP_CLUSTERED_BROADCAST_DF = "__builtin_IB_simd_clustered_broadcast_df";
 const llvm::StringRef SubGroupFuncsResolution::SIMD_BLOCK_READ_1_GBL = "__builtin_IB_simd_block_read_1_global";
 const llvm::StringRef SubGroupFuncsResolution::SIMD_BLOCK_READ_2_GBL = "__builtin_IB_simd_block_read_2_global";
 const llvm::StringRef SubGroupFuncsResolution::SIMD_BLOCK_READ_4_GBL = "__builtin_IB_simd_block_read_4_global";
@@ -180,6 +187,7 @@ const llvm::StringRef SubGroupFuncsResolution::GET_IMAGE_BTI = "__builtin_IB_get
 const llvm::StringRef SubGroupFuncsResolution::SUB_GROUP_REDUCE = "__builtin_IB_sub_group_reduce";
 const llvm::StringRef SubGroupFuncsResolution::SUB_GROUP_SCAN = "__builtin_IB_sub_group_scan";
 const llvm::StringRef SubGroupFuncsResolution::SUB_GROUP_CLUSTERED_REDUCE = "__builtin_IB_sub_group_clustered_reduce";
+const llvm::StringRef SubGroupFuncsResolution::SUB_GROUP_CLUSTERED_SCAN = "__builtin_IB_sub_group_clustered_scan";
 
 const std::array<std::pair<std::string, WaveOps>, 13> SubGroupFuncsResolution::m_spvOpToWaveOpMap =
 {
@@ -292,11 +300,12 @@ void SubGroupFuncsResolution::mediaBlockRead(llvm::CallInst& CI)
 
     if (use && isa<BitCastInst>(use) && (use->getType()->getScalarType()->isFloatTy() || use->getType()->getScalarType()->isHalfTy()))
     {
+        Type* types[] = { use->getType(), CI.getArgOperand(0)->getType() };
         BitCastInst* bitCast = cast<BitCastInst>(use);
         Function* simdMediaBlockReadFunc = GenISAIntrinsic::getDeclaration(
             CI.getCalledFunction()->getParent(),
             GenISAIntrinsic::GenISA_simdMediaBlockRead,
-            use->getType());
+            types);
         Instruction* simdMediaBlockRead = CallInst::Create(simdMediaBlockReadFunc, args, "", &CI);
         use->replaceAllUsesWith(simdMediaBlockRead);
         updateDebugLoc(&CI, simdMediaBlockRead);
@@ -304,10 +313,11 @@ void SubGroupFuncsResolution::mediaBlockRead(llvm::CallInst& CI)
         m_instsToDelete.push_back(&CI);
     }
     else {
+        Type* types[] = { CI.getType(), CI.getArgOperand(0)->getType() };
         Function* simdMediaBlockReadFunc = GenISAIntrinsic::getDeclaration(
             CI.getCalledFunction()->getParent(),
             GenISAIntrinsic::GenISA_simdMediaBlockRead,
-            CI.getType());
+            types);
         Instruction* simdMediaBlockRead = CallInst::Create(simdMediaBlockReadFunc, args, "", &CI);
         updateDebugLoc(&CI, simdMediaBlockRead);
         CI.replaceAllUsesWith(simdMediaBlockRead);
@@ -322,10 +332,11 @@ void SubGroupFuncsResolution::mediaBlockWrite(llvm::CallInst& CI)
     pushMediaBlockArgs(args, CI);
     args.push_back(CI.getArgOperand(2)); // push data
 
+    Type* types[] = { CI.getArgOperand(0)->getType(), CI.getArgOperand(2)->getType() };
     Function* simdMediaBlockWriteFunc = GenISAIntrinsic::getDeclaration(
         CI.getCalledFunction()->getParent(),
         GenISAIntrinsic::GenISA_simdMediaBlockWrite,
-        CI.getArgOperand(2)->getType());
+        types);
     Instruction* simdMediaBlockWrite = CallInst::Create(simdMediaBlockWriteFunc, args, "", &CI);
     updateDebugLoc(&CI, simdMediaBlockWrite);
 
@@ -573,6 +584,14 @@ void SubGroupFuncsResolution::subGroupArithmetic(CallInst& CI, WaveOps op, Group
             arg->getType());
         waveCall = IRB.CreateCall(waveScan, args);
     }
+    else if (groupType == GroupOperationClusteredScan)
+    {
+        Value* args[4] = { arg, opVal, CI.getArgOperand(1) , IRB.getInt32(0) };
+        Function* waveClusteredScan = GenISAIntrinsic::getDeclaration(CI.getCalledFunction()->getParent(),
+            GenISAIntrinsic::GenISA_WaveClusteredPrefix,
+            arg->getType());
+        waveCall = IRB.CreateCall(waveClusteredScan, args);
+    }
     else if (groupType == GroupOperationClusteredReduce)
     {
         Value* clusterSize = CI.getOperand(1);
@@ -678,6 +697,41 @@ void SubGroupFuncsResolution::visitCallInst(CallInst& CI)
         Instruction* simdBroadcast = CallInst::Create(simdBroadcastFunc, args, "simdBroadcast", &CI);
         updateDebugLoc(&CI, simdBroadcast);
         CI.replaceAllUsesWith(simdBroadcast);
+        CI.eraseFromParent();
+    }
+    else if (funcName.equals(SubGroupFuncsResolution::SUB_GROUP_CLUSTERED_BROADCAST) ||
+        funcName.equals(SubGroupFuncsResolution::SUB_GROUP_CLUSTERED_BROADCAST_US) ||
+        funcName.equals(SubGroupFuncsResolution::SUB_GROUP_CLUSTERED_BROADCAST_F) ||
+        funcName.equals(SubGroupFuncsResolution::SUB_GROUP_CLUSTERED_BROADCAST_H) ||
+        funcName.equals(SubGroupFuncsResolution::SUB_GROUP_CLUSTERED_BROADCAST_C) ||
+        funcName.equals(SubGroupFuncsResolution::SUB_GROUP_CLUSTERED_BROADCAST_B) ||
+        funcName.equals(SubGroupFuncsResolution::SUB_GROUP_CLUSTERED_BROADCAST_DF)
+        )
+    {
+        // Creates intrinsics that will be lowered in the CodeGen and will handle the sub_group_clustered_broadcast function
+        IRBuilder<> IRB(&CI);
+        Value* args[4];
+        args[0] = CI.getArgOperand(0);
+        args[1] = CI.getArgOperand(1);
+        args[2] = CI.getArgOperand(2);
+        args[3] = IRB.getInt32(0);
+
+        if (!isa<ConstantInt>(args[1]))
+        {
+            m_pCtx->EmitError("cluster_size argument in clustered_broadcast must be constant.", &CI);
+            return;
+        }
+        if (!isa<ConstantInt>(args[2]))
+        {
+            m_pCtx->EmitError("in_cluster_lane argument in clustered_broadcast must be constant.", &CI);
+            return;
+        }
+
+        Function* simdClusteredBroadcastFunc = GenISAIntrinsic::getDeclaration(CI.getCalledFunction()->getParent(),
+            GenISAIntrinsic::GenISA_WaveClusteredBroadcast, args[0]->getType());
+        Instruction* simdClusteredBroadcast = CallInst::Create(simdClusteredBroadcastFunc, args, "simdClusteredBroadcast", &CI);
+        updateDebugLoc(&CI, simdClusteredBroadcast);
+        CI.replaceAllUsesWith(simdClusteredBroadcast);
         CI.eraseFromParent();
     }
     else if (funcName.equals(SubGroupFuncsResolution::SUB_GROUP_SHUFFLE_DOWN) ||
@@ -873,10 +927,11 @@ void SubGroupFuncsResolution::visitCallInst(CallInst& CI)
         args.push_back(blockWidth);
         args.push_back(blockHeight);
 
+        Type* types[] = { CI.getCalledFunction()->getReturnType(), CI.getArgOperand(0)->getType() };
         Function* MediaBlockReadFunc = GenISAIntrinsic::getDeclaration(
             CI.getCalledFunction()->getParent(),
             GenISAIntrinsic::GenISA_MediaBlockRead,
-            CI.getCalledFunction()->getReturnType());
+            types);
 
         auto* MediaBlockRead = cast<GenIntrinsicInst>(
             CallInst::Create(MediaBlockReadFunc, args, "", &CI));
@@ -926,10 +981,11 @@ void SubGroupFuncsResolution::visitCallInst(CallInst& CI)
         args.push_back(blockHeight);
         args.push_back(CI.getArgOperand(4)); // pixels
 
+        Type* types[] = { CI.getArgOperand(0)->getType(), CI.getArgOperand(4)->getType() };
         Function* MediaBlockWriteFunc = GenISAIntrinsic::getDeclaration(
             CI.getCalledFunction()->getParent(),
             GenISAIntrinsic::GenISA_MediaBlockWrite,
-            CI.getArgOperand(4)->getType());
+            types);
 
         auto* MediaBlockWrite = cast<GenIntrinsicInst>(
             CallInst::Create(MediaBlockWriteFunc, args, "", &CI));
@@ -985,6 +1041,10 @@ void SubGroupFuncsResolution::visitCallInst(CallInst& CI)
     else if (funcName.startswith(SubGroupFuncsResolution::SUB_GROUP_CLUSTERED_REDUCE))
     {
         return subGroupArithmetic( CI, GetWaveOp(funcName), GroupOperationClusteredReduce);
+    }
+    else if (funcName.startswith(SubGroupFuncsResolution::SUB_GROUP_CLUSTERED_SCAN))
+    {
+        return subGroupArithmetic(CI, GetWaveOp(funcName), GroupOperationClusteredScan);
     }
     else if (funcName.startswith(SubGroupFuncsResolution::SUB_GROUP_BARRIER))
     {

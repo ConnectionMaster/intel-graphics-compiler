@@ -20,7 +20,7 @@ namespace IGCLLVM {
 #if LLVM_VERSION_MAJOR >= 14
 using SignedDivisionByConstantInfo = llvm::SignedDivisionByConstantInfo;
 using UnsignedDivisionByConstantInfo =
-#if LLVM_VERSION_MAJOR == 14
+#if (LLVM_VERSION_MAJOR == 14) || defined(IGC_LLVM_TRUNK_REVISION)
     // Account for a typo
     llvm::UnsignedDivisonByConstantInfo;
 #else // LLVM_VERSION_MAJOR == 14
@@ -40,25 +40,13 @@ inline SignedDivisionByConstantInfo getAPIntMagic(const llvm::APInt &value) {
 }
 
 inline UnsignedDivisionByConstantInfo getAPIntMagicUnsigned(const llvm::APInt &value, const unsigned LeadingZeros = 0) {
-#if LLVM_VERSION_MAJOR >= 14
+#if LLVM_VERSION_MAJOR >= 16
+    // Basing on this: [https://reviews.llvm.org/D140924]
+    return UnsignedDivisionByConstantInfo::get(value, LeadingZeros, false);
+#elif LLVM_VERSION_MAJOR >= 14
     return UnsignedDivisionByConstantInfo::get(value, LeadingZeros);
 #else
     return value.magicu(LeadingZeros);
-#endif
-}
-
-inline bool isNegatedPowerOf2(const llvm::APInt &value) {
-#if LLVM_VERSION_MAJOR >= 14
-    return value.isNegatedPowerOf2();
-#else // Implementation from LLVM.org, released version 14
-    unsigned BitWidth = value.getBitWidth();
-    IGC_ASSERT_MESSAGE(BitWidth, "zero width values not allowed");
-    if (value.isNonNegative())
-      return false;
-    // NegatedPowerOf2 - shifted mask in the top bits.
-    unsigned LO = value.countLeadingOnes();
-    unsigned TZ = value.countTrailingZeros();
-    return (LO + TZ) == BitWidth;
 #endif
 }
 

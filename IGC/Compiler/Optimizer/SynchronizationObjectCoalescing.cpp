@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2021-2023 Intel Corporation
+Copyright (C) 2021-2025 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -55,17 +55,16 @@ struct ExplanationEntry
 enum InstructionMask : uint32_t
 {
     None = 0x0,
-    AtomicOperation            = (1 << 0),
-    TypedReadOperation         = (1 << 1),
-    TypedWriteOperation        = (1 << 2),
-    OutputUrbReadOperation     = (1 << 3),
-    UrbWriteOperation          = (1 << 4),
-    BufferReadOperation        = (1 << 5),
-    BufferWriteOperation       = (1 << 6),
-    SharedMemoryReadOperation  = (1 << 7),
-    SharedMemoryWriteOperation = (1 << 8),
-    EndOfThreadOperation       = (1 << 9),
-
+    AtomicOperation               = (1 << 0),
+    TypedReadOperation            = (1 << 1),
+    TypedWriteOperation           = (1 << 2),
+    OutputUrbReadOperation        = (1 << 3),
+    UrbWriteOperation             = (1 << 4),
+    BufferReadOperation           = (1 << 5),
+    BufferWriteOperation          = (1 << 6),
+    SharedMemoryReadOperation     = (1 << 7),
+    SharedMemoryWriteOperation    = (1 << 8),
+    EndOfThreadOperation          = (1 << 9),
     LastMaskPlusOne,
 };
 
@@ -284,7 +283,8 @@ public:
         ReadSyncAtomic = 0x20,
         WriteSyncRead = 0x40,
         AtomicSyncAtomic = 0x80,
-        WriteSyncRet = 0x100
+        WriteSyncRet = 0x100,
+        ExtendedCacheControlSyncRet = 0x200
     };
 
 private:
@@ -401,19 +401,7 @@ private:
     ////////////////////////////////////////////////////////////////////////
     SynchronizationCaseMask GetSynchronizationMaskForAllResources(
         InstructionMask localForwardMemoryInstructionMask,
-        InstructionMask localBackwardMemoryInstructionMask) const;;
-
-    ////////////////////////////////////////////////////////////////////////
-    static bool IsSyncInstruction(const llvm::Instruction* pInst);
-
-    ////////////////////////////////////////////////////////////////////////
-    static bool IsMemoryInstruction(const llvm::Instruction* pInst);
-
-    ////////////////////////////////////////////////////////////////////////
-    static bool IsReadMemoryInstruction(const llvm::Instruction* pInst);
-
-    ////////////////////////////////////////////////////////////////////////
-    static bool IsWriteMemoryInstruction(const llvm::Instruction* pInst);
+        InstructionMask localBackwardMemoryInstructionMask) const;
 
     ////////////////////////////////////////////////////////////////////////
     static bool IsAtomicOperation(const llvm::Instruction* pInst);
@@ -485,7 +473,7 @@ private:
     static bool IsFenceOperation(const llvm::Instruction* pInst);
 
     ////////////////////////////////////////////////////////////////////////
-    static bool IsGlobalResource(llvm::Type* pResourePointerType);
+    static bool IsGlobalWritableResource(llvm::Type* pResourePointerType);
 
     ////////////////////////////////////////////////////////////////////////
     static bool IsSharedMemoryResource(llvm::Type* pResourePointerType);
@@ -563,8 +551,10 @@ bool SynchronizationObjectCoalescing::runOnFunction(llvm::Function& F)
 {
     m_CurrentFunction = &F;
     const CodeGenContext* const ctx = getAnalysis<CodeGenContextWrapper>().getCodeGenContext();
+    const ModuleMetaData* const md = ctx->getModuleMetaData();
     m_HasIndependentSharedMemoryFenceFunctionality = !ctx->platform.hasSLMFence() ||
         (ctx->platform.hasSLMFence() && ctx->platform.hasIndependentSharedMemoryFenceFunctionality()) ||
+        md->compOpt.EnableIndependentSharedMemoryFenceFunctionality ||
         IGC_IS_FLAG_ENABLED(EnableIndependentSharedMemoryFenceFunctionality);
     m_ShaderType = ctx->type;
     m_HasTypedMemoryFenceFunctionality = ctx->platform.hasLSC() && ctx->platform.LSCEnabled();
@@ -981,7 +971,8 @@ InstructionMask SynchronizationObjectCoalescing::GetDefaultWriteMemoryInstructio
         {
         case LSC_UGM: // .ugm
         case LSC_UGML: // .ugml
-            result |= BufferWriteOperation;
+            result |=
+                BufferWriteOperation;
             if (!m_HasIndependentSharedMemoryFenceFunctionality)
             {
                 result |= SharedMemoryWriteOperation;
@@ -1086,7 +1077,10 @@ InstructionMask SynchronizationObjectCoalescing::GetDefaultMemoryInstructionMask
         {
         case LSC_UGM: // .ugm
         case LSC_UGML: // .ugml
-            result |= AtomicOperation | BufferWriteOperation | BufferReadOperation;
+            result |=
+                AtomicOperation |
+                BufferWriteOperation |
+                BufferReadOperation;
             if (!m_HasIndependentSharedMemoryFenceFunctionality)
             {
                 result |= SharedMemoryWriteOperation | SharedMemoryReadOperation;
@@ -1132,7 +1126,11 @@ InstructionMask SynchronizationObjectCoalescing::GetDefaultMemoryInstructionMask
         IGC_ASSERT(0);
     }
 
-    if (static_cast<uint32_t>(result & (SharedMemoryWriteOperation | BufferWriteOperation | TypedWriteOperation)) != 0)
+    constexpr InstructionMask maskToIncludeEOT =
+        SharedMemoryWriteOperation |
+        BufferWriteOperation |
+        TypedWriteOperation;
+    if (static_cast<uint32_t>(result & maskToIncludeEOT) != 0)
     {
 
         result = static_cast<InstructionMask>(
@@ -1863,7 +1861,7 @@ IGC::InstructionMask SynchronizationObjectCoalescing::GetAtomicInstructionMaskFr
         else
         {
             llvm::Type* pPointerType = pGenIntrinsicInst->getOperand(0)->getType();
-            if (IsGlobalResource(pPointerType))
+            if (IsGlobalWritableResource(pPointerType))
             {
                 result = static_cast<InstructionMask>(result | InstructionMask::BufferReadOperation);
                 result = static_cast<InstructionMask>(result | InstructionMask::BufferWriteOperation);
@@ -1909,8 +1907,8 @@ SynchronizationObjectCoalescing::SynchronizationCaseMask SynchronizationObjectCo
     }
 
     // write -> fence -> ret
-    bool requiresFlush = static_cast<uint32_t>(writeBit & (SharedMemoryWriteOperation | BufferWriteOperation | TypedWriteOperation)) != 0;
-    bool isWriteSyncRetCase = requiresFlush && ((localBackwardMemoryInstructionMask & writeBit) != 0 &&
+    bool requiresFlushWrites = static_cast<uint32_t>(writeBit & (SharedMemoryWriteOperation | BufferWriteOperation | TypedWriteOperation)) != 0;
+    bool isWriteSyncRetCase = requiresFlushWrites && ((localBackwardMemoryInstructionMask & writeBit) != 0 &&
         (localForwardMemoryInstructionMask & EndOfThreadOperation) != 0);
     if (isWriteSyncRetCase)
     {
@@ -2379,43 +2377,6 @@ void SynchronizationObjectCoalescing::InvalidateMembers()
 }
 
 ////////////////////////////////////////////////////////////////////////
-bool SynchronizationObjectCoalescing::IsSyncInstruction(const llvm::Instruction* pInst)
-{
-    return IsThreadBarrierOperation(pInst) ||
-        IsTypedMemoryFenceOperation(pInst) ||
-        IsUrbFenceOperation(pInst) ||
-        IsLscFenceOperation(pInst) ||
-        IsUntypedMemoryFenceOperation(pInst);
-}
-
-////////////////////////////////////////////////////////////////////////
-bool SynchronizationObjectCoalescing::IsMemoryInstruction(const llvm::Instruction* pInst)
-{
-    return IsReadMemoryInstruction(pInst) ||
-        IsWriteMemoryInstruction(pInst);
-}
-
-////////////////////////////////////////////////////////////////////////
-bool SynchronizationObjectCoalescing::IsReadMemoryInstruction(const llvm::Instruction* pInst)
-{
-    return IsAtomicOperation(pInst) ||
-        IsBufferReadOperation(pInst) ||
-        IsSharedMemoryReadOperation(pInst) ||
-        IsTypedReadOperation(pInst) ||
-        IsOutputUrbReadOperation(pInst);
-}
-
-////////////////////////////////////////////////////////////////////////
-bool SynchronizationObjectCoalescing::IsWriteMemoryInstruction(const llvm::Instruction* pInst)
-{
-    return IsAtomicOperation(pInst) ||
-        IsBufferWriteOperation(pInst) ||
-        IsSharedMemoryWriteOperation(pInst) ||
-        IsTypedWriteOperation(pInst) ||
-        IsUrbWriteOperation(pInst);
-}
-
-////////////////////////////////////////////////////////////////////////
 bool SynchronizationObjectCoalescing::IsAtomicOperation(const llvm::Instruction* pInst)
 {
     if (llvm::isa<llvm::GenIntrinsicInst>(pInst))
@@ -2464,7 +2425,8 @@ bool SynchronizationObjectCoalescing::IsTypedReadOperation(const llvm::Instructi
         switch (pGenIntrinsicInst->getIntrinsicID())
         {
         case llvm::GenISAIntrinsic::GenISA_typedread:
-            return true;
+        case llvm::GenISAIntrinsic::GenISA_typedreadMS:
+            return IsGlobalWritableResource(pGenIntrinsicInst->getOperand(0)->getType());
         default:
             break;
         }
@@ -2482,6 +2444,7 @@ bool SynchronizationObjectCoalescing::IsTypedWriteOperation(const llvm::Instruct
         switch (pGenIntrinsicInst->getIntrinsicID())
         {
         case llvm::GenISAIntrinsic::GenISA_typedwrite:
+        case llvm::GenISAIntrinsic::GenISA_typedwriteMS:
             return true;
         default:
             break;
@@ -2536,8 +2499,9 @@ bool SynchronizationObjectCoalescing::IsUrbWriteOperation(const llvm::Instructio
     return false;
 }
 
-////////////////////////////////////////////////////////////////////////
-bool SynchronizationObjectCoalescing::IsBufferReadOperation(const llvm::Instruction* pInst)
+////////////////////////////////////////////////////////////////////////////////
+inline llvm::Type* GetReadOperationPointerType(
+    const llvm::Instruction* pInst)
 {
     if (llvm::isa<llvm::GenIntrinsicInst>(pInst))
     {
@@ -2547,21 +2511,27 @@ bool SynchronizationObjectCoalescing::IsBufferReadOperation(const llvm::Instruct
         {
         case llvm::GenISAIntrinsic::GenISA_ldraw_indexed:
         case llvm::GenISAIntrinsic::GenISA_ldrawvector_indexed:
-            return IsGlobalResource(pGenIntrinsicInst->getOperand(0)->getType());
+        case llvm::GenISAIntrinsic::GenISA_simdBlockRead:
+        case llvm::GenISAIntrinsic::GenISA_simdBlockReadBindless:
+        case llvm::GenISAIntrinsic::GenISA_LSCLoad:
+        case llvm::GenISAIntrinsic::GenISA_LSCLoadWithSideEffects:
+        case llvm::GenISAIntrinsic::GenISA_LSCLoadBlock:
+        case llvm::GenISAIntrinsic::GenISA_LSCLoadCmask:
+            return pGenIntrinsicInst->getOperand(0)->getType();
         default:
             break;
         }
     }
     else if (llvm::isa<llvm::LoadInst>(pInst))
     {
-        return IsGlobalResource(llvm::cast<llvm::LoadInst>(pInst)->getPointerOperandType());
+        return llvm::cast<llvm::LoadInst>(pInst)->getPointerOperandType();
     }
-
-    return false;
+    return nullptr;
 }
 
-////////////////////////////////////////////////////////////////////////
-bool SynchronizationObjectCoalescing::IsBufferWriteOperation(const llvm::Instruction* pInst)
+////////////////////////////////////////////////////////////////////////////////
+inline llvm::Type* GetWriteOperationPointerType(
+    const llvm::Instruction* pInst)
 {
     if (llvm::isa<llvm::GenIntrinsicInst>(pInst))
     {
@@ -2571,38 +2541,61 @@ bool SynchronizationObjectCoalescing::IsBufferWriteOperation(const llvm::Instruc
         {
         case llvm::GenISAIntrinsic::GenISA_storeraw_indexed:
         case llvm::GenISAIntrinsic::GenISA_storerawvector_indexed:
-            return IsGlobalResource(pGenIntrinsicInst->getOperand(0)->getType());
+        case llvm::GenISAIntrinsic::GenISA_simdBlockWrite:
+        case llvm::GenISAIntrinsic::GenISA_simdBlockWriteBindless:
+        case llvm::GenISAIntrinsic::GenISA_LSCStore:
+        case llvm::GenISAIntrinsic::GenISA_LSCStoreBlock:
+        case llvm::GenISAIntrinsic::GenISA_LSCStoreCmask:
+            return pGenIntrinsicInst->getOperand(0)->getType();
         default:
             break;
         }
     }
     else if (llvm::isa<llvm::StoreInst>(pInst))
     {
-        return IsGlobalResource(llvm::cast<llvm::StoreInst>(pInst)->getPointerOperandType());
+        return llvm::cast<llvm::StoreInst>(pInst)->getPointerOperandType();
     }
 
+    return nullptr;
+}
+
+////////////////////////////////////////////////////////////////////////
+bool SynchronizationObjectCoalescing::IsBufferReadOperation(const llvm::Instruction* pInst)
+{
+    if (llvm::Type* pPtrType = GetReadOperationPointerType(pInst))
+    {
+        return IsGlobalWritableResource(pPtrType);
+    }
+    return false;
+}
+
+////////////////////////////////////////////////////////////////////////
+bool SynchronizationObjectCoalescing::IsBufferWriteOperation(const llvm::Instruction* pInst)
+{
+    if (llvm::Type* pPtrType = GetWriteOperationPointerType(pInst))
+    {
+        return IsGlobalWritableResource(pPtrType);
+    }
     return false;
 }
 
 ////////////////////////////////////////////////////////////////////////
 bool SynchronizationObjectCoalescing::IsSharedMemoryReadOperation(const llvm::Instruction* pInst)
 {
-    if (llvm::isa<llvm::LoadInst>(pInst))
+    if (llvm::Type* pPtrType = GetReadOperationPointerType(pInst))
     {
-        return IsSharedMemoryResource(llvm::cast<llvm::LoadInst>(pInst)->getPointerOperandType());
+        return IsSharedMemoryResource(pPtrType);
     }
-
     return false;
 }
 
 ////////////////////////////////////////////////////////////////////////
 bool SynchronizationObjectCoalescing::IsSharedMemoryWriteOperation(const llvm::Instruction* pInst)
 {
-    if (llvm::isa<llvm::StoreInst>(pInst))
+    if (llvm::Type* pPtrType = GetWriteOperationPointerType(pInst))
     {
-        return IsSharedMemoryResource(llvm::cast<llvm::StoreInst>(pInst)->getPointerOperandType());
+        return IsSharedMemoryResource(pPtrType);
     }
-
     return false;
 }
 
@@ -2888,7 +2881,10 @@ bool SynchronizationObjectCoalescing::IsFenceOperation(const llvm::Instruction* 
 }
 
 ////////////////////////////////////////////////////////////////////////
-bool SynchronizationObjectCoalescing::IsGlobalResource(llvm::Type* pResourePointerType)
+/// Returns true for resources in the global memory (storage buffers or
+/// storage images) that are not marked as ReadOnly in the shader.
+bool SynchronizationObjectCoalescing::IsGlobalWritableResource(
+    llvm::Type* pResourePointerType)
 {
     uint as = pResourePointerType->getPointerAddressSpace();
     switch (as)
@@ -2905,6 +2901,7 @@ bool SynchronizationObjectCoalescing::IsGlobalResource(llvm::Type* pResourePoint
         {
         case IGC::UAV:
         case IGC::BINDLESS:
+        case IGC::BINDLESS_WRITEONLY:
         case IGC::STATELESS:
         case IGC::SSH_BINDLESS:
             return true;
@@ -2914,6 +2911,7 @@ bool SynchronizationObjectCoalescing::IsGlobalResource(llvm::Type* pResourePoint
         case IGC::POINTER:
         case IGC::BINDLESS_CONSTANT_BUFFER:
         case IGC::BINDLESS_TEXTURE:
+        case IGC::BINDLESS_READONLY:
         case IGC::SAMPLER:
         case IGC::BINDLESS_SAMPLER:
         case IGC::RENDER_TARGET:

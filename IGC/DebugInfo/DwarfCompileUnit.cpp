@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2017-2021 Intel Corporation
+Copyright (C) 2017-2024 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -34,6 +34,7 @@ See LICENSE.TXT for details.
 #include "llvm/MC/MCSymbol.h"
 #include "llvm/MC/MCSymbolELF.h"
 #include "llvm/MC/MachineLocation.h"
+#include <cmath>
 #include <optional>
 #include "common/LLVMWarningsPop.hpp"
 // clang-format on
@@ -49,7 +50,7 @@ See LICENSE.TXT for details.
 #include "Compiler/CISACodeGen/messageEncoding.hpp"
 
 #include "Probe/Assertion.h"
-
+#include <cmath>
 #define DEBUG_TYPE "dwarfdebug"
 
 using namespace llvm;
@@ -1241,8 +1242,9 @@ void CompileUnit::addSimdLane(IGC::DIEBlock *Block, const DbgVariable &DV,
         (isPacked || varSizeInBits > 32) ? (uint32_t)varSizeInBits : 32;
     uint32_t variablesInSingleGRF =
         (VISAMod->getGRFSizeInBits()) / bitsUsedByVar;
-    uint32_t valForSubRegLit =
-        variablesInSingleGRF > 0 ? (uint32_t)log2(variablesInSingleGRF) : 0;
+    uint32_t valForSubRegLit = variablesInSingleGRF > 0
+                                   ? (uint32_t)std::log2(variablesInSingleGRF)
+                                   : 0;
 
     // TODO: missing case lr->getGRF().subRegNum > 0
     // unsigned int subReg = lr->getGRF().subRegNum;
@@ -2178,7 +2180,10 @@ void CompileUnit::constructEnumTypeDIE(DIE &Buffer, DICompositeType *CTy) {
   DIType *DTy = resolve(CTy->getBaseType());
   if (DTy) {
     addType(&Buffer, DTy);
-    addFlag(&Buffer, dwarf::DW_AT_enum_class);
+    // Add DW_AT_enum_class when FlagEnumClass exists
+    if (CTy->getFlags() & DINode::FlagEnumClass) {
+      addFlag(&Buffer, dwarf::DW_AT_enum_class);
+    }
   }
 }
 
@@ -2252,7 +2257,7 @@ IGC::DIE *CompileUnit::constructVariableDIE(DbgVariable &DV,
 
   // Check if variable is described by a DBG_VALUE instruction.
   const Instruction *pDbgInst = DV.getDbgInst();
-  if (!pDbgInst || !DV.isLocationInlined) {
+  if (!pDbgInst || !DV.currentLocationIsInlined()) {
     DV.setDIE(VariableDie);
     LLVM_DEBUG(dbgs() << " done. No dbg.inst assotiated\n");
     return VariableDie;
@@ -2598,8 +2603,7 @@ bool CompileUnit::buildFpBasedLoc(const DbgVariable &var, IGC::DIEBlock *Block,
 }
 
 bool CompileUnit::buildSlicedLoc(
-    const DbgVariable &var, IGC::DIEBlock *Block,
-    const VISAVariableLocation &loc,
+    DbgVariable &var, IGC::DIEBlock *Block, const VISAVariableLocation &loc,
     const std::vector<DbgDecoder::LiveIntervalsVISA> *vars) {
   LLVM_DEBUG(dbgs() << "  sliced variable, pushing lane \n");
   // DW_OP_push_simd_lane
@@ -2623,7 +2627,7 @@ bool CompileUnit::buildSlicedLoc(
   unsigned int offsetNotTaken = Block->ComputeSizeOnTheFly(Asm);
 
   // Emit first register
-  if (!buildValidVar(var, Block, loc, vars, true))
+  if (!buildValidVar(var, Block, loc, vars, DbgRegisterType::FirstHalf))
     return false;
 
   // Emit second half register
@@ -2640,16 +2644,16 @@ bool CompileUnit::buildSlicedLoc(
   // register in buildValidVar(), which always processes the 1st register only.
   VISAVariableLocation second_loc(loc);
   second_loc.SetRegister(loc.GetSecondReg());
-  if (!buildValidVar(var, Block, second_loc, vars, false))
+  if (!buildValidVar(var, Block, second_loc, vars, DbgRegisterType::SecondHalf))
     return false;
 
   return true;
 }
 
 bool CompileUnit::buildValidVar(
-    const DbgVariable &var, IGC::DIEBlock *Block,
-    const VISAVariableLocation &loc,
-    const std::vector<DbgDecoder::LiveIntervalsVISA> *vars, bool firstHalf) {
+    DbgVariable &var, IGC::DIEBlock *Block, const VISAVariableLocation &loc,
+    const std::vector<DbgDecoder::LiveIntervalsVISA> *vars,
+    DbgRegisterType regType) {
   const DbgDecoder::VarInfo *VarInfo = nullptr;
   const auto *VISAMod = loc.GetVISAModule();
 
@@ -2666,87 +2670,94 @@ bool CompileUnit::buildValidVar(
       LLVM_DEBUG(dbgs() << "  warning: could not get vISA Variable info\n");
   }
 
-  if (VarInfo || (vars && vars->size() >= (firstHalf ? 1u : 2u))) {
-    const auto &lrToUse =
-        vars ? vars->at(firstHalf ? 0 : 1) : VarInfo->lrs.front();
-    LLVM_DEBUG(dbgs() << "  emitting variable location at LR: <";
-               lrToUse.print(dbgs()); dbgs() << ">\n");
-    emitLocation = true;
-    if (lrToUse.isGRF()) {
-      if (loc.IsVectorized() == false) {
-        if (loc.isRegionBasedAddress()) {
-          // VC-backend specific addressing model
-          addSimdLaneRegionBase(Block, var, loc, &lrToUse);
-        } else {
-          addSimdLaneScalar(Block, var, loc, lrToUse);
-        }
-        var.emitExpression(this, Block);
-        return false;
+  const bool isSecondHalf = regType == DbgRegisterType::SecondHalf;
+  const unsigned NumVarsExpected = isSecondHalf ? 2 : 1;
+  const unsigned LRIndex = isSecondHalf ? 1 : 0;
+  const DbgDecoder::LiveIntervalsVISA *lrToUse;
+  if (vars && vars->size() >= NumVarsExpected)
+    lrToUse = &vars->at(LRIndex);
+  else if (VarInfo)
+    lrToUse = &VarInfo->lrs.front();
+  else
+    return false;
+
+  LLVM_DEBUG(dbgs() << "  emitting variable location at LR: <";
+             lrToUse->print(dbgs()); dbgs() << ">\n");
+  var.setLocationRegisterType(regType);
+  emitLocation = true;
+  if (lrToUse->isGRF()) {
+    if (!loc.IsVectorized()) {
+      if (loc.isRegionBasedAddress()) {
+        // VC-backend specific addressing model
+        addSimdLaneRegionBase(Block, var, loc, lrToUse);
       } else {
-        for (unsigned int vectorElem = 0;
-             vectorElem < loc.GetVectorNumElements(); ++vectorElem) {
-          // Emit SIMD lane for GRF (unpacked)
-          const auto MaxUI16 = std::numeric_limits<uint16_t>::max();
-          const auto registerSizeInBits =
-              DD->GetVISAModule()->getGRFSizeInBits();
-          const auto instrSimdWidth =
-              (DD->simdWidth > 16 && registerSizeInBits == 256) ? 16
-                                                                : DD->simdWidth;
-          auto SimdOffset = instrSimdWidth * vectorElem;
-          IGC_ASSERT(DD->simdWidth <= 32 && vectorElem < MaxUI16 &&
-                     SimdOffset < MaxUI16);
-          if (loc.IsRegister())
-            addSimdLane(Block, var, loc, &lrToUse, (uint16_t)(SimdOffset),
-                        false, !firstHalf);
-        }
+        addSimdLaneScalar(Block, var, loc, *lrToUse);
       }
-    } else if (lrToUse.isSpill()) {
-      if (loc.IsVectorized() == false) {
-        addScratchLocation(Block, lrToUse.getSpillOffset().memoryOffset, 0);
-        addBE_FP(Block);
-      } else {
-        // TODO: revise these calculations
-        unsigned GrfSizeBytes = VISAMod->getGRFSizeInBytes();
-        IGC_ASSERT(GrfSizeBytes <= std::numeric_limits<uint16_t>::max());
-
-        unsigned GrfSizeInBits = GrfSizeBytes * 8;
-        IGC_ASSERT(GrfSizeInBits <= std::numeric_limits<uint16_t>::max());
-
-        unsigned varSizeInBits = var.getRegisterValueSizeInBits(DD);
-
-        unsigned varSizeInReg =
-            (loc.IsInMemory() && varSizeInBits < 32) ? 32 : varSizeInBits;
-
-        IGC_ASSERT(DD->simdWidth != 0);
-        unsigned FullSizeInBits = varSizeInReg * DD->simdWidth;
-        unsigned numOfRegs = (FullSizeInBits > GrfSizeInBits)
-                                 ? (FullSizeInBits / GrfSizeInBits)
-                                 : 1;
-        IGC_ASSERT(numOfRegs <= std::numeric_limits<uint16_t>::max());
-
-        for (unsigned int vectorElem = 0;
-             vectorElem < loc.GetVectorNumElements(); ++vectorElem) {
-          unsigned VectorOffset = vectorElem * numOfRegs * GrfSizeBytes;
-          IGC_ASSERT(VectorOffset <= static_cast<uint32_t>(
-                                         std::numeric_limits<int32_t>::max()));
-          addScratchLocation(Block, lrToUse.getSpillOffset().memoryOffset,
-                             static_cast<int32_t>(VectorOffset));
-          addBE_FP(Block);
-          addSimdLane(Block, var, loc, &lrToUse, 0, false,
-                      !firstHalf); // Emit SIMD lane for spill (unpacked)
-        }
-      }
+      var.emitExpression(this, Block);
+      return false;
     } else {
-      LLVM_DEBUG(
-          dbgs() << "  <warning> variable is neither in GRF nor spilled\n");
+      for (unsigned int vectorElem = 0; vectorElem < loc.GetVectorNumElements();
+           ++vectorElem) {
+        // Emit SIMD lane for GRF (unpacked)
+        constexpr auto MaxUI16 = std::numeric_limits<uint16_t>::max();
+        const auto registerSizeInBits = DD->GetVISAModule()->getGRFSizeInBits();
+        const auto instrSimdWidth =
+            (DD->simdWidth > 16 && registerSizeInBits == 256) ? 16
+                                                              : DD->simdWidth;
+        auto SimdOffset = instrSimdWidth * vectorElem;
+        IGC_ASSERT(DD->simdWidth <= 32 && vectorElem < MaxUI16 &&
+                   SimdOffset < MaxUI16);
+        if (loc.IsRegister())
+          addSimdLane(Block, var, loc, lrToUse, (uint16_t)(SimdOffset), false,
+                      isSecondHalf);
+      }
     }
-    var.emitExpression(this, Block);
+  } else if (lrToUse->isSpill()) {
+    if (!loc.IsVectorized()) {
+      addScratchLocation(Block, lrToUse->getSpillOffset().memoryOffset, 0);
+      addBE_FP(Block);
+    } else {
+      // TODO: revise these calculations
+      unsigned GrfSizeBytes = VISAMod->getGRFSizeInBytes();
+      IGC_ASSERT(GrfSizeBytes <= std::numeric_limits<uint16_t>::max());
+
+      unsigned GrfSizeInBits = GrfSizeBytes * 8;
+      IGC_ASSERT(GrfSizeInBits <= std::numeric_limits<uint16_t>::max());
+
+      unsigned varSizeInBits = var.getRegisterValueSizeInBits(DD);
+
+      unsigned varSizeInReg =
+          (loc.IsInMemory() && varSizeInBits < 32) ? 32 : varSizeInBits;
+
+      IGC_ASSERT(DD->simdWidth != 0);
+      unsigned FullSizeInBits = varSizeInReg * DD->simdWidth;
+      unsigned numOfRegs = (FullSizeInBits > GrfSizeInBits)
+                               ? (FullSizeInBits / GrfSizeInBits)
+                               : 1;
+      IGC_ASSERT(numOfRegs <= std::numeric_limits<uint16_t>::max());
+
+      for (unsigned int vectorElem = 0; vectorElem < loc.GetVectorNumElements();
+           ++vectorElem) {
+        unsigned VectorOffset = vectorElem * numOfRegs * GrfSizeBytes;
+        IGC_ASSERT(VectorOffset <=
+                   static_cast<uint32_t>(std::numeric_limits<int32_t>::max()));
+        addScratchLocation(Block, lrToUse->getSpillOffset().memoryOffset,
+                           static_cast<int32_t>(VectorOffset));
+        addBE_FP(Block);
+        // Emit SIMD lane for spill (unpacked)
+        addSimdLane(Block, var, loc, lrToUse, 0, false, isSecondHalf);
+      }
+    }
+  } else {
+    LLVM_DEBUG(
+        dbgs() << "  <warning> variable is neither in GRF nor spilled\n");
   }
+  var.emitExpression(this, Block);
   return true;
 }
 
 IGC::DIEBlock *CompileUnit::buildGeneral(
-    const DbgVariable &var, const VISAVariableLocation &loc,
+    DbgVariable &var, const VISAVariableLocation &loc,
     const std::vector<DbgDecoder::LiveIntervalsVISA> *vars,
     IGC::DIE *VariableDie) {
   IGC::DIEBlock *Block = new (DIEValueAllocator) IGC::DIEBlock();
@@ -2783,7 +2794,7 @@ IGC::DIEBlock *CompileUnit::buildGeneral(
     if (loc.HasLocationSecondReg()) {
       buildSlicedLoc(var, Block, loc, vars);
     } else {
-      buildValidVar(var, Block, loc, vars, true);
+      buildValidVar(var, Block, loc, vars, DbgRegisterType::Regular);
     }
   }
 

@@ -108,6 +108,7 @@ public:
 enum class forbiddenKind {
   FBD_ADDR = 0,
   FBD_FLAG = 1,
+  FBD_SCALAR,
   FBD_RESERVEDGRF,
   FBD_EOT,
   FBD_LASTGRF,
@@ -325,6 +326,9 @@ typedef struct Interval {
   Interval() = default;
   Interval(const Interval &) = default;
   Interval &operator=(const Interval &) = default;
+  bool operator!=(const Interval &Other) {
+    return start != Other.start || end != Other.end;
+  }
   Interval(G4_INST *s, G4_INST *e) {
     start = s;
     end = e;
@@ -544,6 +548,10 @@ private:
   void handlePred(FuncInfo* funcInfo, G4_INST *inst);
   void handleNonReducibleExtension(FuncInfo *funcInfo);
   void handleLoopExtension(FuncInfo *funcInfo);
+  std::unordered_set<G4_BB *> getAllJIPTargetBBs(FuncInfo *funcInfo);
+  std::vector<std::pair<G4_BB *, G4_BB *>>
+  getNonLoopBackEdges(FuncInfo *funcInfo);
+  void handleNonLoopBackEdges(FuncInfo *funcInfo);
   void extendVarLiveness(FuncInfo *funcInfo, G4_BB *bb, G4_INST *inst);
   unsigned getEnd(const G4_Declare *dcl) const;
   bool isNoMask(const G4_Declare *dcl, unsigned size) const;
@@ -1179,7 +1187,8 @@ public:
   void addFlagSaveRestoreCode();
   void getSaveRestoreRegister();
   void getCallerSaveRegisters();
-  void dumpRegisterPressure();
+  void dumpRegisterPressure(std::ostream&);
+  void dumpRPEToFile();
   GlobalRA &getGRA() { return gra; }
   G4_SrcRegRegion *getScratchSurface() const;
   unsigned int getNumVars() const { return numVar; }
@@ -1299,6 +1308,8 @@ public:
         getForbiddenVectorSize(G4_ADDRESS));
     forbiddenVec[(size_t)forbiddenKind::FBD_FLAG].resize(
         getForbiddenVectorSize(G4_FLAG));
+    forbiddenVec[(size_t)forbiddenKind::FBD_SCALAR].resize(
+        getForbiddenVectorSize(G4_SCALAR));
   };
   ~ForbiddenRegs(){};
 
@@ -1394,6 +1405,7 @@ private:
   static const RAVarInfo defaultValues;
   std::vector<RAVarInfo> vars;
   std::vector<G4_Declare *> UndeclaredVars;
+  std::vector<G4_Declare *> UndefinedCmpVars;
 
   // fake declares for each GRF reg, used by HRA
   // note only GRFs that are used by LRA get a declare
@@ -1527,7 +1539,7 @@ public:
   InterferenceMatrixStorage intfStorage;
   IncrementalRA incRA;
 
-
+  bool didGRFIncrease = false;
   bool avoidBundleConflict = false;
 
   unsigned getSubRetLoc(const G4_BB *bb) {
@@ -1606,6 +1618,7 @@ public:
   void addSpillCodeInBB(G4_BB *bb) { BBsWithSpillCode.insert(bb); }
 
   void addUndefinedDcl(G4_Declare *dcl) { UndeclaredVars.push_back(dcl); }
+  void addUndefinedCmpDcl(G4_Declare *dcl) { UndefinedCmpVars.push_back(dcl); }
 
   bool isUndefinedDcl(const G4_Declare *dcl) const {
     return std::find(UndeclaredVars.begin(), UndeclaredVars.end(), dcl) !=
@@ -1678,6 +1691,7 @@ public:
       setBBId(dcl, UINT_MAX);
       resetLocalLR(dcl);
     }
+    UndefinedCmpVars.clear();
   }
 
   void clearLocalLiveRanges() {
@@ -1971,6 +1985,7 @@ public:
   void reportSpillInfo(const LivenessAnalysis &liveness,
                        const GraphColor &coloring) const;
   static uint32_t getRefCount(int loopNestLevel);
+  bool canIncreaseGRF(unsigned spillSize, bool infCostSpilled);
   void updateSubRegAlignment(G4_SubReg_Align subAlign);
   bool isChannelSliced();
   // Used by LRA/GRA/hybrid RA
@@ -1997,6 +2012,8 @@ public:
                       std::unordered_set<G4_INST *> &group);
   void addrRegAlloc();
   void flagRegAlloc();
+  void scalarRegAlloc();
+  void selectScalarCandidates();
   void fastRADecision();
   bool tryHybridRA();
   bool hybridRA(LocalRA &lra);
@@ -2035,6 +2052,8 @@ public:
   void addCallerSavePseudoCode();
   void addCalleeSavePseudoCode();
   void addStoreRestoreToReturn();
+  void storeCEInProlog();
+  void setUndefinedVarCmp();
   void markGraphBlockLocalVars();
   void verifyRA(LivenessAnalysis &liveAnalysis);
   void verifySpillFill();
@@ -2157,6 +2176,7 @@ private:
   void writeVerboseStatsNumVars(LivenessAnalysis &liveAnalysis,
                                 FINALIZER_INFO *jitInfo);
   void writeVerboseRPEStats(RPE &rpe);
+  bool VRTIncreasedGRF(GraphColor &coloring);
   void splitOnSpill(bool fastCompile, GraphColor &coloring,
                     LivenessAnalysis &livenessAnalysis);
   bool convertToFailSafe(bool reserveSpillReg, GraphColor &coloring,

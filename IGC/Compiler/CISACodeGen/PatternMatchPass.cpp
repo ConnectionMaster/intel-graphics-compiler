@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2017-2022 Intel Corporation
+Copyright (C) 2017-2024 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -1055,6 +1055,11 @@ namespace IGC
                 // If a phi is used in a subspan we cannot propagate the subspan use and need to use VMask
                 m_NeedVMask = true;
 
+                if (isSampleSource && isa<PHINode>(v))
+                {
+                    m_sampleSource.insert(v);
+                }
+
                 if (Instruction* I = dyn_cast<Instruction>(v))
                 {
                     // this is WA for situation where application has early return (not discard) from shader
@@ -1301,6 +1306,8 @@ namespace IGC
             case GenISAIntrinsic::GenISA_icmpxchgatomictyped:
             case GenISAIntrinsic::GenISA_typedread:
             case GenISAIntrinsic::GenISA_typedwrite:
+            case GenISAIntrinsic::GenISA_typedreadMS:
+            case GenISAIntrinsic::GenISA_typedwriteMS:
             case GenISAIntrinsic::GenISA_floatatomictyped:
             case GenISAIntrinsic::GenISA_fcmpxchgatomictyped:
             case GenISAIntrinsic::GenISA_ldlptr:
@@ -1367,11 +1374,13 @@ namespace IGC
                 break;
             case GenISAIntrinsic::GenISA_WaveBallot:
             case GenISAIntrinsic::GenISA_WaveInverseBallot:
+            case GenISAIntrinsic::GenISA_WaveClusteredBallot:
             case GenISAIntrinsic::GenISA_WaveAll:
             case GenISAIntrinsic::GenISA_WaveClustered:
             case GenISAIntrinsic::GenISA_WaveInterleave:
             case GenISAIntrinsic::GenISA_WaveClusteredInterleave:
             case GenISAIntrinsic::GenISA_WavePrefix:
+            case GenISAIntrinsic::GenISA_WaveClusteredPrefix:
                 match = MatchWaveInstruction(*GII);
                 break;
             case GenISAIntrinsic::GenISA_simdBlockRead:
@@ -1560,7 +1569,60 @@ namespace IGC
 
     void CodeGenPatternMatch::visitPHINode(PHINode& I)
     {
-        // nothing to do
+        struct PHIPattern : Pattern
+        {
+            //bool isInDivergentLoop = false;
+            llvm::PHINode* phi = nullptr;
+            virtual void Emit(EmitPass* pass, const DstModifier& modifier)
+            {
+                IGC_ASSERT(modifier.sat == false);
+                IGC_ASSERT(modifier.flag == nullptr);
+                pass->EmitInitializePHI(phi);
+            }
+        };
+
+        if (Loop* L = LI->getLoopFor(I.getParent()))
+        {
+            SmallVector<BasicBlock*, 4> exitingBlocks;
+            SmallPtrSet<Instruction*, 8> visitedInstructions;
+            L->getExitingBlocks(exitingBlocks);
+            for (auto exitingBlock : exitingBlocks)
+            {
+                if (!isUniform(exitingBlock->getTerminator()))
+                {
+                    std::vector<Instruction*> worklist;
+                    worklist.push_back(&I);
+                    while (!worklist.empty())
+                    {
+                        Instruction* currentInst = worklist.back();
+                        worklist.pop_back();
+                        for (auto operand : currentInst->operand_values())
+                        {
+                            if (auto nextInst = dyn_cast<Instruction>(operand))
+                            {
+                                if (nextInst == &I)
+                                {
+                                    return;
+                                }
+                                if(L->contains(nextInst->getParent()) && !visitedInstructions.contains(nextInst))
+                                {
+                                    worklist.push_back(nextInst);
+                                    visitedInstructions.insert(nextInst);
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        if (IsSourceOfSample(&I))
+        {
+            PHIPattern* pattern = new (m_allocator) PHIPattern();
+            pattern->phi = &I;
+            //pattern->isInDivergentLoop = isInDivergentLoop;
+            AddPattern(pattern);
+        }
     }
 
     void CodeGenPatternMatch::visitBitCastInst(BitCastInst& I)
@@ -2724,7 +2786,7 @@ namespace IGC
             // HW does an early bounds check on varOffset for A32 messages. Thus, if varOffset
             // is negative, then the bounds check fails early even though the immediate offset
             // would bring the final calculation to a positive number.
-            if (!isA64AddressingModel && !valueIsPositive(varOffset, m_DL) && IGC_GET_FLAG_VALUE(LscImmOffsMatch) < 3)
+            if (!isA64AddressingModel && !UsedWithoutImmInMemInst(varOffset) && !valueIsPositive(varOffset, m_DL) && IGC_GET_FLAG_VALUE(LscImmOffsMatch) < 3)
                 return false;
 
             MarkAsSource(varOffset, IsSourceOfSample(&I));
@@ -3602,6 +3664,11 @@ namespace IGC
                 // without improve code quality this may be refined in the future
                 if (inst->hasOneUse() && SupportsSaturate(inst))
                 {
+                    bool isSourceOfSample = IsSourceOfSample(&I);
+                    if (isSourceOfSample)
+                    {
+                        m_sampleSource.insert(inst);
+                    }
                     auto *pattern = Match(*inst);
                     IGC_ASSERT_MESSAGE(pattern, "Failed to match pattern");
                     // Even though the original `inst` may support saturate,
@@ -3611,6 +3678,10 @@ namespace IGC
                     {
                         satPattern->pattern = pattern;
                         match = true;
+                    }
+                    else if (isSourceOfSample)
+                    {
+                        m_sampleSource.erase(inst);
                     }
                 }
             }
@@ -3666,19 +3737,6 @@ namespace IGC
             }
         };
 
-        // dp4a with modifiers
-        struct Dp4aSatPattern : Pattern
-        {
-            GenIntrinsicInst* inst;
-            bool isAccSigned;
-            virtual void Emit(EmitPass* pass, const DstModifier& modifier)
-            {
-                DstModifier mod = modifier;
-                mod.sat = true;
-                pass->emitDP4A(inst, nullptr, mod, isAccSigned);
-            }
-        };
-
 
         bool match = false;
         llvm::Value* source = nullptr;
@@ -3723,26 +3781,6 @@ namespace IGC
                     satPattern->isSigned = !isUnsigned;
                     satPattern->src = GetSource(truncInst->getOperand(0), !isUnsigned, false, IsSourceOfSample(&I));
                     AddPattern(satPattern);
-                }
-                else if (llvm::GenIntrinsicInst * genIsaInst = llvm::dyn_cast<llvm::GenIntrinsicInst>(source);
-                    genIsaInst &&
-                    (genIsaInst->getIntrinsicID() == llvm::GenISAIntrinsic::ID::GenISA_dp4a_ss ||
-                    genIsaInst->getIntrinsicID() == llvm::GenISAIntrinsic::ID::GenISA_dp4a_su ||
-                    genIsaInst->getIntrinsicID() == llvm::GenISAIntrinsic::ID::GenISA_dp4a_uu ||
-                    genIsaInst->getIntrinsicID() == llvm::GenISAIntrinsic::ID::GenISA_dp4a_us))
-                {
-                    match = true;
-
-                    uint numSources = GetNbSources(*sourceInst);
-                    for (uint i = 0; i < numSources; i++)
-                    {
-                        MarkAsSource(sourceInst->getOperand(i), IsSourceOfSample(&I));
-                    }
-
-                    Dp4aSatPattern* dp4aSatPattern = new (m_allocator) Dp4aSatPattern();
-                    dp4aSatPattern->inst = genIsaInst;
-                    dp4aSatPattern->isAccSigned = !isUnsigned;
-                    AddPattern(dp4aSatPattern);
                 }
                 else
                 {
@@ -3887,6 +3925,70 @@ namespace IGC
         return found;
     }
 
+    // Helper function for MatchGenericPointersCmp, not to be used anywhere else.
+    // It searches recursively for its arg origin until it tracks it down to
+    // ExtractValueInst (where author assumed that there's no need to search further)
+    // or reaches the depth limit (the default value of 3 should be deep enough).
+    // The tag is contained in 3 highest bits of the pointer, so we're interested
+    // only in the half containing high bits, hence the HIGH_ADDR_INDEX check.
+    // The function returns pair where first tells whether any emulated 64bit pointer
+    // was found, second tells whether any of the emulated pointers found needs its tag
+    // cleared.
+    // The following example is to show why we're looking for any emu ptr, without
+    // requiring all of them to be that:
+    // Let's say that someone hardcoded a 64bit generic ptr as an unsigned int value
+    // and wants to assign it to an operand based on a condition, to then compare it
+    // with another operand.
+    //
+    //      unsigned generic_ptr_val = 0xFF00FFFFFFDF0000
+    //      ptr = min(&some_val, generic_ptr_val)
+    //      if (ptr < other_generic_ptr)
+    //      {
+    //          ...
+    //      }
+    //
+    // In such case we still need to treat it as a regular generic ptr and clear the tag.
+    static std::pair<bool, bool> tracksDownToEmu(const Value* op, const unsigned depth=3)
+    {
+        if (depth == 0)
+        {
+            return std::make_pair(false, false);
+        }
+
+        constexpr unsigned HIGH_ADDR_INDEX = 1;
+        static auto hasGenericPtrTy = [](const Value* V) {
+            const Type* Ty = V->getType();
+            return isa<PointerType>(Ty) && Ty->getPointerAddressSpace() == ADDRESS_SPACE_GENERIC;
+        };
+
+        if (const auto* e = dyn_cast<ExtractValueInst>(op))
+        {
+            if (e->getNumIndices() != 1 || e->getIndices()[0] != HIGH_ADDR_INDEX)
+            {
+                return std::make_pair(false, false);
+            }
+            if (const auto* GII = dyn_cast<GenIntrinsicInst>(e->getAggregateOperand()))
+            {
+                if (GII->getIntrinsicID() == GenISAIntrinsic::GenISA_ptr_to_pair)
+                {
+                    const Value* ptr = GII->getOperand(0);
+                    if (hasGenericPtrTy(ptr))
+                    {
+                        return std::make_pair(true, !isa<ConstantPointerNull>(ptr));
+                    }
+                }
+            }
+        }
+        else if (const auto* selectInst = dyn_cast<SelectInst>(op))
+        {
+            auto [op1EmuFound, op1NeedsTagClearing] = tracksDownToEmu(selectInst->getOperand(1), depth - 1);
+            auto [op2EmuFound, op2NeedsTagClearing] = tracksDownToEmu(selectInst->getOperand(2), depth - 1);
+            return std::make_pair(op1EmuFound | op2EmuFound,
+                                  op1NeedsTagClearing | op2NeedsTagClearing);
+        }
+        return std::make_pair(false, false);
+    }
+
     // When a NULL pointer is directly assigned to a generic pointer, then
     // it doesn't have a pointer tag, so comparing it with NULL pointers that
     // were firstly assigned to a named addrspace and then casted to a
@@ -3948,27 +4050,11 @@ namespace IGC
             for (uint8_t i = 0; i < 2; ++i)
             {
                 Value* src = I.getOperand(i);
-                auto e = dyn_cast<ExtractValueInst>(src);
-
-                if (!e) continue;
-                if (e->getNumIndices() != 1) continue;
-
-                unsigned index = e->getIndices()[0];
-                static const unsigned HIGH_ADDR_INDEX = 1;
-
-                if (index != HIGH_ADDR_INDEX) continue;
-
-                if (GenIntrinsicInst* GII = dyn_cast<GenIntrinsicInst>(e->getAggregateOperand()))
+                auto [emuFound, needsTagClearing] = tracksDownToEmu(src);
+                if (emuFound)
                 {
-                    if (GII->getIntrinsicID() == GenISAIntrinsic::GenISA_ptr_to_pair)
-                    {
-                        Value* ptr = GII->getOperand(0);
-                        if (hasGenericPtrTy(ptr))
-                        {
-                            clearTagMask |= (!isa<ConstantPointerNull>(ptr) << i);
-                            found = true;
-                        }
-                    }
+                    found = true;
+                    clearTagMask |= (needsTagClearing << i);
                 }
             }
         }
@@ -5178,6 +5264,7 @@ namespace IGC
         switch (I.getIntrinsicID())
         {
         case GenISAIntrinsic::GenISA_WaveAll:
+        case GenISAIntrinsic::GenISA_WaveClusteredBallot:
             helperLaneIndex = 2;
             break;
         case GenISAIntrinsic::GenISA_WaveBallot:
@@ -5186,6 +5273,7 @@ namespace IGC
             break;
         case GenISAIntrinsic::GenISA_WaveInterleave:
         case GenISAIntrinsic::GenISA_WaveClustered:
+        case GenISAIntrinsic::GenISA_WaveClusteredPrefix:
             helperLaneIndex = 3;
             break;
         case GenISAIntrinsic::GenISA_WavePrefix:
@@ -5211,7 +5299,7 @@ namespace IGC
             SSource source;
             virtual void Emit(EmitPass* pass, const DstModifier& modifier)
             {
-                const bool isSimd32Dispatch = (pass->m_currShader->m_dispatchSize == SIMDMode::SIMD32);
+                const bool isSimd32Dispatch = (pass->m_currShader->m_State.m_dispatchSize == SIMDMode::SIMD32);
                 if (isSimd32Dispatch && pass->m_currShader->m_numberInstance == 2)
                 {
                     pass->emitCrossInstanceMov(source, modifier);

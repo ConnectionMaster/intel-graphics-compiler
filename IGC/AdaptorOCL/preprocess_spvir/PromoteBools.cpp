@@ -13,7 +13,6 @@ SPDX-License-Identifier: MIT
 #include "llvmWrapper/IR/Instructions.h"
 #include "llvmWrapper/IR/Type.h"
 #include "llvmWrapper/IR/Function.h"
-#include "llvmWrapper/IR/Attributes.h"
 #include "llvmWrapper/Support/Alignment.h"
 #include "llvmWrapper/Transforms/Utils/Cloning.h"
 #include <llvm/IR/Module.h>
@@ -531,13 +530,14 @@ Value* PromoteBools::getOrCreatePromotedValue(Value* value)
     return newValue;
 }
 
-void PromoteBools::setPromotedAttributes(Function* newFunction, AttributeList& attributeList)
+template<typename T>
+void PromoteBools::setPromotedAttributes(T* newCallOrFunc, const AttributeList& attributeList)
 {
-    auto getPromoted = [this, &newFunction](llvm::Attribute attr)
+    auto getPromoted = [this, &newCallOrFunc](llvm::Attribute attr)
         {
             if (attr.isTypeAttribute())
             {
-                return attr.getWithNewType(newFunction->getContext(),
+                return attr.getWithNewType(newCallOrFunc->getContext(),
                     getOrCreatePromotedType(attr.getValueAsType()));
             }
             else
@@ -547,35 +547,28 @@ void PromoteBools::setPromotedAttributes(Function* newFunction, AttributeList& a
         };
 
     // set function attributes
-    AttrBuilder attrBuilder(newFunction->getContext());
-    for (const auto& attr : IGCLLVM::getFnAttrs(attributeList))
+    for (const auto& attr : attributeList.getFnAttrs())
     {
-        attrBuilder.addAttribute(getPromoted(attr));
+        newCallOrFunc->addFnAttr(getPromoted(attr));
     }
-    IGCLLVM::addFnAttrs(newFunction, attrBuilder);
 
-    // set return attributes
-    attrBuilder.clear();
-    for (const auto &attr : IGCLLVM::getRetAttrs(attributeList))
+    for (const auto& attr : attributeList.getRetAttrs())
     {
-        attrBuilder.addAttribute(getPromoted(attr));
+        newCallOrFunc->addRetAttr(getPromoted(attr));
     }
-    IGCLLVM::addRetAttrs(newFunction, attrBuilder);
 
     // set params' attributes
-    for (size_t i = 0; i < newFunction->arg_size(); i++)
+    for (size_t i = 0; i < newCallOrFunc->arg_size(); i++)
     {
         if (!attributeList.hasParamAttrs(i))
         {
             continue;
         }
 
-        attrBuilder.clear();
-        for (const auto& attr : IGCLLVM::getParamAttrs(attributeList, i))
+        for (const auto& attr : attributeList.getParamAttrs(i))
         {
-            attrBuilder.addAttribute(getPromoted(attr));
+            newCallOrFunc->addParamAttr(i, getPromoted(attr));
         }
-        newFunction->addParamAttrs(i, attrBuilder);
     }
 }
 
@@ -590,7 +583,8 @@ Function* PromoteBools::promoteFunction(Function* function)
     }
 
 #if !defined(WDDM_ANDROID_IGC)
-    if (BiFManager::BiFManagerHandler::IsBiF(function))
+    if (BiFManager::BiFManagerHandler::IsBiF(function)
+        || function->getName().startswith("__builtin_IB_"))
     {
         return function;
     }
@@ -895,7 +889,7 @@ CallInst* PromoteBools::promoteIndirectCallOrInlineAsm(CallInst* call)
         call
     );
     newCall->setCallingConv(call->getCallingConv());
-    newCall->setAttributes(call->getAttributes());
+    setPromotedAttributes(newCall, call->getAttributes());
     newCall->setDebugLoc(call->getDebugLoc());
     return newCall;
 }
@@ -968,7 +962,7 @@ CallInst* PromoteBools::promoteCall(CallInst* call)
         call
     );
     newCall->setCallingConv(call->getCallingConv());
-    newCall->setAttributes(call->getAttributes());
+    setPromotedAttributes(newCall, call->getAttributes());
     newCall->setDebugLoc(call->getDebugLoc());
     return newCall;
 }

@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2019-2024 Intel Corporation
+Copyright (C) 2019-2025 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -918,10 +918,11 @@ static bool isExtOperandBaled(Use &U, const GenXBaling *Baling) {
 
 // Args:
 //    HasBarrier - whether kernel has barrier or sbarrier
-void addKernelAttrsFromMetadata(VISAKernel &Kernel,
-                                const vc::KernelMetadata &KM,
-                                const GenXSubtarget *Subtarget,
-                                bool HasBarrier) {
+static void addKernelAttrsFromMetadata(VISAKernel &Kernel,
+                                       const vc::KernelMetadata &KM,
+                                       const GenXSubtarget *Subtarget,
+                                       const GenXBackendConfig *BC,
+                                       bool HasBarrier) {
   auto &Ctx = KM.getFunction()->getContext();
   unsigned SLMSizeInKb = divideCeil(KM.getSLMSize(), 1024);
   if (SLMSizeInKb > Subtarget->getMaxSlmSize())
@@ -947,6 +948,21 @@ void addKernelAttrsFromMetadata(VISAKernel &Kernel,
         static_cast<uint8_t>(KM.getAlignedBarrierCnt(HasBarrier));
     Kernel.AddKernelAttribute("NBarrierCnt", sizeof(BarrierCnt), &BarrierCnt);
   }
+
+  // Default number of registers.
+  unsigned NumGRF = 128;
+  // Set by compile option.
+  if (BC->isAutoLargeGRFMode())
+    NumGRF = 0;
+  if (BC->getGRFSize())
+    NumGRF = BC->getGRFSize();
+  // Set by kernel metadata.
+  if (KM.getGRFSize()) {
+    unsigned NumGRFPerKernel = *KM.getGRFSize();
+    if (NumGRFPerKernel == 0 || Subtarget->isValidGRFSize(NumGRFPerKernel))
+      NumGRF = NumGRFPerKernel;
+  }
+  Kernel.AddKernelAttribute("NumGRF", sizeof(NumGRF), &NumGRF);
 }
 
 // Legalize name for using as filename or in visa asm
@@ -1005,7 +1021,8 @@ void GenXKernelBuilder::runOnKernel() {
   IGC_ASSERT_MESSAGE(Kernel, "Kernel initialization failed!");
   LLVM_DEBUG(dbgs() << "=== PROCESS KERNEL(" << KernelName << ") ===\n");
 
-  addKernelAttrsFromMetadata(*Kernel, TheKernelMetadata, Subtarget, HasBarrier);
+  addKernelAttrsFromMetadata(*Kernel, TheKernelMetadata, Subtarget,
+                             BackendConfig, HasBarrier);
 
   // Set CM target for all functions produced by VC.
   // See visa spec for CMTarget value (section 4, Kernel).
@@ -2208,7 +2225,7 @@ std::string GenXKernelBuilder::createInlineAsmSourceOperand(
       return Kernel->getVectorOperandName(ImmOp, false);
     } else {
       ConstantInt *CI = cast<ConstantInt>(C);
-      return llvm::to_string(CI->getSExtValue());
+      return std::to_string(CI->getSExtValue());
     }
   }
 
@@ -5342,7 +5359,7 @@ void GenXKernelBuilder::buildInlineAsm(CallInst *CI) {
   // Scan asm string in reverse direction to match larger numbers first
   for (int ArgNo = ConstraintsInfo.size() - 1; ArgNo >= 0; ArgNo--) {
     // Regexp to match number of operand
-    Regex R("\\$+" + llvm::to_string(ArgNo));
+    Regex R("\\$+" + std::to_string(ArgNo));
     if (!R.match(AsmStr))
       continue;
     // Operand that must be substituded into inline assembly string
@@ -5666,7 +5683,10 @@ static void dumpGlobalAnnotations(Module &M) {
     auto *Struct = dyn_cast<ConstantStruct>(Op.get());
     if (!Struct)
       continue;
-    auto *Func = dyn_cast<Function>(Struct->getOperand(0)->getOperand(0));
+    Value *FuncPtr = Struct->getOperand(0);
+    if (auto *Bitcast = dyn_cast<BitCastOperator>(FuncPtr))
+      FuncPtr = Bitcast->getOperand(0);
+    auto *Func = dyn_cast<Function>(FuncPtr);
     if (!Func)
       continue;
     auto FuncName = Func->getName();
@@ -5782,8 +5802,18 @@ collectFinalizerArgs(StringSaver &Saver, const GenXSubtarget &ST,
 
   const WA_TABLE *WATable = BC.getWATable();
   // enable preemption if subtarget supports it
-  if (ST.hasPreemption())
-    addArgument("-enablePreemption");
+  if (ST.hasPreemption()) {
+    if (ST.getVisaPlatform() >= TARGET_PLATFORM::Xe2)
+      addArgument("-enablePreemptionR0Only");
+    else
+      addArgument("-enablePreemption");
+  }
+
+  // enable Send WAR WA for PVC
+  if ((ST.getTargetId() == GenXSubtarget::XeHPC) ||
+      (ST.getTargetId() == GenXSubtarget::XeHPCVG)) {
+    addArgument("-PVCSendWARWA");
+  }
 
   if (ST.hasHalfSIMDLSC())
     addArgument("-enableHalfLSC");
@@ -5813,13 +5843,6 @@ collectFinalizerArgs(StringSaver &Saver, const GenXSubtarget &ST,
   if (ST.needsWANoMaskFusedEU() && !DisableNoMaskWA)
     addArgument("-noMaskWA");
 
-  unsigned GRFSize = BC.getGRFSize();
-  if (GRFSize > 0) {
-    addArgument("-TotalGRFNum");
-    addArgument(to_string(GRFSize));
-  } else if (BC.isAutoLargeGRFMode())
-    addArgument("-autoGRFSelection");
-
   if (ST.hasFusedEU()) {
     addArgument("-fusedCallWA");
     addArgument("1");
@@ -5837,8 +5860,8 @@ collectFinalizerArgs(StringSaver &Saver, const GenXSubtarget &ST,
     uint32_t HashHi = Hash >> 32;
 
     addArgument("-hashmovs");
-    addArgument(to_string(HashHi));
-    addArgument(to_string(HashLo));
+    addArgument(std::to_string(HashHi));
+    addArgument(std::to_string(HashLo));
 
     if (BC.isHashMovsAtPrologueEnabled())
       addArgument("-hashatprologue");

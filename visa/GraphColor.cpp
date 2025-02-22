@@ -1354,6 +1354,8 @@ void LiveRange::initializeForbidden() {
     setForbidden(forbiddenKind::FBD_ADDR);
   } else if (LivenessAnalysis::livenessClass(rf, G4_FLAG)) {
     setForbidden(forbiddenKind::FBD_FLAG);
+  } else if (LivenessAnalysis::livenessClass(rf, G4_SCALAR)) {
+    setForbidden(forbiddenKind::FBD_SCALAR);
   } else {
     setForbidden(forbiddenKind::FBD_RESERVEDGRF);
   };
@@ -2139,6 +2141,29 @@ void Interference::buildInterferenceForFcall(
   }
 }
 
+bool GlobalRA::canIncreaseGRF(unsigned spillSize, bool infCostSpilled) {
+  // If we estimate insufficient # GRFs early on, we may end up
+  // spilling an infinite spill cost variable. As last ditch effort,
+  // we bump up # GRFs and retry compilation. If we estimate GRF
+  // config well, then we should never see infCostSpilled == true.
+
+  // Conditions to increase #GRFs assuming first RA iteration did not succeed:
+  //  - Variable with inf spill cost, or
+  //  - #GRFs selected and next larger one has same number of threads, or
+  //  - Spill size is above threshold
+  if ((infCostSpilled || kernel.grfMode.hasLargerGRFSameThreads() ||
+       spillSize >= kernel.getuInt32Option(vISA_SpillAllowed)) &&
+      !didGRFIncrease) {
+    if (kernel.updateKernelToLargerGRF()) {
+      // GRF successfully increased
+      RA_TRACE(std::cout << "\t--new GRF size " << kernel.getNumRegTotal()
+                         << ". Re-run RA\n ");
+      didGRFIncrease = true;
+      return true;
+    }
+  }
+  return false;
+}
 
 void Interference::buildInterferenceForDst(
     G4_BB *bb, SparseBitVector &live, G4_INST *inst,
@@ -2987,6 +3012,15 @@ bool Augmentation::updateDstMaskForGatherRaw(G4_INST *inst,
   SFID funcID = msgDesc->getFuncId();
 
   switch (funcID) {
+  case SFID::RTHW:
+    // Mark RT send dst to be NonDefault, even when it doesn't have WriteEnable
+    if (kernel.getPlatform() >= Xe2) {
+      for (auto &elem : mask)
+        elem = NOMASK_BYTE;
+      return true;
+    }
+    break;
+
   case SFID::DP_DC1:
     switch (msgDesc->getHdcMessageType()) {
     case DC1_A64_SCATTERED_READ: // a64 scattered read: svm_gather
@@ -4250,6 +4284,163 @@ void Augmentation::handleNonReducibleExtension(FuncInfo *funcInfo) {
   }
 }
 
+std::unordered_set<G4_BB *>
+Augmentation::getAllJIPTargetBBs(FuncInfo *funcInfo) {
+  // Any BB that has join as first non-label instruction is a JIP target.
+  std::unordered_set<G4_BB *> JIPTargetBBs;
+
+  for (auto *BB : funcInfo->getBBList()) {
+    if (BB->empty())
+      continue;
+    auto InstIt = BB->begin();
+    if ((*InstIt)->isLabel())
+      ++InstIt;
+    if (InstIt != BB->end() && (*InstIt)->opcode() == G4_join)
+      JIPTargetBBs.insert(BB);
+  }
+
+  return JIPTargetBBs;
+}
+
+std::vector<std::pair<G4_BB *, G4_BB *>>
+Augmentation::getNonLoopBackEdges(FuncInfo *funcInfo) {
+  auto &LoopBackEdges = kernel.fg.getAllNaturalLoops();
+  std::vector<std::pair<G4_BB *, G4_BB *>> NonLoopBackEdges;
+
+  for (auto *BB : funcInfo->getBBList()) {
+    if (BB->empty())
+      continue;
+    if (BB->back()->opcode() != G4_jmpi && BB->back()->opcode() != G4_goto)
+      continue;
+    auto LastInstLexId = BB->back()->getLexicalId();
+    for (auto *Succ : BB->Succs) {
+      vISA_ASSERT(!Succ->empty(), "expecting non-empty succ BB");
+      auto SuccInstLexId = Succ->front()->getLexicalId();
+      // Forward edge
+      if (SuccInstLexId > LastInstLexId)
+        continue;
+      // Check if this is a loop edge
+      auto Edge = std::pair(BB, Succ);
+      if (LoopBackEdges.find(Edge) == LoopBackEdges.end())
+        NonLoopBackEdges.push_back(Edge);
+    }
+  }
+
+  return NonLoopBackEdges;
+}
+
+void Augmentation::handleNonLoopBackEdges(FuncInfo *funcInfo) {
+
+  // up:
+  // (W) P5 =
+  // ...
+  // goto Later
+  // ...
+  // <other BBs>
+  // join down
+  //
+  // BB1:
+  // P21 = ...
+  // (P38) goto down
+  //
+  // otherBB:
+  // ...
+  // (W) jmpi (M1, 1) up
+  //
+  // down:
+  // = P21
+  //
+  // Later:
+  //
+  // In above snippet, following path may be taken:
+  // BB1, otherBB, up, down, Later
+  //
+  // P21 is defined in BB1. If P5 uses same register
+  // then it can clobber P21 before it gets used in
+  // down. So P5 and P21 intervals must overlap.
+  //
+  // If we've a non-loop backedge in an interval and if
+  // there's an incoming JIP edge within that interval
+  // then it means we should extend the interval up to
+  // the backedge destination. In above snippet, it means
+  // extending P21 to "up" so that it overlaps with P5.
+
+  auto AllJIPTargetBBs = getAllJIPTargetBBs(funcInfo);
+
+  // Return true if there's any JIP incoming edge within interval
+  auto hasIncomingJIPEdge = [&AllJIPTargetBBs](const vISA::Interval &Interval) {
+    for (auto *JIPTargetBB : AllJIPTargetBBs) {
+      vISA::Interval Temp(JIPTargetBB->front(), JIPTargetBB->front());
+      if (Interval.intervalsOverlap(Temp))
+        return true;
+    }
+    return false;
+  };
+
+  auto NonLoopBackEdges = getNonLoopBackEdges(funcInfo);
+  if (NonLoopBackEdges.empty()) {
+    VISA_DEBUG_VERBOSE({ std::cout << "No non-loop backedges found\n"; });
+    return;
+  }
+
+  auto getNonLoopBackEdgesInInterval =
+      [&NonLoopBackEdges](const vISA::Interval &Interval) {
+        std::vector<std::pair<G4_BB *, G4_BB *>> NonLoopBackEdgesInInterval;
+
+        for (auto &NonLoopBackEdge : NonLoopBackEdges) {
+          vISA::Interval Temp(NonLoopBackEdge.first->back(),
+                              NonLoopBackEdge.first->back());
+          if (Interval.intervalsOverlap(Temp))
+            NonLoopBackEdgesInInterval.push_back(NonLoopBackEdge);
+        }
+
+        return NonLoopBackEdgesInInterval;
+      };
+
+  for (G4_Declare *Dcl : kernel.Declares) {
+    auto &All = gra.getAllIntervals(Dcl);
+    // We shouldn't need to consider special variables like args, retval.
+    // Because such variables are not defined/used in same function.
+    if (All.size() != 1)
+      continue;
+    auto &Interval = All[0];
+    bool Change = false;
+    // Handle transitive backwards branches
+    // TODO: Handle forward branch from interval that later jump backwards
+    // and cause JIP edge to be taken in the middle of the interval.
+    do {
+      Change = false;
+      auto Start = Interval.start;
+      if (hasSubroutines && instToFunc[Start->getLexicalId()] != funcInfo)
+        continue;
+      if (!hasIncomingJIPEdge(Interval))
+        continue;
+      std::vector<std::pair<G4_BB *, G4_BB *>> NonLoopBackEdges =
+          getNonLoopBackEdgesInInterval(Interval);
+
+      for (auto &NonLoopBackEdge : NonLoopBackEdges) {
+        if (NonLoopBackEdge.second) {
+          vISA_ASSERT(NonLoopBackEdge.second->size() > 0,
+                      "expecting backedge target to be non-empty");
+          auto StartLexId = Interval.start->getLexicalId();
+          if (StartLexId > NonLoopBackEdge.second->front()->getLexicalId()) {
+            VISA_DEBUG_VERBOSE({
+              std::cout << "Updating start interval for " << Dcl->getName()
+                        << " from " << StartLexId << " to "
+                        << NonLoopBackEdge.second->front()->getLexicalId()
+                        << " - ";
+              NonLoopBackEdge.second->front()->dump();
+            });
+            auto OldInterval = Interval;
+            updateStartInterval(Dcl, NonLoopBackEdge.second->front());
+            Change = (OldInterval != Interval);
+          }
+        }
+      }
+    } while (Change);
+  }
+}
+
 void Augmentation::handleLoopExtension(FuncInfo *funcInfo) {
   // process each natural loop
   for (auto &iter : kernel.fg.getAllNaturalLoops()) {
@@ -4383,6 +4574,8 @@ void Augmentation::buildLiveIntervals(FuncInfo* funcInfo) {
       handlePred(funcInfo, inst);
     }
   }
+
+  handleNonLoopBackEdges(funcInfo);
 
   // A variable may be defined in each divergent loop iteration and used
   // outside the loop. SIMT liveness can detect the variable as KILL and
@@ -4786,23 +4979,14 @@ void Augmentation::handleSIMDIntf(G4_Declare *firstDcl, G4_Declare *secondDcl,
     return;
   }
 
-  auto contain = [](const auto &C, auto pred) {
-    return std::find_if(C.cbegin(), C.cend(), pred) != C.cend();
-  };
-
   bool isFirstDcl = true;
+  bool isPseudoVCADcl = kernel.fg.isPseudoVCADcl(firstDcl);
+  if (!isPseudoVCADcl){
+    isPseudoVCADcl = kernel.fg.isPseudoVCADcl(secondDcl);
+    isFirstDcl = false;
+  }
 
-  auto pred = [firstDcl, secondDcl, &isFirstDcl](const auto &el) {
-    if (el.second.VCA == firstDcl)
-      return true;
-    if (el.second.VCA == secondDcl) {
-      isFirstDcl = false;
-      return true;
-    }
-    return false;
-  };
-
-  if (contain(kernel.fg.fcallToPseudoDclMap, pred)) {
+  if (isPseudoVCADcl) {
     // Mark intf for following pattern:
     // V33 =
     // ...
@@ -6711,6 +6895,12 @@ void PhyRegUsage::updateRegUsage(LiveRange *lr) {
         PhyRegUsage::numAllocUnit(dcl->getNumElems(), dcl->getElemType()),
         dcl->getNumRows());
   }
+  else if (pr->isS0()) {
+    markBusyScalar(
+        0, PhyRegUsage::offsetAllocUnit(lr->getPhyRegOff(), dcl->getElemType()),
+        PhyRegUsage::numAllocUnit(dcl->getNumElems(), dcl->getElemType()),
+        dcl->getNumRows());
+  }
   else {
     vISA_ASSERT(false, ERROR_GRAPHCOLOR); // un-handled reg type
   }
@@ -6757,6 +6947,8 @@ bool GraphColor::assignColors(ColorHeuristic colorHeuristicGRF,
     rFile = G4_FLAG;
   else if (liveAnalysis.livenessClass(G4_ADDRESS))
     rFile = G4_ADDRESS;
+  else if (liveAnalysis.livenessClass(G4_SCALAR))
+    rFile = G4_SCALAR;
 
   FreePhyRegs FPR(kernel);
 
@@ -8829,6 +9021,8 @@ unsigned ForbiddenRegs::getForbiddenVectorSize(G4_RegFileKind regKind) const {
     return builder.getNumAddrRegisters();
   case G4_FLAG:
     return builder.getNumFlagRegisters();
+  case G4_SCALAR:
+    return builder.kernel.getSRFInWords();
   default:
     vISA_ASSERT_UNREACHABLE("illegal reg file");
     return 0;
@@ -9063,6 +9257,59 @@ void GlobalRA::addCalleeSavePseudoCode() {
   vISA_ASSERT((*exitBBIt)->isFReturn(), ERROR_REGALLOC);
   exitBB->insertBefore(exitBBIt, restoreInst);
   builder.instList.clear();
+}
+
+void GlobalRA::storeCEInProlog() {
+  if (!kernel.getOption(vISA_storeCE))
+    return;
+
+  // If we've to store CE in prolog, we emit:
+  // TmpReg (GRF_Aligned) = CE0.0
+  // Store TmpReg @ FP+Offset
+  //
+  // Where Offset = 1 GRF size in bytes
+
+  // Create new variable equal to GRF size so it's always GRF aligned.
+  // It's transitory so shouldn't impact register pressure. We want to
+  // write CE0.0 in 0th location of this variable so that it can be
+  // used as send payload.
+  auto TmpReg = builder.createDeclare(
+      "TmpCEReg", G4_GRF, builder.numEltPerGRF<Type_UD>(), 1, Type_UD);
+  auto *DstRgn = builder.createDstRegRegion(TmpReg, 1);
+  auto *CEReg = regPool.getMask0Reg();
+  auto *SrcOpnd = builder.createSrc(
+      CEReg, 0, 0, kernel.fg.builder->getRegionScalar(), Type_UD);
+  auto Mov = builder.createMov(g4::SIMD1, DstRgn, SrcOpnd,
+                               G4_InstOption::InstOpt_WriteEnable, false);
+  auto nextPos = kernel.fg.getEntryBB()->insertBefore(
+      kernel.fg.getEntryBB()->getFirstInsertPos(), Mov);
+
+  auto payloadSrc =
+      builder.createSrcRegRegion(TmpReg, builder.getRegionStride1());
+  const unsigned execSize = 8;
+  G4_DstRegRegion *postDst = builder.createNullDst(Type_UD);
+  G4_INST *store = nullptr;
+  unsigned int HWOffset = builder.numEltPerGRF<Type_UB>() / getHWordByteSize();
+  vISA_ASSERT(kernel.stackCall.getFrameDescriptorByteSize() <=
+                  builder.numEltPerGRF<Type_UB>(),
+              "ce0 overwrote FDE");
+  kernel.getKernelDebugInfo()->setCESaveOffset(HWOffset * getHWordByteSize());
+
+  if (builder.supportsLSC()) {
+    auto headerOpnd = getSpillFillHeader(*kernel.fg.builder, nullptr);
+    store = builder.createSpill(postDst, headerOpnd, payloadSrc,
+                                G4_ExecSize(execSize), 1, HWOffset,
+                                builder.getBEFP(), InstOpt_WriteEnable, false);
+  } else {
+    store = builder.createSpill(postDst, payloadSrc, G4_ExecSize(execSize), 1,
+                                HWOffset, builder.getBEFP(),
+                                InstOpt_WriteEnable, false);
+  }
+  kernel.fg.getEntryBB()->insertAfter(nextPos, store);
+
+  if (builder.kernel.getOption(vISA_GenerateDebugInfo)) {
+    builder.kernel.getKernelDebugInfo()->setSaveCEInst(store);
+  }
 }
 
 //
@@ -10197,6 +10444,89 @@ void GlobalRA::flagRegAlloc() {
 
   vISA_ASSERT(iterationNo < maxRAIterations, "Flag RA has failed.");
 }
+void GlobalRA::scalarRegAlloc() {
+  uint32_t scalarSpillId = 0;
+  unsigned maxRAIterations = builder.getuint32Option(vISA_MaxRAIterations);
+  unsigned iterationNo = 0;
+
+  std::set<G4_Declare *> PreAssigned;
+  for (auto dcl : kernel.Declares) {
+    if (dcl->getRegFile() == G4_SCALAR) {
+      auto regVar = dcl->getRegVar();
+      if (regVar->isS0())
+        PreAssigned.insert(dcl);
+    }
+  }
+  while (iterationNo < maxRAIterations) {
+    RA_TRACE(std::cout << "--scalar RA iteration " << iterationNo << "\n");
+    //
+    // choose reg vars whose reg file kind is ARF
+    //
+    LivenessAnalysis liveAnalysis(*this, G4_SCALAR);
+    liveAnalysis.computeLiveness();
+
+    //
+    // if no reg var needs to reg allocated, then skip reg allocation
+    //
+    if (liveAnalysis.getNumSelectedVar() > 0) {
+      GraphColor coloring(liveAnalysis, false, false);
+      if (!coloring.regAlloc(false, false, nullptr)) {
+        SpillManager spillScalar(*this, coloring.getSpilledLiveRanges(),
+                                 scalarSpillId);
+        spillScalar.insertSpillCode();
+        scalarSpillId = spillScalar.getNextTempDclId();
+
+        //
+        // if new scalar temps are created, we need to do RA again so that newly
+        // created temps can get registers. If there are no more newly created
+        // temps, we then commit reg assignments
+        //
+        if (spillScalar.isAnyNewTempCreated() == false) {
+          coloring.confirmRegisterAssignments();
+          if ((builder.kernel.fg.getHasStackCalls() ||
+               builder.kernel.fg.getIsStackCallFunc())) {
+            vASSERT(false &&
+                    "missing code"); // coloring.addA0SaveRestoreCode();
+          }
+          break; // no more new scalar temps; done with scalar allocation
+        }
+      } else // successfully allocate register without spilling
+      {
+        coloring.confirmRegisterAssignments();
+        if ((builder.kernel.fg.getHasStackCalls() ||
+             builder.kernel.fg.getIsStackCallFunc())) {
+          vASSERT(false && "missing code"); // coloring.addA0SaveRestoreCode();
+        }
+        VISA_DEBUG_VERBOSE(detectUndefinedUses(liveAnalysis, kernel));
+
+        break; // done with scalar allocation
+      }
+    } else {
+      break; // no scalar allocation needed
+    }
+    iterationNo++;
+  }
+  kernel.dumpToFile("after.Scalar_RA." + std::to_string(iterationNo));
+  constexpr unsigned ScalarRegisterGRFBase = 96;
+  // change scalar-register assignment back to fixed GRF location so that
+  // the code can be simulated on platform without scalar pipe
+  for (G4_Declare *dcl : kernel.Declares) {
+    if (dcl->getRegFile() == G4_SCALAR && !PreAssigned.count(dcl)) {
+      auto regVar = dcl->getRegVar();
+      if (regVar->isS0()) {
+        auto offset = regVar->getPhyRegOff() * dcl->getElemSize();
+        unsigned int regNum = offset / builder.getGRFSize();
+        unsigned int subRegNum =
+            (offset % builder.getGRFSize()) / dcl->getElemSize();
+        regVar->setPhyReg(regPool.getGreg(regNum + ScalarRegisterGRFBase),
+                        subRegNum);
+        dcl->setRegFile(G4_GRF);
+      }
+    }
+  }
+  kernel.dumpToFile("after.Scalar_Rename." + std::to_string(iterationNo));
+  vISA_ASSERT(iterationNo < maxRAIterations, "Scalar RA has failed.");
+}
 
 void GlobalRA::assignRegForAliasDcl() {
   //
@@ -10240,6 +10570,16 @@ void GlobalRA::assignRegForAliasDcl() {
         } else if (CurrentRegVar->getDeclare()->getRegFile() == G4_ADDRESS) {
           vISA_ASSERT(tempoffset < builder.getNumAddrRegisters() * 2,
                       ERROR_REGALLOC); // Must hold tempoffset in one A0 reg
+          CurrentRegVar->setPhyReg(
+              AliasRegVar->getPhyReg(),
+              tempoffset / CurrentRegVar->getDeclare()->getElemSize());
+        } else if (CurrentRegVar->getDeclare()->getRegFile() == G4_SCALAR) {
+          if (builder.getuint32Option(vISA_ScalarPipe))
+            vISA_ASSERT(tempoffset < kernel.getSRFInWords() *2,
+                        ERROR_REGALLOC);
+          else
+          vISA_ASSERT(tempoffset < builder.getScalarRegisterSizeInBytes(),
+                      ERROR_REGALLOC);
           CurrentRegVar->setPhyReg(
               AliasRegVar->getPhyReg(),
               tempoffset / CurrentRegVar->getDeclare()->getElemSize());
@@ -10385,6 +10725,163 @@ bool GlobalRA::hybridRA(LocalRA &lra) {
 }
 
 
+//
+// change single-element dcl for G4_GRF to G4_SCALAR
+//
+void GlobalRA::selectScalarCandidates() {
+  // collect root-declares that may be changed to scalar
+  std::set<G4_Declare *> candidates;
+  for (auto bb : kernel.fg) {
+    for (auto inst : *bb) {
+      G4_DstRegRegion *dst = inst->getDst();
+      if (dst && dst->getTopDcl()) {
+        auto rootDcl = dst->getTopDcl();
+        if (rootDcl->getRegFile() == G4_GRF && !candidates.count(rootDcl) &&
+            rootDcl->getNumRows() <= 1) {
+          bool isNoMaskInst =
+              (inst->isWriteEnableInst() || bb->isAllLaneActive());
+          if (inst->getExecSize() == g4::SIMD1 && isNoMaskInst) {
+            candidates.insert(rootDcl);
+          }
+        }
+      }
+    }
+  }
+  // filter candidates that we cannot handle
+  std::set<G4_Declare *> multiUseInputs;
+  std::set<G4_Declare *> visitedInputs;
+  for (auto bb : kernel.fg) {
+    for (auto inst : *bb) {
+      G4_DstRegRegion *dst = inst->getDst();
+      if (dst && dst->getTopDcl()) {
+        auto rootDcl = dst->getTopDcl();
+        if (candidates.count(rootDcl)) {
+          // when there is only one SRF, it is unrealistic to allow
+          // send to write to SRF
+          if (inst->isSend() && kernel.getSRFInWords()*2
+              <= builder.getScalarRegisterSizeInBytes()) {
+            candidates.erase(rootDcl);
+          }
+          bool isNoMaskInst =
+              (inst->isWriteEnableInst() || bb->isAllLaneActive());
+          // all writes to that top-dcl have to be simd1-nomask
+          if (!(inst->getExecSize() == g4::SIMD1 && isNoMaskInst)) {
+            candidates.erase(rootDcl);
+          }
+        }
+      }
+      // when there is only one SRF, it is also unrealistic to allow
+      // SRF as regular send source because it has to be 64-byte aligned
+      if (inst->isSend() && kernel.getSRFInWords() * 2 <=
+                                builder.getScalarRegisterSizeInBytes()) {
+        for (int i = 0; i < inst->getNumSrc(); i++) {
+          auto src = inst->getSrc(i);
+          if (!src || !src->isSrcRegRegion())
+            continue;
+          auto srcDcl = src->getTopDcl();
+          if (srcDcl && candidates.count(srcDcl))
+            candidates.erase(srcDcl);
+        }
+      }
+      // Also find all the input dcls that is used inside a loop,
+      // or used more than once. Skip moves and sends
+      if (inst->isRawMov() || inst->isSend())
+        continue;
+      for (int i = 0; i < inst->getNumSrc(); i++) {
+        auto src = inst->getSrc(i);
+        if (!src || !src->isSrcRegRegion())
+          continue;
+        G4_SrcRegRegion *origSrc = src->asSrcRegRegion();
+        auto srcDcl = src->getTopDcl();
+        if (srcDcl && srcDcl->getRegFile() == G4_INPUT &&
+            srcDcl->getTotalElems() == 1 && origSrc && origSrc->isScalar()) {
+          // mark multi-use
+          if (bb->getNestLevel() > 0)
+            multiUseInputs.insert(srcDcl);
+          else if (visitedInputs.find(srcDcl) != visitedInputs.end())
+            multiUseInputs.insert(srcDcl);
+          // mark any use
+          visitedInputs.insert(srcDcl);
+        }
+      }
+    }
+  }
+  // update declares
+  for (auto dcl : kernel.Declares) {
+    auto rootDcl = dcl->getRootDeclare();
+    if (candidates.count(rootDcl)) {
+      dcl->setRegFile(G4_SCALAR);
+    }
+  }
+  G4_BB *entryBB = kernel.fg.getEntryBB();
+  auto insertIt = entryBB->begin();
+  for (INST_LIST_ITER IB = entryBB->end(); insertIt != IB; ++insertIt) {
+    G4_INST *tI = (*insertIt);
+    if (tI->isFlowControl() || tI == entryBB->back())
+      break;
+  }
+  std::map<G4_Declare *, G4_Declare *> inputMap;
+  for (auto bb : kernel.fg) {
+    INST_LIST_ITER it = bb->begin(), iEnd = bb->end();
+    INST_LIST_ITER next_iter = it;
+    for (; it != iEnd; it = next_iter) {
+      ++next_iter;
+      G4_INST *inst = *it;
+      // skip moves and sends
+      if (inst->isRawMov() || inst->isSend())
+        continue;
+      // Add move for scalar-iput with multiple-uses to save power.
+      // The move should be inserted into the entry-block before the first use.
+      for (int i = 0; i < inst->getNumSrc(); i++) {
+        auto src = inst->getSrc(i);
+        if (!src || !src->isSrcRegRegion())
+          continue;
+        G4_SrcRegRegion *origSrc = src->asSrcRegRegion();
+        auto srcDcl = src->getTopDcl();
+        if (srcDcl && origSrc && origSrc->isScalar() &&
+            multiUseInputs.find(srcDcl) != multiUseInputs.end()) {
+          vISA_ASSERT(!candidates.count(srcDcl),
+                      "input-variable cannot be a scalar candidate");
+          // insert a move to a scalar-register candidate
+          auto subAlign = Get_G4_SubRegAlign_From_Size(
+              (uint16_t)origSrc->getElemSize(), builder.getPlatform(),
+              builder.getGRFAlign());
+          G4_Declare *tmpDcl = nullptr;
+          G4_SrcModifier modifier = origSrc->getModifier();
+          if (inputMap.find(srcDcl) != inputMap.end())
+            tmpDcl = inputMap[srcDcl];
+          else {
+            // create dcl for scalar
+            tmpDcl =
+                builder.createTempVar(g4::SIMD1, origSrc->getType(), subAlign);
+            tmpDcl->setRegFile(G4_SCALAR);
+            candidates.insert(tmpDcl);
+            inputMap[srcDcl] = tmpDcl;
+            addVarToRA(tmpDcl);
+            // create mov
+            origSrc->setModifier(Mod_src_undef);
+            G4_DstRegRegion *dst = builder.createDstRegRegion(tmpDcl, 1);
+            G4_INST *movInst = builder.createMov(g4::SIMD1, dst, origSrc,
+                                                 InstOpt_WriteEnable, false);
+            // insert mov
+            if (bb == entryBB)
+              bb->insertBefore(it, movInst);
+            else
+              entryBB->insertBefore(insertIt, movInst);
+          }
+          G4_SrcRegRegion *newSrc = builder.createSrcRegRegion(
+              modifier, Direct, tmpDcl->getRegVar(), 0, 0,
+              builder.getRegionScalar(), tmpDcl->getElemType());
+          inst->setSrc(newSrc, i);
+        }
+      }
+    }
+  }
+  // flag and address spill location now should be scalar registers.
+  // scalar registers can be spilled into GRF
+  // need this? addrFlagSpillDcls.clear();
+  kernel.dumpToFile("after.select_scalar.");
+}
 
 
 std::pair<unsigned, unsigned> GlobalRA::reserveGRFSpillReg(GraphColor &coloring) {
@@ -10463,6 +10960,7 @@ void GlobalRA::stackCallSaveRestore(bool hasStackCall) {
     // Only GENX sub-graphs require callee-save code.
 
     if (builder.getIsKernel() == false) {
+      storeCEInProlog();
       addCalleeSavePseudoCode();
       addStoreRestoreToReturn();
     }
@@ -10695,6 +11193,22 @@ void GlobalRA::writeVerboseRPEStats(RPE &rpe) {
   }
 }
 
+bool GlobalRA::VRTIncreasedGRF(GraphColor &coloring) {
+  if (kernel.useAutoGRFSelection()) {
+    bool infCostSpilled =
+        coloring.getSpilledLiveRanges().end() !=
+        std::find_if(coloring.getSpilledLiveRanges().begin(),
+                     coloring.getSpilledLiveRanges().end(),
+                     [](const LiveRange *spilledLR) {
+                       return spilledLR->getSpillCost() == MAXSPILLCOST;
+                     });
+    // Check if GRF can be increased to avoid large spills
+    if (canIncreaseGRF(computeSpillSize(coloring.getSpilledLiveRanges()),
+                       infCostSpilled))
+      return true;
+  }
+  return false;
+}
 
 void GlobalRA::splitOnSpill(bool fastCompile, GraphColor &coloring,
                             LivenessAnalysis &liveAnalysis) {
@@ -11030,6 +11544,10 @@ int GlobalRA::coloringRegAlloc() {
 
     flagRegAlloc();
   }
+  if (builder.getuint32Option(vISA_ScalarPipe)) {
+    selectScalarCandidates();
+    scalarRegAlloc();
+  }
   // LSC messages are used when:
   // a. Stack call is used on PVC+,
   // b. Spill size exceeds what can be represented using hword msg on PVC+
@@ -11046,8 +11564,13 @@ int GlobalRA::coloringRegAlloc() {
 
   if (kernel.fg.getIsStackCallFunc()) {
     // Allocate space to store Frame Descriptor
-    nextSpillOffset += 32;
-    scratchOffset += 32;
+    nextSpillOffset += builder.numEltPerGRF<Type_UB>();
+    scratchOffset += builder.numEltPerGRF<Type_UB>();
+
+    if (kernel.getOption(vISA_storeCE)) {
+      nextSpillOffset += builder.numEltPerGRF<Type_UB>();
+      scratchOffset += builder.numEltPerGRF<Type_UB>();
+    }
   }
 
   // Global linear scan RA
@@ -11187,8 +11710,9 @@ int GlobalRA::coloringRegAlloc() {
     GraphColor coloring(liveAnalysis, false, forceSpill);
 
     if (builder.getOption(vISA_dumpRPE) && iterationNo == 0 && !rematDone) {
+      coloring.dumpRPEToFile();
       // dump pressure the first time we enter global RA
-      coloring.dumpRegisterPressure();
+      coloring.dumpRegisterPressure(std::cerr);
     }
 
     // Get the size of register which are reserved for spill
@@ -11202,6 +11726,15 @@ int GlobalRA::coloringRegAlloc() {
     bool isColoringGood =
         coloring.regAlloc(doBankConflictReduction, highInternalConflict, &rpe);
     if (!isColoringGood) {
+      // When there are spills and -abortonspill is set, vISA will bump up the
+      // number of GRFs first and try to compile without spills under one of
+      // the following conditions:
+      //  - Variable with inf spill cost, or
+      //  - #GRFs selected and next larger one has same number of threads, or
+      //  - Spill ratio is above threshold
+      // If none of the conditions is met, vISA will abort and return VISA_SPILL.
+      if (VRTIncreasedGRF(coloring))
+        continue;
 
       bool rerunGRA1 = false, rerunGRA2 = false, rerunGRA3 = false,
            isEarlyExit = false, abort = false, success = false;
@@ -11439,23 +11972,37 @@ void GlobalRA::insertPhyRegDecls() {
   VISA_DEBUG(std::cout << "Local RA used " << numGRFsUsed << " GRFs\n");
 }
 
-void GraphColor::dumpRegisterPressure() {
+void GraphColor::dumpRPEToFile() {
+  // Dump RPE output to file if asmName is set
+  auto *asmOutput = builder.getOptions()->getOptionCstr(VISA_AsmFileName);
+  if (asmOutput) {
+    std::string FN(asmOutput);
+    FN += ".rpe";
+    std::ofstream OF;
+    OF.open(FN, std::ofstream::out);
+    dumpRegisterPressure(OF);
+    OF.close();
+  }
+}
+
+void GraphColor::dumpRegisterPressure(std::ostream &OS) {
   RPE rpe(gra, &liveAnalysis);
   uint32_t max = 0;
   std::vector<G4_INST *> maxInst;
   rpe.run();
 
   for (auto bb : builder.kernel.fg) {
-    std::cerr << "BB " << bb->getId() << ": (Pred: ";
+    OS << "BB " << bb->getId() << ": (Pred: ";
     for (auto pred : bb->Preds) {
-      std::cerr << pred->getId() << ",";
+      OS << pred->getId() << ",";
     }
-    std::cerr << " Succ: ";
+    OS << " Succ: ";
     for (auto succ : bb->Succs) {
-      std::cerr << succ->getId() << ",";
+      OS << succ->getId() << ",";
     }
-    std::cerr << ")\n";
-    for (auto inst : *bb) {
+    OS << ")\n";
+    for (auto instIt = bb->begin(); instIt != bb->end(); ++instIt) {
+      auto *inst = *instIt;
       uint32_t pressure = rpe.getRegisterPressure(inst);
       if (pressure > max) {
         max = pressure;
@@ -11465,14 +12012,15 @@ void GraphColor::dumpRegisterPressure() {
         maxInst.push_back(inst);
       }
 
-      std::cerr << "[" << pressure << "] ";
-      inst->dump();
+      if (kernel.getOption(vISA_EmitSrcFileLineToRPE))
+        bb->emitInstructionSourceLineMapping(OS, instIt);
+      OS << "[" << pressure << "] ";
+      inst->print(OS);
     }
   }
-  std::cerr << "max pressure: " << max << ", " << maxInst.size()
-            << " inst(s)\n";
+  OS << "max pressure: " << max << ", " << maxInst.size() << " inst(s)\n";
   for (auto inst : maxInst) {
-    inst->dump();
+    inst->print(OS);
   }
 }
 
@@ -12036,6 +12584,9 @@ unsigned GraphColor::edgeWeightARF(const LiveRange *lr1, const LiveRange *lr2) {
           "Found unsupported subRegAlignment in address register allocation!");
       return 0;
     }
+  }
+  else if (lr1->getRegKind() == G4_SCALAR) {
+    return edgeWeightGRF<false>(lr1, lr2); // treat scalar just like GRF
   }
   vISA_ASSERT_UNREACHABLE(
       "Found unsupported ARF reg type in register allocation!");

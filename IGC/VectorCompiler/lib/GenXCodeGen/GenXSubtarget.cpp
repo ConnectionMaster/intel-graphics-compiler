@@ -27,6 +27,8 @@ SPDX-License-Identifier: MIT
 #include "Probe/Assertion.h"
 #include "common/StringMacros.hpp"
 
+#include <unordered_set>
+
 using namespace llvm;
 
 #define DEBUG_TYPE "subtarget"
@@ -68,6 +70,7 @@ void GenXSubtarget::initSubtargetFeatures(StringRef CPU, StringRef FS) {
                  .Case("XeHPC", XeHPC)
                  .Case("XeHPCVG", XeHPCVG)
                  .Case("Xe2", Xe2)
+                 .Case("Xe3", Xe3)
                  .Default(Invalid);
 
   std::string CPUName(CPU);
@@ -101,6 +104,8 @@ uint32_t GenXSubtarget::getMaxThreadsNumPerSubDevice() const {
     return 1 << 12;
   case Xe2:
     return 1 << 13;
+  case Xe3:
+    return 1 << 15;
   }
   return 0;
 }
@@ -144,6 +149,16 @@ ArrayRef<std::pair<int, int>> GenXSubtarget::getThreadIdReservedBits() const {
     // [3] : Reserved MBZ
     // [2:0] : TID
     static const std::pair<int, int> Bits[] = {{10, 1}, {7, 1}, {3, 1}};
+    return Bits;
+  }
+  case GenXSubtarget::Xe3: {
+    // [17:14] Slice ID.
+    // [13:12] : Reserved MBZ
+    // [11:8] SubSlice ID
+    // [7] : Reserved MBZ
+    // [6:4] : EUID
+    // [3:0] : TID
+    static const std::pair<int, int> Bits[] = {{12, 2}, {7, 1}};
     return Bits;
   }
   default:
@@ -203,7 +218,8 @@ ArrayRef<std::pair<int, int>> GenXSubtarget::getEUIdBits() const {
     static const std::pair<int, int> Bits[] = {{4, 2}, {8, 1}};
     return Bits;
   }
-  case GenXSubtarget::Xe2: {
+  case GenXSubtarget::Xe2:
+  case GenXSubtarget::Xe3: {
     // [6:4] : EUID
     static const std::pair<int, int> Bits[] = {{4, 3}};
     return Bits;
@@ -216,6 +232,11 @@ ArrayRef<std::pair<int, int>> GenXSubtarget::getEUIdBits() const {
 
 ArrayRef<std::pair<int, int>> GenXSubtarget::getThreadIdBits() const {
   switch (TargetId) {
+  case GenXSubtarget::Xe3: {
+    // [3:0] : EUID
+    static const std::pair<int, int> Bits[] = {{0, 4}};
+    return Bits;
+  }
   default:
     static const std::pair<int, int> Bits[] = {{0, 3}};
     return Bits;
@@ -250,6 +271,8 @@ TARGET_PLATFORM GenXSubtarget::getVisaPlatform() const {
     return TARGET_PLATFORM::Xe_PVCXT;
   case Xe2:
     return TARGET_PLATFORM::Xe2;
+  case Xe3:
+    return TARGET_PLATFORM::Xe3;
   default:
     return TARGET_PLATFORM::GENX_NONE;
   }
@@ -273,4 +296,24 @@ bool GenXSubtarget::isInternalIntrinsicSupported(unsigned ID) const {
 #undef GET_INTRINSIC_TARGET_FEATURE_CHECKER
 
   return true;
+}
+
+bool GenXSubtarget::isValidGRFSize(unsigned Size) const {
+  switch (TargetId) {
+  case GenXSubtarget::XeHP:
+  case GenXSubtarget::XeHPG:
+  case GenXSubtarget::XeLPG:
+  case GenXSubtarget::XeLPGPlus:
+  case GenXSubtarget::XeHPC:
+  case GenXSubtarget::XeHPCVG:
+  case GenXSubtarget::Xe2:
+    return Size == 128 || Size == 256;
+  case GenXSubtarget::Xe3: {
+    static const std::unordered_set<unsigned> Supported = {32,  64,  96, 128,
+                                                           160, 192, 256};
+    return Supported.count(Size);
+  }
+  default:
+    return Size == 128; // platforms <= TGL
+  }
 }

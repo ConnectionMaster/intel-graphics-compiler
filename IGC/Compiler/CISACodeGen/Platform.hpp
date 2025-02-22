@@ -154,7 +154,7 @@ bool supportSimd32PerPixelPSWithNumSamples16() const
 bool canSupportWMTPWithoutBTD() const {
     // Returns true if the platform has the capability of supporting
     // WMTP but WMTP isn't supported for all shader types
-    return isCoreChildOf(IGFX_XE2_HPG_CORE);
+    return (isCoreChildOf(IGFX_XE2_HPG_CORE) && !isCoreChildOf(IGFX_XE3_CORE));
 }
 
 
@@ -166,6 +166,16 @@ bool canSupportWMTP() const
 }
 
 bool supportsWMTPForShaderType(ShaderType type) const {
+    if (isCoreChildOf(IGFX_XE3_CORE)) {
+        switch(type) {
+        case ShaderType::COMPUTE_SHADER:
+        case ShaderType::OPENCL_SHADER:
+        case ShaderType::RAYTRACING_SHADER:
+            return true;
+        default:
+            return false;
+        }
+    }
 
     if (isCoreChildOf(IGFX_XE2_HPG_CORE)) {
         switch(type) {
@@ -201,6 +211,10 @@ bool isProductChildOf(PRODUCT_FAMILY product) const
     if (product == IGFX_PVC)
         return isCoreChildOf(IGFX_XE_HPC_CORE);
     return m_platformInfo.eProductFamily >= product;
+}
+
+bool isCoreXE2() const {
+    return ( m_platformInfo.eRenderCoreFamily == IGFX_XE2_HPG_CORE );
 }
 
 // This function checks if core is child of another core
@@ -907,6 +921,7 @@ bool isValidNumThreads(int32_t numThreadsPerEU) const
 {
     return numThreadsPerEU == 0 // "auto" mode - use compiler heuristic
         || numThreadsPerEU == 4
+        || numThreadsPerEU == 10
         || numThreadsPerEU == 8;
 }
 
@@ -919,7 +934,8 @@ bool supports3DAndCubeSampleD() const
         m_platformInfo.eProductFamily != IGFX_METEORLAKE &&
         m_platformInfo.eProductFamily != IGFX_ARROWLAKE &&
         m_platformInfo.eProductFamily != IGFX_BMG &&
-        m_platformInfo.eProductFamily != IGFX_LUNARLAKE
+        m_platformInfo.eProductFamily != IGFX_LUNARLAKE &&
+        m_platformInfo.eRenderCoreFamily != IGFX_XE3_CORE
         );
 }
 
@@ -1095,6 +1111,10 @@ bool typedReadSupportsAllRenderableFormats() const
 
 bool EnableNewTileYCheckDefault() const
 {
+    if (isCoreChildOf(IGFX_XE3_CORE))
+    {
+        return false;
+    }
     return true;
 }
 
@@ -1103,6 +1123,24 @@ bool EnableKeepTileYForFlattenedDefault() const
     return false;
 }
 
+bool supportsWriteableMSAATextures() const
+{
+    return isCoreChildOf(IGFX_XE3_CORE);
+}
+bool supportsVRT() const
+{
+    return isCoreChildOf(IGFX_XE3_CORE);
+}
+
+bool supportsOutOfBoundsGrfAccess() const
+{
+    return !isCoreChildOf(IGFX_XE3_CORE);
+}
+bool needsOutOfBoundsBuiltinChecks() const
+{
+    return !supportsOutOfBoundsGrfAccess() &&
+        IGC_IS_FLAG_ENABLED(EnableOutOfBoundsBuiltinChecks);
+}
 bool needsWAForThreadsUtilization() const
 {
     return (m_platformInfo.eProductFamily == IGFX_DG2 ||
@@ -1160,6 +1198,10 @@ unsigned int getMaxNumberHWThreadForEachWG() const
         // Each WG is dispatched into one subslice
         return getMaxNumberThreadPerSubslice();
     }
+    else if (m_platformInfo.eRenderCoreFamily == IGFX_XE3_CORE)
+    {
+        return getMaxNumberThreadPerSubslice();
+    }
     else {
         IGC_ASSERT_MESSAGE(0, "Unsupported platform!");
     }
@@ -1169,6 +1211,18 @@ unsigned int getMaxNumberHWThreadForEachWG() const
 uint32_t getGRFSize() const
 {
     return isCoreChildOf(IGFX_XE_HPC_CORE) ? 64 : 32;
+}
+
+uint32_t getMaxNumGRF(ShaderType type) const
+{
+    if (supportsVRT())
+    {
+        return 256;
+    }
+    else
+    {
+        return 128;
+    }
 }
 
 uint32_t getInlineDataSize() const
@@ -1288,6 +1342,7 @@ bool hasCorrectlyRoundedMacros() const {
         m_platformInfo.eProductFamily != IGFX_ALDERLAKE_P &&
         m_platformInfo.eProductFamily != IGFX_ALDERLAKE_N &&
         m_platformInfo.eProductFamily != IGFX_DG2 &&
+        m_platformInfo.eRenderCoreFamily != IGFX_XE3_CORE &&
         m_platformInfo.eProductFamily != IGFX_METEORLAKE) &&
         m_platformInfo.eProductFamily != IGFX_ARROWLAKE &&
         m_platformInfo.eProductFamily != IGFX_BMG &&
@@ -1444,9 +1499,22 @@ bool hasBarrierControlFlowOpt() const
     return enabled;
 }
 
+bool needsLocalScopeEvictTGM() const
+{
+    return true;
+}
+
+bool needWaSamplerNoMask() const
+{
+    return m_WaTable.Wa_22011157800 && !IGC_IS_FLAG_DISABLED(DiableWaSamplerNoMask);
+}
+
 bool hasSlowSameSBIDLoad() const
 {
-    return isCoreChildOf(IGFX_XE2_HPG_CORE);
+    bool bYes = false;
+    bYes = isCoreChildOf(IGFX_XE_HPG_CORE);
+
+    return bYes && !needWaSamplerNoMask();
 }
 
 bool canDoMultipleLineMOVOpt() const
@@ -1468,6 +1536,19 @@ bool isDynamicRayQueryDynamicRayManagementMechanismEnabled() const
 {
     return (isCoreChildOf(IGFX_XE2_HPG_CORE) &&
         IGC_IS_FLAG_DISABLED(DisableRayQueryDynamicRayManagementMechanism));
+}
+
+bool isSWSubTriangleOpacityCullingEmulationEnabled() const
+{
+    return (isCoreChildOf(IGFX_XE3_CORE) &&
+        IGC_IS_FLAG_DISABLED(DisableSWSubTriangleOpacityCullingEmulation));
+}
+
+bool isRayQueryReturnOptimizationEnabled() const
+{
+    return (isCoreChildOf(IGFX_XE2_HPG_CORE) &&
+        !getWATable().Wa_14018117913 &&
+        IGC_IS_FLAG_DISABLED(DisableRayQueryReturnOptimization));
 }
 
 // ***** Below go accessor methods for testing WA data from WA_TABLE *****
@@ -1612,10 +1693,8 @@ bool enableMultiGRFAccessWA() const
 // Return true if platform has structured control-flow instructions and IGC wants to use them.
 bool hasSCF() const
 {
-    bool doscf = true;
     // DG2 and PVC still has SCF, but igc will stop using them.
-    doscf = !isProductChildOf(IGFX_DG2);
-    return doscf;
+    return !isProductChildOf(IGFX_DG2);
 }
 
 const SCompilerHwCaps& GetCaps() { return m_caps; }
@@ -1683,7 +1762,7 @@ bool WaDisableD64ScratchMessage() const
 
 bool supportLargeGRF() const
 {
-    return isCoreChildOf(IGFX_XE_HPG_CORE);
+    return (isCoreChildOf(IGFX_XE_HPG_CORE) && !isCoreChildOf(IGFX_XE3_CORE));
 }
 
 bool supportCheckCSThreadsLimit() const
@@ -1798,6 +1877,11 @@ bool preferLSCCache() const
 }
 
 
+bool usesDynamicPolyPackingPolicies() const
+{
+    return isCoreChildOf(IGFX_XE3_CORE) && IGC_IS_FLAG_DISABLED(DisableDynamicPolyPackingPolicies);
+}
+
 bool allowDivergentControlFlowRayQueryCheckRelease() const
 {
     return m_WaTable.Wa_22019804511 != 0;
@@ -1805,7 +1889,6 @@ bool allowDivergentControlFlowRayQueryCheckRelease() const
 
 bool allowProceedBasedApproachForRayQueryDynamicRayManagementMechanism() const
 {
-
     return IGC_IS_FLAG_DISABLED(DisableProceedBasedApproachForRayQueryDynamicRayManagementMechanism);
 }
 

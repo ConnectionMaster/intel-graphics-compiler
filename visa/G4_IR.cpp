@@ -882,6 +882,13 @@ bool G4_INST::hasNoPipe() const {
   return false;
 }
 
+bool G4_INST::isS0Opnd(G4_Operand *opnd) const {
+  if (opnd->getBase()->isS0()) {
+    return true;
+  }
+
+  return false;
+}
 
 bool G4_INST::isLongPipeType(G4_Type type) const {
   if (builder.hasPartialInt64Support()) {
@@ -912,6 +919,27 @@ bool G4_INST::isJEUPipeInstructionXe() const {
   return false;
 }
 
+bool G4_INST::isS0PipeInstructionXe() const {
+  if (isPseudoAddrMovIntrinsic()) {
+    return true;
+  }
+
+  if (opcode() != G4_mov) {
+    return false;
+  }
+
+  G4_Operand *dst = getDst();
+  if (!dst || (dst && !isS0Opnd(dst))) {
+    return false;
+  }
+
+  const G4_Operand *src = getSrc(0);
+  if (!src->isImm()) {
+    return false;
+  }
+
+  return true;
+}
 
 bool G4_INST::isLongPipeInstructionXe() const {
   if (isJEUPipeInstructionXe()) {
@@ -926,6 +954,9 @@ bool G4_INST::isLongPipeInstructionXe() const {
     return false;
   }
 
+  if (isS0PipeInstructionXe()) {
+    return false;
+  }
 
   const G4_Operand *dst = getDst();
   if (dst && isLongPipeType(dst->getType())) {
@@ -959,6 +990,9 @@ bool G4_INST::isIntegerPipeInstructionXe() const {
     return false;
   }
 
+  if (isS0PipeInstructionXe()) {
+    return false;
+  }
 
   if (builder.hasFixedCycleMathPipeline() && isMath()) {
     return false;
@@ -1001,6 +1035,9 @@ bool G4_INST::isFloatPipeInstructionXe() const {
     return false;
   }
 
+  if (isS0PipeInstructionXe()) {
+    return false;
+  }
 
 
   if (isLongPipeInstructionXe()) {
@@ -1051,6 +1088,9 @@ int G4_INST::getMaxDepDistance() const {
 }
 
 SB_INST_PIPE G4_INST::getInstructionPipeXe() const {
+  if (isS0PipeInstructionXe()) {
+    return PIPE_S0;
+  }
 
   if (isLongPipeInstructionXe()) {
     return PIPE_LONG;
@@ -1104,6 +1144,9 @@ SB_INST_PIPE G4_INST::getDistDepPipeXe() const {
     break;
   case DistanceType::DISTMATH:
     depPipe = PIPE_MATH;
+    break;
+  case DistanceType::DISTS0:
+    depPipe = PIPE_S0;
     break;
   default:
     vISA_ASSERT(0, "Unknown distance dependence type");
@@ -2217,6 +2260,12 @@ bool G4_INST::canPropagateTo(G4_INST *useInst, Gen4_Operand_Number opndNum,
     return false;
   }
 
+  // The meaning of region for indirect will be different with different
+  // execution size
+  if (!sameExecSize && src->isIndirect()) {
+    return false;
+  }
+
   // Be conserversative, do not bother to do complicated region compositions.
   // There are three variables to compute the composition:
   // (1) the dst stride
@@ -3121,7 +3170,8 @@ static void emitPredWrEn(std::ostream &output, G4_INST &inst) {
 
 static void emitExecSize(std::ostream &output, const G4_INST &inst) {
   auto execSize = static_cast<int>(inst.getExecSize());
-  if (inst.opcode() != G4_nop && inst.opcode() != G4_wait) {
+  if (inst.opcode() != G4_nop &&
+      inst.opcode() != G4_wait) {
     output << '(';
     if (execSize == UNDEFINED_EXEC_SIZE) {
       output << "??";
@@ -3350,6 +3400,9 @@ void G4_INST::emit_options(std::ostream &output) const {
       break;
     case DistanceType::DISTLONG:
       dists << 'L';
+      break;
+    case DistanceType::DISTS0:
+      dists << 'S';
       break;
     case DistanceType::DISTMATH:
       dists << 'M';
@@ -3757,6 +3810,9 @@ void G4_Areg::emit(std::ostream &output) {
   case AREG_F3:
     output << "f3";
     break;
+  case AREG_S0:
+    output << "s0";
+    break;
   default:
     output << "unknown architecture reg";
     vISA_ASSERT_UNREACHABLE(ERROR_UNKNOWN);
@@ -4154,7 +4210,12 @@ static void printRegVarOff(std::ostream &output, G4_Operand *opnd,
         vISA_ASSERT(baseVar->getPhyReg()->isAreg(), ERROR_UNKNOWN);
         (static_cast<G4_Areg *>(baseVar->getPhyReg()))->emit(output);
         output << '.' << (baseVar->getPhyRegOff() + subRegOffset);
-        {
+        if (base->isS0()) {
+          G4_RegVar *baseVar = static_cast<G4_RegVar *>(base);
+          int elems = baseVar->getDeclare()->getNumElems();
+
+          output << "]:" << elems;
+        } else {
           output << ", " << immAddrOff << ']';
         }
       } else {
@@ -4166,7 +4227,12 @@ static void printRegVarOff(std::ostream &output, G4_Operand *opnd,
     } else if (base->isAreg()) {
       (static_cast<G4_Areg *>(base))->emit(output);
       output << '.' << subRegOffset;
-      {
+      if (base->isS0()) {
+        G4_RegVar *baseVar = static_cast<G4_RegVar *>(base);
+        int elems = baseVar->getDeclare()->getNumElems();
+
+        output << "]:" << elems;
+      } else {
         output << ", " << immAddrOff << ']';
       }
     } else {
@@ -4305,8 +4371,20 @@ void G4_DstRegRegion::computeLeftBound(const IR_Builder &builder) {
     }
 
     byteOffset = left_bound / 8;
-  }
-  else if (base != NULL && base->isAccReg()) {
+  } else if (base && base->isS0()) {
+    if (base->isRegVar()) {
+      if (base->asRegVar()->getPhyReg()) {
+        left_bound = base->asRegVar()->getPhyRegOff() * TypeSize(type);
+        left_bound += subRegOff * TypeSize(type);
+      } else {
+        left_bound = subRegOff * TypeSize(type);
+      }
+    } else {
+      left_bound = subRegOff * TypeSize(type);
+    }
+
+    byteOffset = left_bound;
+  } else if (base != NULL && base->isAccReg()) {
     left_bound = subRegOff * TypeSize(type);
     if (base->asAreg()->getArchRegType() == AREG_ACC1 || regOff == 1) {
       left_bound += builder.getACCSize();
@@ -5037,6 +5115,7 @@ PhyRegPool::PhyRegPool(Mem_Manager &m, unsigned int maxRegisterNumber) {
   ARF_Table[AREG_SP] = new (m) G4_Areg(AREG_SP);
   ARF_Table[AREG_F2] = new (m) G4_Areg(AREG_F2);
   ARF_Table[AREG_F3] = new (m) G4_Areg(AREG_F3);
+  ARF_Table[AREG_S0] = new (m) G4_Areg(AREG_S0);
 }
 
 void PhyRegPool::rebuildRegPool(Mem_Manager &m, unsigned int numRegisters) {
@@ -5078,6 +5157,7 @@ G4_Declare::G4_Declare(const IR_Builder &builder, const char *n,
   addrSpillFill = false;
   forceSpilled = false;
   exclusiveLoad = false;
+  isCmpUseOnly = false;
   scopeID = 0;
 
   declId = (unsigned)dcllist.size();
@@ -5178,6 +5258,8 @@ void G4_Declare::emit(std::ostream &output) const {
       bool valid = false;
       output << " (f" << phyreg->asAreg()->ExRegNum(valid) << "."
              << regVar->getPhyRegOff() << ")";
+    } else if (phyreg->isS0()) {
+      output << " (s0." << regVar->getPhyRegOff() << ")";
     }
   } else if (isSpilled()) {
     const char *maybeForced = isForceSpilled() ? "force " : "";
@@ -5776,8 +5858,20 @@ void G4_SrcRegRegion::computeLeftBound(const IR_Builder &builder) {
     }
 
     right_bound = 0;
-  }
-  else if (base != NULL && base->isAccReg()) {
+  } else if (base != NULL && base->isS0()) {
+    if (base->isRegVar()) {
+      if (base->asRegVar()->getPhyReg()) {
+        left_bound = base->asRegVar()->getPhyRegOff() * TypeSize(type);
+        left_bound += subRegOff * TypeSize(type);
+      } else {
+        left_bound = subRegOff * TypeSize(type);
+      }
+    } else {
+      left_bound = subRegOff * TypeSize(type);
+    }
+
+    right_bound = 0;
+  } else if (base != NULL && base->isAccReg()) {
     left_bound = subRegOff * TypeSize(type);
     if (base->asAreg()->getArchRegType() == AREG_ACC1) {
       left_bound += builder.getACCSize();

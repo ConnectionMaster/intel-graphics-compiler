@@ -11,6 +11,7 @@ SPDX-License-Identifier: MIT
 #include "Compiler/CISACodeGen/ShaderCodeGen.hpp"
 #include "Compiler/InitializePasses.h"
 #include "llvmWrapper/IR/DerivedTypes.h"
+#include "llvmWrapper/IR/Argument.h"
 
 // Generic address space (GAS) pointer resolving is done in two steps:
 // 1) Find cast from non-GAS pointer to GAS pointer
@@ -147,8 +148,6 @@ bool GASResolving::resolveMemoryFromHost(Function& F) const {
 
     // collect load candidates and in parallel check for unsafe instructions
     // visitor may be a more beautiful way to do this
-    bool HasASCast = false; // if there exists addrspace cast from non global/generic space
-    bool HasPtoi = false; // if there exists ptrtoint with global/generic space
     for (BasicBlock& B : F) {
         for (Instruction& I : B) {
             if (auto LI = dyn_cast<LoadInst>(&I)) {
@@ -173,21 +172,7 @@ bool GASResolving::resolveMemoryFromHost(Function& F) const {
                 return false;
             }
             else if (auto PI = dyn_cast<PtrToIntInst>(&I)) {
-                // if we have a ptrtoint we need to check data flow which we don't want to
-                if (PI->getPointerAddressSpace() != ADDRESS_SPACE_GLOBAL &&
-                    PI->getPointerAddressSpace() != ADDRESS_SPACE_GENERIC)
-                    return false;
-                else {
-                    HasPtoi = true;
-                }
-
                 return false;
-            }
-            else if (auto AI = dyn_cast<AddrSpaceCastInst>(&I)) {
-                if (AI->getSrcAddressSpace() != ADDRESS_SPACE_GLOBAL &&
-                    AI->getSrcAddressSpace() != ADDRESS_SPACE_GENERIC) {
-                    HasASCast = true;
-                }
             }
             else if (auto SI = dyn_cast<StoreInst>(&I)) {
                 Value* V = SI->getValueOperand();
@@ -202,8 +187,6 @@ bool GASResolving::resolveMemoryFromHost(Function& F) const {
             }
         }
     }
-    if (HasASCast && HasPtoi)
-        return false;
 
     if (Loads.empty())
         return false;
@@ -284,7 +267,12 @@ bool GASResolving::checkGenericArguments(Function& F) const {
         if (auto Ty = dyn_cast<PointerType>(FT->getParamType(p))) {
             if (Ty->getAddressSpace() != ADDRESS_SPACE_GLOBAL)
                 continue;
-            auto PteeTy = IGCLLVM::getNonOpaquePtrEltTy(Ty);
+            auto PteeTy = IGCLLVM::getArgAttrEltTy(F.getArg(p));
+            if (PteeTy == nullptr && !IGCLLVM::isOpaquePointerTy(Ty))
+                PteeTy = IGCLLVM::getNonOpaquePtrEltTy(Ty);    // Legacy code: getNonOpaquePtrEltTy
+            if (PteeTy == nullptr)
+                // go to slow path
+                return true;
             if (auto PTy = dyn_cast<PointerType>(PteeTy)) {
                 if (PTy->getAddressSpace() == ADDRESS_SPACE_GENERIC)
                     return true;

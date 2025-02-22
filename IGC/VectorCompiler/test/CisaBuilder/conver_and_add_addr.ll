@@ -1,6 +1,6 @@
 ;=========================== begin_copyright_notice ============================
 ;
-; Copyright (C) 2023 Intel Corporation
+; Copyright (C) 2023-2024 Intel Corporation
 ;
 ; SPDX-License-Identifier: MIT
 ;
@@ -8,13 +8,15 @@
 
 ; COM: ;;;;;;;;;; RUNNERS ;;;;;;;;;;
 
-; RUN: %opt %use_old_pass_manager% -march=genx64 -mtriple=spir64-unknown-unknown -mcpu=XeHPC \
+; RUN: %opt_typed_ptrs %use_old_pass_manager% -march=genx64 -mtriple=spir64-unknown-unknown -mcpu=XeHPC \
+; RUN: -GenXModule -GenXLivenessWrapper -GenXCategoryWrapper -GenXLiveRangesWrapper -GenXCisaBuilderPass -GenXFinalizer \
+; RUN: -disable-verify -finalizer-opts="-dumpcommonisa -isaasmToConsole" < %s | FileCheck %s
+; RUN: %opt_opaque_ptrs %use_old_pass_manager% -march=genx64 -mtriple=spir64-unknown-unknown -mcpu=XeHPC \
 ; RUN: -GenXModule -GenXLivenessWrapper -GenXCategoryWrapper -GenXLiveRangesWrapper -GenXCisaBuilderPass -GenXFinalizer \
 ; RUN: -disable-verify -finalizer-opts="-dumpcommonisa -isaasmToConsole" < %s | FileCheck %s
 
 ; COM: ;;;;;;;;;; CHECKERS ;;;;;;;;;;
 
-; Gen9 VISA check
 ; CHECK: addr_add (M1, 1) [[A0:A[0-9]]](0)<1> &V{{[0-9]+}}[616] [[VBASE:V[0-9]+]](
 ; CHECK-NEXT: addr_add (M1, 1) [[A1:A[0-9]]](0)<1> &V{{[0-9]+}}[617] [[VBASE]](
 ; CHECK-NEXT: addr_add (M1, 1) [[A2:A[0-9]]](0)<1> [[A0]](0)<1> 0x264:uw

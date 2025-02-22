@@ -62,8 +62,6 @@ cmp+sel to avoid expensive VxH mov.
 #include "GenISAIntrinsics/GenIntrinsicInst.h"
 #include "common/IGCConstantFolder.h"
 #include "common/LLVMWarningsPush.hpp"
-#include "llvm/Config/llvm-config.h"
-#include <llvmWrapper/ADT/APInt.h>
 #include "llvmWrapper/IR/IntrinsicInst.h"
 #include <llvmWrapper/IR/DIBuilder.h>
 #include <llvmWrapper/IR/DerivedTypes.h>
@@ -73,6 +71,7 @@ cmp+sel to avoid expensive VxH mov.
 #include <llvm/ADT/Statistic.h>
 #include <llvm/ADT/SetVector.h>
 #include <llvm/Analysis/ConstantFolding.h>
+#include <llvm/Analysis/InstructionSimplify.h>
 #include <llvm/IR/Constants.h>
 #include "llvm/IR/DebugInfo.h"
 #include <llvm/IR/Function.h>
@@ -1465,9 +1464,10 @@ void CustomSafeOptPass::matchDp4a(BinaryOperator &I) {
     }
     Value* ValA = Builder.CreateBitCast(VectorA, Builder.getInt32Ty());
     Value* ValB = Builder.CreateBitCast(VectorB, Builder.getInt32Ty());
+    Value* ValSat = Builder.getInt1(false);
 
     Function* Dp4aFun = GenISAIntrinsic::getDeclaration(I.getModule(), IntrinsicID, Builder.getInt32Ty());
-    Value* Res = Builder.CreateCall(Dp4aFun, { AccVal, ValA, ValB });
+    Value* Res = Builder.CreateCall(Dp4aFun, { AccVal, ValA, ValB, ValSat });
     I.replaceAllUsesWith(Res);
 }
 
@@ -1673,8 +1673,8 @@ bool CustomSafeOptPass::isEmulatedAdd(BinaryOperator& I)
                     {
                         if (pConstOrVal->isNegative() == false)
                         {
-                            DWORD const_or_val = int_cast<DWORD>(pConstOrVal->getZExtValue());
-                            DWORD nextPowerOfTwo = iSTD::RoundPower2(const_or_val + 1);
+                            QWORD const_or_val = pConstOrVal->getZExtValue();
+                            QWORD nextPowerOfTwo = iSTD::RoundPower2(const_or_val + 1);
                             if (nextPowerOfTwo && (pConstMul->getZExtValue() % nextPowerOfTwo == 0))
                             {
                                 return true;
@@ -1929,6 +1929,42 @@ void CustomSafeOptPass::visitBinaryOperator(BinaryOperator& I)
     }
 }
 
+void CustomSafeOptPass::visitTruncInst(TruncInst& I)
+{
+    /*
+    From:
+    %334 = zext i16 %orig to i32
+    %335 = call i32 @llvm.genx.GenISA.WaveShuffleIndex.i32(i32 %334, i32 %333, i32 0)
+    %336 = trunc i32 %335 to i16
+    To:
+    %335 = call i16 @llvm.genx.GenISA.WaveShuffleIndex.i16(i16 %orig, i32 %333, i32 0)
+    */
+    if( I.getSrcTy()->isIntegerTy( 32 ) && I.getDestTy()->isIntegerTy( 16 ) )
+    {
+        // We know all variants of shuffle from zext are safe to demote. (unlike WaveAll which might not be)
+        if( auto* genIntr = dyn_cast<GenIntrinsicInst>( I.getOperand( 0 ) ); genIntr && isSubGroupShuffleVariant( genIntr ) && genIntr->hasOneUse() )
+        {
+            if( auto* ZI = dyn_cast<ZExtInst>( genIntr->getOperand( 0 ) ); ZI && ZI->getSrcTy()->isIntegerTy( 16 ) && ZI->getDestTy()->isIntegerTy( 32 ) )
+            {
+                IRBuilder<> builder( &I );
+
+                llvm::SmallVector<Value*> newArgs( genIntr->args().begin(), genIntr->args().end() );
+
+                // Override first arg (same position for all enabled intrinsics here) with lower type
+                newArgs[ 0 ] = ZI->getOperand( 0 );
+
+                // We do it this way, so that module will get proper func declaration of demoted type
+                Function* demotedFuncDeclaration = GenISAIntrinsic::getDeclaration( I.getModule(), genIntr->getIntrinsicID(), builder.getInt16Ty() );
+                Value* replacementCall = builder.CreateCall( demotedFuncDeclaration, newArgs );
+
+                I.replaceAllUsesWith( replacementCall );
+                I.eraseFromParent();
+                genIntr->eraseFromParent();
+            }
+        }
+    }
+}
+
 void IGC::CustomSafeOptPass::visitLdptr(llvm::SamplerLoadIntrinsic* inst)
 {
     if (!IGC_IS_FLAG_ENABLED(UseHDCTypedReadForAllTextures) &&
@@ -2133,46 +2169,48 @@ void IGC::CustomSafeOptPass::visitSampleBptr(llvm::SampleIntrinsic* sampleInst)
     }
 }
 
-bool CustomSafeOptPass::isIdentityMatrix(ExtractElementInst& I)
-{
-    bool found = false;
-    auto extractType = cast<IGCLLVM::FixedVectorType>(I.getVectorOperandType());
-    auto extractTypeVecSize = (uint32_t)extractType->getNumElements();
-    if (extractTypeVecSize == 20 ||
-        extractTypeVecSize == 16)
-    {
-        if (Constant * C = dyn_cast<Constant>(I.getVectorOperand()))
-        {
-            found = true;
 
-            // found = true if the extractelement is like this:
-            // %189 = extractelement <20 x float>
-            //    <float 1.000000e+00, float 0.000000e+00, float 0.000000e+00, float 0.000000e+00,
-            //     float 0.000000e+00, float 1.000000e+00, float 0.000000e+00, float 0.000000e+00,
-            //     float 0.000000e+00, float 0.000000e+00, float 1.000000e+00, float 0.000000e+00,
-            //     float 0.000000e+00, float 0.000000e+00, float 0.000000e+00, float 1.000000e+00,
-            //     float 0.000000e+00, float 0.000000e+00, float 0.000000e+00, float 0.000000e+00>, i32 %188
-            for (unsigned int i = 0; i < extractTypeVecSize; i++)
-            {
-                if (i == 0 || i == 5 || i == 10 || i == 15)
-                {
-                    ConstantFP* fpC = dyn_cast<ConstantFP>(C->getAggregateElement(i));
-                    ConstantInt* intC = dyn_cast<ConstantInt>(C->getAggregateElement(i));
-                    if((fpC && !fpC->isExactlyValue(1.f)) || (intC && !intC->isAllOnesValue()))
-                    {
-                        found = false;
-                        break;
-                    }
-                }
-                else if (!C->getAggregateElement(i)->isZeroValue())
-                {
-                    found = false;
-                    break;
-                }
-            }
+std::optional<bool> CustomSafeOptPass::getSignIfIdentityMatrix(ExtractElementInst& I)
+{
+    auto ExtractType = cast<IGCLLVM::FixedVectorType>(I.getVectorOperandType());
+    auto ExtractTypeVecSize = (uint32_t)ExtractType->getNumElements();
+
+    if (!(ExtractTypeVecSize == 20 || ExtractTypeVecSize == 16))
+        return std::nullopt;
+
+    Constant * C = dyn_cast<Constant>(I.getVectorOperand());
+    if (C == nullptr)
+        return std::nullopt;
+
+    bool PositiveSign = true;
+    // IsIdentity = true if the extractelement is like this:
+    // %189 = extractelement <20 x float>
+    //    <float 1.000000e+00, float 0.000000e+00, float 0.000000e+00, float 0.000000e+00,
+    //     float 0.000000e+00, float 1.000000e+00, float 0.000000e+00, float 0.000000e+00,
+    //     float 0.000000e+00, float 0.000000e+00, float 1.000000e+00, float 0.000000e+00,
+    //     float 0.000000e+00, float 0.000000e+00, float 0.000000e+00, float 1.000000e+00,
+    //     float 0.000000e+00, float 0.000000e+00, float 0.000000e+00, float 0.000000e+00>, i32 %188
+
+    for (unsigned int i = 0; i < ExtractTypeVecSize; i++)
+    {
+        if ( i % 5 == 0)
+        {
+            ConstantFP* FpC = dyn_cast<ConstantFP>(C->getAggregateElement(i));
+            ConstantInt* IntC = dyn_cast<ConstantInt>(C->getAggregateElement(i));
+            bool IsPlusMinusOne = false;
+            IsPlusMinusOne |= FpC && (FpC->isExactlyValue(1.f) || FpC->isExactlyValue(-1.f));
+            IsPlusMinusOne |= IntC && (IntC->isOne() || IntC->isMinusOne());
+
+            if(!IsPlusMinusOne)
+                return std::nullopt;
+            //we are assuming that the identity matrix does not have mixed values ones
+            PositiveSign = !((FpC && FpC->isNegative()) || (IntC && IntC->isNegative()));
         }
+        else if (!C->getAggregateElement(i)->isZeroValue())
+            return std::nullopt;
     }
-    return found;
+
+    return std::optional<bool>(PositiveSign);
 }
 
 void CustomSafeOptPass::dp4WithIdentityMatrix(ExtractElementInst& I)
@@ -2206,7 +2244,8 @@ void CustomSafeOptPass::dp4WithIdentityMatrix(ExtractElementInst& I)
     */
 
     // check %190 = extractelement <20 x float> <float 1.000000e+00, float 0.000000e+00, float 0.000000e+00, float 0.000000e+00 ...
-    if (!I.hasOneUse() || !isIdentityMatrix(I))
+    auto IsPositive = getSignIfIdentityMatrix(I);
+    if (!I.hasOneUse() || !IsPositive.has_value())
         return;
 
     Instruction* offset[4] = {nullptr, nullptr, nullptr, nullptr};
@@ -2217,6 +2256,7 @@ void CustomSafeOptPass::dp4WithIdentityMatrix(ExtractElementInst& I)
     offset[0] = dyn_cast<BinaryOperator>(I.getOperand(1));
     if (!offset[0] ||
         offset[0]->getOpcode() != Instruction::Shl ||
+        !offset[0]->hasNoUnsignedWrap() ||
         offset[0]->getOperand(1) != ConstantInt::get(offset[0]->getOperand(1)->getType(), 2))
     {
         return;
@@ -2260,7 +2300,7 @@ void CustomSafeOptPass::dp4WithIdentityMatrix(ExtractElementInst& I)
     for (int i = 1; i < 4; i++)
     {
         eeInst[i] = dyn_cast<ExtractElementInst>(*offset[i]->user_begin());
-        if (!eeInst[i] || !isIdentityMatrix(*eeInst[i]))
+        if (!eeInst[i] || !getSignIfIdentityMatrix(*eeInst[i]).has_value())
         {
             return;
         }
@@ -2268,14 +2308,19 @@ void CustomSafeOptPass::dp4WithIdentityMatrix(ExtractElementInst& I)
 
     // check dp4 and put them in mulI[] and addI[]
     Instruction* mulI[4] = { nullptr, nullptr, nullptr, nullptr };
+    auto isCorrectMulInst = [](Instruction* I) {
+        return I->getOpcode() == Instruction::Mul || (I->getOpcode() == Instruction::FMul && I->isFast());
+    };
+
     for (int i = 0; i < 4; i++)
     {
         mulI[i] = dyn_cast<Instruction>(*eeInst[i]->user_begin());
-        if (mulI[i] == nullptr || !mulI[i]->hasOneUse())
+        if (mulI[i] == nullptr || !mulI[i]->hasOneUse() || !isCorrectMulInst(mulI[i]))
         {
             return;
         }
     }
+
     int inputInSrcIndex = 0;
     if (mulI[0]->getOperand(0) == eeInst[0])
         inputInSrcIndex = 1;
@@ -2290,9 +2335,16 @@ void CustomSafeOptPass::dp4WithIdentityMatrix(ExtractElementInst& I)
     addI[1] = dyn_cast<Instruction>(*mulI[2]->user_begin());
     addI[2] = dyn_cast<Instruction>(*mulI[3]->user_begin());
 
-    if( addI[0] == nullptr ||
+    auto isAddInst = [](Instruction* I) {
+        return (I->getOpcode() == Instruction::Add || I->getOpcode() == Instruction::FAdd);
+    };
+
+    if ( addI[0] == nullptr ||
         addI[1] == nullptr ||
         addI[2] == nullptr ||
+        !isAddInst(addI[0]) ||
+        !isAddInst(addI[1]) ||
+        !isAddInst(addI[2]) ||
         !addI[0]->hasOneUse() ||
         !addI[1]->hasOneUse() ||
         *addI[0]->user_begin() != *mulI[2]->user_begin() ||
@@ -2309,13 +2361,31 @@ void CustomSafeOptPass::dp4WithIdentityMatrix(ExtractElementInst& I)
     Value* cond2 = builder.CreateICmp(ICmpInst::ICMP_EQ, offset[0]->getOperand(0), ConstantInt::get(offset[0]->getOperand(0)->getType(), 2));
     Value* cond3 = builder.CreateICmp(ICmpInst::ICMP_EQ, offset[0]->getOperand(0), ConstantInt::get(offset[0]->getOperand(0)->getType(), 3));
 
-    Value* zero = ConstantFP::get(Type::getFloatTy(I.getContext()), 0);
+    Value* zero = Constant::getNullValue(I.getType());
     Value* sel0 = builder.CreateSelect(cond0, mulI[0]->getOperand(inputInSrcIndex), zero);
     Value* sel1 = builder.CreateSelect(cond1, mulI[1]->getOperand(inputInSrcIndex), sel0);
     Value* sel2 = builder.CreateSelect(cond2, mulI[2]->getOperand(inputInSrcIndex), sel1);
     Value* sel3 = builder.CreateSelect(cond3, mulI[3]->getOperand(inputInSrcIndex), sel2);
 
-    addI[2]->replaceAllUsesWith(sel3);
+    if(I.getType()->isFloatingPointTy())
+    {
+        cast<Instruction>(sel0)->copyFastMathFlags(mulI[3]);
+        cast<Instruction>(sel1)->copyFastMathFlags(mulI[3]);
+        cast<Instruction>(sel2)->copyFastMathFlags(mulI[3]);
+        cast<Instruction>(sel3)->copyFastMathFlags(mulI[3]);
+    }
+
+    if(IsPositive.value())
+    {
+        addI[2]->replaceAllUsesWith(sel3);
+        return;
+    }
+
+    if(I.getType()->isFloatingPointTy())
+        addI[2]->replaceAllUsesWith(builder.CreateFNeg(sel3));
+    else
+        addI[2]->replaceAllUsesWith(builder.CreateNeg(sel3));
+
 }
 
 void CustomSafeOptPass::visitExtractElementInst(ExtractElementInst& I)
@@ -2381,179 +2451,95 @@ void CustomSafeOptPass::visitExtractElementInst(ExtractElementInst& I)
     dp4WithIdentityMatrix(I);
 }
 
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// This pass removes dead local memory loads and stores. If we remove all such loads and stores, we also
-// remove all local memory fences together with barriers that follow.
-//
-IGC_INITIALIZE_PASS_BEGIN(TrivialLocalMemoryOpsElimination, "TrivialLocalMemoryOpsElimination", "TrivialLocalMemoryOpsElimination", false, false)
-IGC_INITIALIZE_PASS_END(TrivialLocalMemoryOpsElimination, "TrivialLocalMemoryOpsElimination", "TrivialLocalMemoryOpsElimination", false, false)
+////////////////////////////////////////////////////////////////////////////////
+IGC_INITIALIZE_PASS_BEGIN(TrivialUnnecessaryTGMFenceElimination, "TrivialUnnecessaryTGMFenceElimination", "TrivialUnnecessaryTGMFenceElimination", false, false)
+IGC_INITIALIZE_PASS_END(TrivialUnnecessaryTGMFenceElimination, "TrivialUnnecessaryTGMFenceElimination", "TrivialUnnecessaryTGMFenceElimination", false, false)
 
-char TrivialLocalMemoryOpsElimination::ID = 0;
+char TrivialUnnecessaryTGMFenceElimination::ID = 0;
 
-TrivialLocalMemoryOpsElimination::TrivialLocalMemoryOpsElimination() : FunctionPass(ID)
+TrivialUnnecessaryTGMFenceElimination::TrivialUnnecessaryTGMFenceElimination() : FunctionPass(ID)
 {
-    initializeTrivialLocalMemoryOpsEliminationPass(*PassRegistry::getPassRegistry());
+    initializeTrivialUnnecessaryTGMFenceEliminationPass(*PassRegistry::getPassRegistry());
 }
 
-bool TrivialLocalMemoryOpsElimination::runOnFunction(Function& F)
+static inline bool IsTypedReadOperation(const Instruction* pInst)
+{
+    const GenIntrinsicInst* pIntr = dyn_cast<GenIntrinsicInst>(pInst);
+
+    if (pIntr &&
+        (pIntr->isGenIntrinsic(GenISAIntrinsic::GenISA_typedread) ||
+            pIntr->isGenIntrinsic(GenISAIntrinsic::GenISA_typedreadMS)))
+    {
+        return true;
+    }
+    return false;
+}
+
+static inline bool IsTypedWriteOperation(const Instruction* pInst)
+{
+    const GenIntrinsicInst* pIntr = dyn_cast<GenIntrinsicInst>(pInst);
+
+    if (pIntr &&
+        (pIntr->isGenIntrinsic(GenISAIntrinsic::GenISA_typedwrite) ||
+            pIntr->isGenIntrinsic(GenISAIntrinsic::GenISA_typedwriteMS)))
+    {
+        return true;
+    }
+    return false;
+}
+
+static inline bool IsLscTGMFenceOperation(const Instruction* pInst)
+{
+    const GenIntrinsicInst* pIntr = dyn_cast<GenIntrinsicInst>(pInst);
+    if (pIntr && pIntr->isGenIntrinsic(GenISAIntrinsic::GenISA_LSCFence))
+    {
+        LSC_SFID lscMem = getImmValueEnum<LSC_SFID>(pInst->getOperand(0));
+        if(lscMem == LSC_TGM)
+            return true;
+    }
+    return false;
+}
+// Looks for TGM writes and removes the Fence instruction if there is no TGM read
+bool TrivialUnnecessaryTGMFenceElimination::runOnFunction(Function& F)
 {
     bool change = false;
+    bool foundTypedWrite = false;
+    std::vector<Instruction*> removeFence;
 
-    IGCMD::MetaDataUtils* pMdUtil = getAnalysis<MetaDataUtilsWrapper>().getMetaDataUtils();
-    if (!isEntryFunc(pMdUtil, &F))
+    for (llvm::BasicBlock& bb : F)
     {
-        // Skip if it is non-entry function.  For example, a subroutine
-        //   foo ( local int* p) { ...... store v, p; ......}
-        // in which no localMemoptimization will be performed.
-        return change;
-    }
-
-    visit(F);
-    if (!abortPass && (m_LocalLoadsToRemove.empty() ^ m_LocalStoresToRemove.empty()))
-    {
-        for (StoreInst* Inst : m_LocalStoresToRemove)
+        for (llvm::Instruction& inst : bb)
         {
-            Inst->eraseFromParent();
-            change = true;
-        }
-
-        for (LoadInst* Inst : m_LocalLoadsToRemove)
-        {
-            if (Inst->use_empty())
+            if (IsTypedWriteOperation(&inst))
             {
-                Inst->eraseFromParent();
-                change = true;
+                foundTypedWrite = true;
+            }
+            else if (foundTypedWrite && IsLscTGMFenceOperation(&inst))
+            {
+                removeFence.push_back(&inst);
+                foundTypedWrite = false;
+            }
+            else if (IsTypedReadOperation(&inst))
+            {
+                removeFence.clear();
+                // Since the Basic Blocks may not be in order, skip removing
+                // TGM Fences if there's even one typed read in a function
+                return change;
             }
         }
-
-        for (CallInst* Inst : m_LocalFencesBariersToRemove)
+    }
+    for (Instruction* Inst : removeFence)
+    {
+        if (Inst->use_empty())
         {
             Inst->eraseFromParent();
             change = true;
         }
     }
-    m_LocalStoresToRemove.clear();
-    m_LocalLoadsToRemove.clear();
-    m_LocalFencesBariersToRemove.clear();
-
     return change;
 }
 
-/*
-OCL instruction barrier(CLK_LOCAL_MEM_FENCE); is translate to two instructions
-call void @llvm.genx.GenISA.memoryfence(i1 true, i1 false, i1 false, i1 false, i1 false, i1 false, i1 true)
-call void @llvm.genx.GenISA.threadgroupbarrier()
-
-if we remove call void @llvm.genx.GenISA.memoryfence(i1 true, i1 false, i1 false, i1 false, i1 false, i1 false, i1 true)
-we must remove next instruction if it is call void @llvm.genx.GenISA.threadgroupbarrier()
-*/
-void TrivialLocalMemoryOpsElimination::findNextThreadGroupBarrierInst(Instruction& I)
-{
-    auto nextInst = I.getNextNonDebugInstruction();
-    if (isa<GenIntrinsicInst>(nextInst))
-    {
-        GenIntrinsicInst* II = cast<GenIntrinsicInst>(nextInst);
-        if (II->getIntrinsicID() == GenISAIntrinsic::GenISA_threadgroupbarrier)
-        {
-            m_LocalFencesBariersToRemove.push_back(dyn_cast<CallInst>(nextInst));
-        }
-    }
-}
-
-void TrivialLocalMemoryOpsElimination::visitLoadInst(LoadInst& I)
-{
-    if (I.getPointerAddressSpace() == ADDRESS_SPACE_LOCAL)
-    {
-        m_LocalLoadsToRemove.push_back(&I);
-    }
-    else if (I.getPointerAddressSpace() == ADDRESS_SPACE_GENERIC)
-    {
-        abortPass = true;
-    }
-}
-
-void TrivialLocalMemoryOpsElimination::visitStoreInst(StoreInst& I)
-{
-    if (I.getPointerAddressSpace() == ADDRESS_SPACE_LOCAL)
-    {
-        if (auto *GV = dyn_cast<GlobalVariable>(I.getPointerOperand()->stripPointerCasts()))
-        {
-            // Device sanitizer instrumentation pass inserts a new local memory
-            // variable and inserts store to the variable in a kernel. The
-            // variable is loaded later in no-inline functions. For this case,
-            // do not eliminate the store.
-            if (GV->getName().startswith("__Asan"))
-            {
-                return;
-            }
-        }
-        m_LocalStoresToRemove.push_back(&I);
-    }
-    else if (I.getPointerAddressSpace() == ADDRESS_SPACE_GENERIC)
-    {
-        abortPass = true;
-    }
-}
-
-bool TrivialLocalMemoryOpsElimination::isLocalBarrier(CallInst& I)
-{
-    //check arguments in call void @llvm.genx.GenISA.memoryfence(i1 true, i1 false, i1 false, i1 false, i1 false, i1 false, i1 true) if match to
-    // (i1 true, i1 false, i1 false, i1 false, i1 false, i1 false, i1 true) it is local barrier
-    std::vector<bool> argumentsOfMemoryBarrier;
-
-    for (auto arg = I.arg_begin(); arg != I.arg_end(); ++arg)
-    {
-        ConstantInt* ci = dyn_cast<ConstantInt>(arg);
-        if (ci) {
-            argumentsOfMemoryBarrier.push_back(ci->getValue().getBoolValue());
-        }
-        else {
-            // argument is not a constant, so we can't tell.
-            return false;
-        }
-    }
-
-    return argumentsOfMemoryBarrier == m_argumentsOfLocalMemoryBarrier;
-}
-
-// If any call instruction use pointer to local memory abort pass execution
-void TrivialLocalMemoryOpsElimination::anyCallInstUseLocalMemory(CallInst& I)
-{
-    Function* fn = I.getCalledFunction();
-
-    if (fn != NULL)
-    {
-        for (auto arg = fn->arg_begin(); arg != fn->arg_end(); ++arg)
-        {
-            if (arg->getType()->isPointerTy())
-            {
-                if (arg->getType()->getPointerAddressSpace() == ADDRESS_SPACE_LOCAL || arg->getType()->getPointerAddressSpace() == ADDRESS_SPACE_GENERIC) abortPass = true;
-            }
-        }
-    }
-}
-
-void TrivialLocalMemoryOpsElimination::visitCallInst(CallInst& I)
-{
-    // detect only: llvm.genx.GenISA.memoryfence(i1 true, i1 false, i1 false, i1 false, i1 false, i1 false, i1 true)
-    // (note: the first and last arguments are true)
-    // and add them with immediately following barriers to m_LocalFencesBariersToRemove
-    anyCallInstUseLocalMemory(I);
-
-    if (isa<GenIntrinsicInst>(I))
-    {
-        GenIntrinsicInst* II = cast<GenIntrinsicInst>(&I);
-        if (II->getIntrinsicID() == GenISAIntrinsic::GenISA_memoryfence)
-        {
-            if (isLocalBarrier(I))
-            {
-                m_LocalFencesBariersToRemove.push_back(&I);
-                findNextThreadGroupBarrierInst(I);
-            }
-        }
-    }
- }
-
+////////////////////////////////////////////////////////////////////////////////
 // Register pass to igc-opt
 #define PASS_FLAG2 "igc-gen-specific-pattern"
 #define PASS_DESCRIPTION2 "LastPatternMatch Pass"
@@ -2618,50 +2604,84 @@ void GenSpecificPattern::visitMul(llvm::BinaryOperator& I)
     Value* ValOp = nullptr;
     const APInt* ConstOp = nullptr;
     using namespace llvm::PatternMatch;
-    if (match(&I, m_c_Mul(m_Value(ValOp), m_APInt(ConstOp))))
-    {
-        IRBuilder<> builder(&I);
-        if (ConstOp->isPowerOf2())
-        {
-            I.replaceAllUsesWith(
-                builder.CreateShl(ValOp, (uint64_t)ConstOp->exactLogBase2()));
-            I.eraseFromParent();
-            return;
-        }
-        else if (!IGCLLVM::isNegatedPowerOf2(*ConstOp))
-            return;
+    if (!match(&I, m_c_Mul(m_Value(ValOp), m_APInt(ConstOp))))
+        return;
 
-        APInt ConstOpAbs = ConstOp->abs();
+    // Skip the optimization for mul(x, {1; -1}) - in most cases, such
+    // instances are generated within i64 emulation sequences, and the emitter
+    // is geared toward such patterns.
+    if (ConstOp->isOne() || ConstOp->isAllOnes())
+        return;
+
+    const bool HasNUW = I.hasNoUnsignedWrap();
+    const bool HasNSW = I.hasNoSignedWrap();
+    IGCLLVM::IRBuilder<> builder(&I);
+    // 2^n case
+    if (ConstOp->isPowerOf2())
+    {
         Value* Shl = builder.CreateShl(
-            ValOp, (uint64_t)ConstOpAbs.exactLogBase2());
-        for (User* UI : I.users())
-        {
-            // We're going a little further and making sure that we merge the
-            // shift result's negation with any subsequent adds:
-            //   '%shift = shl i64 %x, n'
-            //   '%res' = sub %var, %shift
-            // preventing the additional negation in between the shift and the
-            // `var` addition. This kind of a peephole optimization may not be
-            // available later down the pipeline.
-            // TODO: Consider moving this logic to add/sub visitors once the
-            // whole GenSpecificPattern iteration logic is guaranteed to allow
-            // deferred instructions.
-            Value* Addend = nullptr;
-            if (match(UI, m_c_Add(m_Specific(&I), m_Value(Addend))))
-            {
-                // Propagate the 'shl' <- 'sub' results instead. No way to
-                // erase the original adds within this pass just yet, as we'd
-                // be invalidating the InstVisitor iteration, but subsequent
-                // DCE instances will handle the orphaned instructions anyway.
-                builder.SetInsertPoint(cast<Instruction>(UI));
-                UI->replaceAllUsesWith(builder.CreateSub(Addend, Shl));
-            }
-        }
-        // Make sure to reset the insertion point for the shl negation after
-        // the possible transformations above
-        builder.SetInsertPoint(&I);
-        I.replaceAllUsesWith(builder.CreateNeg(Shl));
+            ValOp, (uint64_t)ConstOp->exactLogBase2(), "",
+            /*bool NUW=*/HasNUW, /*bool NSW=*/HasNSW);
+        I.replaceAllUsesWith(Shl);
         I.eraseFromParent();
+        return;
+    }
+
+    // -2^n case - legality checks
+    if (!ConstOp->isNegatedPowerOf2())
+        return;
+    // We cannot retain NUW semantics on a negation reliably (LLVM rightly
+    // folds 'sub nuw 0, %y' into 0). Therefore, a transformation like
+    // 'mul nuw %x, -2^n' -> 'shl nuw %x, n'; 'sub 0, %shl'
+    // would be semantically incorrect, and should be skipped.
+    if (HasNUW)
+        return;
+
+    // -2^n case - implementation
+    APInt ConstOpAbs = ConstOp->abs();
+    Value* Shl = builder.CreateShl(
+        ValOp, (uint64_t)ConstOpAbs.exactLogBase2(), "",
+        /*bool NUW=*/HasNUW, /*bool NSW=*/HasNSW);
+    Value* Neg = builder.CreateNegNoNUW(Shl, "", /*bool NSW=*/HasNSW);
+    I.replaceAllUsesWith(Neg);
+    I.eraseFromParent();
+
+    // Go a little further and make sure to merge the shift result's negation
+    // with any subsequent adds:
+    //   '%shift = shl i64 %x, n'
+    //   '%res' = sub %var, %shift
+    // preventing the additional negation in between the shift and `var`
+    // addition.
+    //
+    // TODO: Consider also folding sdiv/srem uses with a constant operand by
+    // negating said operand and using the 'shl' result directly. No reason to
+    // consider 'mul's though - in case of matching overflow flags, we'd expect
+    // these to be constant-folded with the original 'mul' earlier in the
+    // pipeline.
+    //
+    // TODO: Consider re-using an LLVM routine of some sort for this
+    // optimization. That said, on LLVM 14, llvm::SimplifyBinOp() and
+    // higher-level IRBuilder<InstSimplifyFolder>::CreateAdd()/CreateBinOp()
+    // replacements fail to work out of the box.
+    // Alternatively, move this logic to add/sub visitors once the whole
+    // GenSpecificPattern iteration logic allows for deferred instructions.
+    for (User* UI : Neg->users())
+    {
+        Value* Addend = nullptr;
+        if (!match(UI, m_c_Add(m_Specific(Neg), m_Value(Addend))))
+            continue;
+        // Propagate the 'shl' <- 'sub' results instead. No way to erase the
+        // original adds within this pass just yet, as we'd invalidate the
+        // ongoing InstVisitor iteration, however subsequent DCE instances will
+        // handle the orphaned instructions anyway.
+        auto* AddI = cast<Instruction>(UI);
+        if (AddI->hasNoSignedWrap() != HasNSW)
+            continue;
+
+        builder.SetInsertPoint(AddI);
+        Value* Sub = builder.CreateSub(Addend, Shl, "",
+            /*bool NUW=*/AddI->hasNoUnsignedWrap(), /*bool NSW=*/HasNSW);
+        AddI->replaceAllUsesWith(Sub);
     }
 }
 
@@ -6412,13 +6432,12 @@ namespace {
         StringRef getPassName() const override { return "InsertBranchOpt"; }
 
         bool runOnFunction(Function& F) override;
-        void atomicSpiltOpt(Function& F, int mode);
+        void atomicSplitOpt(Function& F, int mode);
         void ThreeWayLoadSpiltOpt(Function& F);
         void findOptCases(SelectInst* I);
         bool HasSrcFromEE(Instruction* I, uint selNum, Instruction*& loadInst);
         virtual void getAnalysisUsage(llvm::AnalysisUsage& AU) const override
         {
-            AU.setPreservesCFG();
             AU.addRequired<CodeGenContextWrapper>();
         }
     private:
@@ -6528,7 +6547,7 @@ void MergeMemFromBranchOpt::visitTypedWrite(llvm::CallInst* inst)
                     {
                         if (llvm::GenIntrinsicInst* giInst = llvm::dyn_cast<GenIntrinsicInst>(br->getPrevNode()))
                         {
-                            if (giInst->getIntrinsicID() == GenISAIntrinsic::GenISA_typedwrite)
+                            if (giInst->getIntrinsicID() == GenISAIntrinsic::GenISA_typedwrite || giInst->getIntrinsicID() == GenISAIntrinsic::GenISA_typedwriteMS)
                             {
                                 IntToPtrInst* itp0 = dyn_cast<IntToPtrInst>(inst->getOperand(0));
                                 IntToPtrInst* itp1 = dyn_cast<IntToPtrInst>(giInst->getOperand(0));
@@ -6597,7 +6616,8 @@ void MergeMemFromBranchOpt::visitCallInst(CallInst& C)
 {
     if (llvm::GenIntrinsicInst* inst = llvm::dyn_cast<GenIntrinsicInst>(&C))
     {
-        if (inst->getIntrinsicID() == GenISAIntrinsic::GenISA_typedwrite)
+        if (inst->getIntrinsicID() == GenISAIntrinsic::GenISA_typedwrite ||
+            inst->getIntrinsicID() == GenISAIntrinsic::GenISA_typedwriteMS)
         {
             visitTypedWrite(inst);
         }
@@ -7064,11 +7084,20 @@ void InsertBranchOpt::ThreeWayLoadSpiltOpt(Function& F)
     }
 }
 
-void InsertBranchOpt::atomicSpiltOpt(Function& F, int mode)
+void InsertBranchOpt::atomicSplitOpt(Function& F, int mode)
 {
+    enum Mode
+    {
+        Disable = 0x0,    // Disabled IGC\EnableAtomicBranch = 0x0
+        ZeroAdd = BIT(0), // Enabled IGC\EnableAtomicBranch = 0x1
+        UMax = BIT(1),    // Enabled IGC\EnableAtomicBranch = 0x2
+        UMin = BIT(2)     // Enabled IGC\EnableAtomicBranch = 0x4
+    };
+
     // Allow both modes to be applied
-    bool defaultMode = ( ( mode & 1 ) == 1 );
-    bool alternateUmaxMode = ( ( mode & 2 ) == 2 );
+    bool zeroAddMode = ( ( mode & ZeroAdd ) == ZeroAdd );
+    bool umaxMode = ( ( mode & UMax ) == UMax );
+    bool uminMode = ( ( mode & UMin ) == UMin );
 
     auto createReadFromAtomic = []( IRBuilder<>& builder, Instruction* inst, bool isTyped )
         {
@@ -7165,9 +7194,11 @@ void InsertBranchOpt::atomicSpiltOpt(Function& F, int mode)
 
                 AtomicOp atomicOp = static_cast<AtomicOp>(op->getZExtValue());
 
-                if( ( ( defaultMode ) && ( atomicOp == AtomicOp::EATOMIC_IADD || atomicOp == AtomicOp::EATOMIC_SUB ) )
-                    ||
-                    atomicOp == AtomicOp::EATOMIC_UMAX )
+                if( ( zeroAddMode && ( atomicOp == AtomicOp::EATOMIC_IADD ||
+                                       atomicOp == AtomicOp::EATOMIC_SUB ||
+                                       atomicOp == AtomicOp::EATOMIC_UMAX ) )
+                    || ( umaxMode && ( atomicOp == AtomicOp::EATOMIC_UMAX ) )
+                    || ( uminMode && ( atomicOp == AtomicOp::EATOMIC_UMIN ) ) )
                 {
                     atomicSplit.push_back( std::make_pair( inst, atomicOp ) );
                 }
@@ -7192,12 +7223,14 @@ void InsertBranchOpt::atomicSpiltOpt(Function& F, int mode)
         Instruction* ElseTerm = nullptr;
         BasicBlock* MergeBlock = nullptr;
 
+        bool isModified = false;
 
-        if( op != AtomicOp::EATOMIC_UMAX || !alternateUmaxMode )
+        if ( ( zeroAddMode && ( op == AtomicOp::EATOMIC_IADD || op == AtomicOp::EATOMIC_SUB ) )
+           || ( !umaxMode && ( op == AtomicOp::EATOMIC_UMAX ) ) )
         {
             // Create an if-then-else structure.
-            // if (cond!=0)
-            //    use the original atomic add inst
+            // if (cond != 0)
+            //    use the original atomic add/sub/umax inst
             // else
             //    use typedread or load
             Instruction* condInst = dyn_cast<Instruction>(builder.CreateICmp(ICmpInst::ICMP_NE, src, builder.getInt32(0)));
@@ -7206,20 +7239,27 @@ void InsertBranchOpt::atomicSpiltOpt(Function& F, int mode)
 
             builder.SetInsertPoint( ElseTerm );
             readI = createReadFromAtomic( builder, inst, isTyped);
+
+            isModified = true;
         }
-        else // ( op == AtomicOp::EATOMIC_UMAX && alternateUmaxMode )
+        else if ( ( umaxMode && ( op == AtomicOp::EATOMIC_UMAX ) )
+                || ( uminMode && ( op == AtomicOp::EATOMIC_UMIN ) ) )
         {
             // Create an if-then structure.
             // x = typedread or load
-            // if (x < src)
-            //    use the original atomic umax inst src
+            // if (src > (for UMax) or < (for Umin) x)
+            //    use the original atomic umax/umin inst src
             readI = createReadFromAtomic( builder, inst, isTyped );
-            Instruction* condInst = dyn_cast<Instruction>( builder.CreateICmp( ICmpInst::ICMP_UGT, src, readI ) );
+            CmpInst::Predicate predicate = ( op == AtomicOp::EATOMIC_UMAX ) ? ICmpInst::ICMP_UGT : ICmpInst::ICMP_ULT;
+            Instruction* condInst = dyn_cast<Instruction>( builder.CreateICmp( predicate, src, readI ) );
 
             splitBBAndName( condInst, inst, &ThenTerm, nullptr, MergeBlock );
             inst->moveBefore( ThenTerm );
+
+            isModified = true;
         }
-        if( inst->getNumUses() )
+
+        if( isModified && inst->getNumUses() )
         {
             PHINode* newPhi = PHINode::Create(inst->getType(), 2, "", &MergeBlock->front());
             inst->replaceUsesOutsideBlock(newPhi, inst->getParent());
@@ -7229,7 +7269,7 @@ void InsertBranchOpt::atomicSpiltOpt(Function& F, int mode)
     }
 }
 
-void typedWriteZeroStoreCheck(Function& F)
+void typedWriteZeroStoreCheck(Function& F, CodeGenContext* pCtx)
 {
     for (auto BI = F.begin(), BE = F.end(); BI != BE; ++BI)
     {
@@ -7240,7 +7280,8 @@ void typedWriteZeroStoreCheck(Function& F)
             //Obtain typedWrite
             if (GenIntrinsicInst* tyWrite = dyn_cast<GenIntrinsicInst>(&*II))
             {
-                if (tyWrite->getIntrinsicID() == GenISAIntrinsic::GenISA_typedwrite)
+                if (tyWrite->getIntrinsicID() == GenISAIntrinsic::GenISA_typedwrite ||
+                    tyWrite->getIntrinsicID() == GenISAIntrinsic::GenISA_typedwriteMS)
                 {
                     bool checksAreGreen = true;
 
@@ -7273,7 +7314,9 @@ void typedWriteZeroStoreCheck(Function& F)
 
                         //Check if extract elem comes from a typedRead
                         GenIntrinsicInst* tyRead = dyn_cast<GenIntrinsicInst>(eeInst[i]->getOperand(0));
-                        if (!tyRead || tyRead->getIntrinsicID() != GenISAIntrinsic::GenISA_typedread)
+                        if (!tyRead ||
+                            (tyWrite->getIntrinsicID() == GenISAIntrinsic::GenISA_typedwrite && tyRead->getIntrinsicID() != GenISAIntrinsic::GenISA_typedread) ||
+                            (tyWrite->getIntrinsicID() == GenISAIntrinsic::GenISA_typedwriteMS && tyRead->getIntrinsicID() != GenISAIntrinsic::GenISA_typedreadMS))
                         {
                             checksAreGreen = false;
                             break;
@@ -7478,7 +7521,7 @@ bool InsertBranchOpt::runOnFunction(Function& F)
     int mode = IGC_IS_FLAG_ENABLED( EnableAtomicBranch ) ? IGC_GET_FLAG_VALUE( EnableAtomicBranch ) : pContext->getModuleMetaData()->csInfo.atomicBranch;
     if( mode )
     {
-        atomicSpiltOpt( F, mode );
+        atomicSplitOpt( F, mode );
     }
 
     if (IGC_IS_FLAG_ENABLED(EnableThreeWayLoadSpiltOpt) || pContext->getModuleMetaData()->enableThreeWayLoadSpiltOpt)
@@ -7486,7 +7529,7 @@ bool InsertBranchOpt::runOnFunction(Function& F)
         ThreeWayLoadSpiltOpt(F);
     }
 
-    typedWriteZeroStoreCheck(F);
+    typedWriteZeroStoreCheck(F, pContext);
 
     return false;
 }

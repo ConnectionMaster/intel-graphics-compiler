@@ -11,6 +11,7 @@ SPDX-License-Identifier: MIT
 #define __BIF_FLAG_CONTROL_H__
 
 BIF_FLAG_CONTROL(PRODUCT_FAMILY, PlatformType)
+BIF_FLAG_CONTROL(GFXCORE_FAMILY, RenderFamily)
 BIF_FLAG_CONTROL(bool, FlushDenormals)
 BIF_FLAG_CONTROL(bool, FastRelaxedMath)
 BIF_FLAG_CONTROL(bool, DashGSpecified)
@@ -35,4 +36,5 @@ BIF_FLAG_CONTROL(bool, UseHighAccuracyMath)
 BIF_FLAG_CONTROL(bool, EnableSWSrgbWrites)
 BIF_FLAG_CONTROL(int, MaxHWThreadIDPerSubDevice)
 BIF_FLAG_CONTROL(int, JointMatrixLoadStoreOpt)
+BIF_FLAG_CONTROL(bool, UseOOBChecks)
 #endif // __BIF_FLAG_CONTROL_H__

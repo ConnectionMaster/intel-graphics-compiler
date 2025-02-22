@@ -26,6 +26,7 @@ SPDX-License-Identifier: MIT
 #include "llvm/GenXIntrinsics/GenXMetadata.h"
 
 #include <cstdint>
+#include <optional>
 #include <type_traits>
 #include <unordered_map>
 
@@ -138,6 +139,14 @@ template <typename Ty = llvm::Value> Ty *getValueAsMetadata(llvm::Metadata *M) {
   return nullptr;
 }
 
+template <typename Ty = llvm::Value>
+Ty *getValueAsMetadata(const llvm::Metadata *M) {
+  if (auto *VM = llvm::dyn_cast<llvm::ValueAsMetadata>(M))
+    if (auto *V = llvm::dyn_cast<Ty>(VM->getValue()))
+      return V;
+  return nullptr;
+}
+
 // Number of barriers can only be 0, 1, 2, 4, 8, 16, 24, 32.
 // Alignment here means choosing nearest overlapping legal number of barriers.
 static unsigned alignBarrierCnt(unsigned BarrierCnt) {
@@ -195,6 +204,13 @@ public:
     Fixed = 4,
   };
 
+  // TODO: Use SPIR-V headers.
+  enum class ExecutionMode {
+    MaximumRegistersINTEL = 6461,
+    MaximumRegistersIdINTEL = 6462,
+    NamedMaximumRegistersINTEL = 6463
+  };
+
 private:
   const llvm::Function *F = nullptr;
   llvm::MDNode *ExternalNode = nullptr;
@@ -203,6 +219,7 @@ private:
   llvm::StringRef Name;
   unsigned SLMSize = 0;
   unsigned NBarrierCnt = 0;
+  unsigned IndirectCount = 0;
   llvm::SmallVector<unsigned, 4> ArgKinds;
   llvm::SmallVector<unsigned, 4> ArgOffsets;
   llvm::SmallVector<ArgIOKind, 4> ArgIOKinds;
@@ -211,6 +228,9 @@ private:
   llvm::SmallVector<unsigned, 4> OffsetInArgs;
   std::vector<int> BTIs;
   ArgToImplicitLinearization Linearization;
+
+  // Optional SPIR-V execution mode.
+  std::optional<unsigned> GRFSize;
 
 public:
   // default constructor
@@ -238,6 +258,9 @@ public:
   void updateLinearizationMD(ArgToImplicitLinearization &&Lin);
   void updateBTIndicesMD(std::vector<int> &&BTIs);
   void updateSLMSizeMD(unsigned Size);
+  void updateIndirectCountMD(unsigned Count);
+
+  void parseExecutionMode(llvm::MDNode *SpirvExecutionMode);
 
   bool hasArgLinearization(llvm::Argument *Arg) const {
     return Linearization.count(Arg);
@@ -274,6 +297,7 @@ public:
       return alignBarrierCnt(NBarrierCnt + (HasBarrier ? 1 : 0));
     return HasBarrier;
   }
+  unsigned getIndirectCount() const { return IndirectCount; }
   llvm::ArrayRef<unsigned> getArgKinds() const { return ArgKinds; }
   llvm::ArrayRef<ArgIOKind> getArgIOKinds() const { return ArgIOKinds; }
   llvm::ArrayRef<llvm::StringRef> getArgTypeDescs() const {
@@ -286,6 +310,8 @@ public:
       return "";
     return ArgTypeDescs[Idx];
   }
+
+  std::optional<unsigned> getGRFSize() const { return GRFSize; }
 
   enum { AK_NORMAL, AK_SAMPLER, AK_SURFACE };
   RegCategory getArgCategory(unsigned Idx) const {

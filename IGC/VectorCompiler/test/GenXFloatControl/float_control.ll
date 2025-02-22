@@ -1,22 +1,36 @@
 ;=========================== begin_copyright_notice ============================
 ;
-; Copyright (C) 2024 Intel Corporation
+; Copyright (C) 2024-2025 Intel Corporation
 ;
 ; SPDX-License-Identifier: MIT
 ;
 ;============================ end_copyright_notice =============================
 
-; RUN: %opt %use_old_pass_manager% -GenXFloatControl -march=genx64 -mcpu=XeHPG \
+; RUN: %opt_typed_ptrs %use_old_pass_manager% -GenXFloatControl -march=genx64 -mcpu=XeHPG \
 ; RUN: -mtriple=spir64-unknown-unknown -S < %s | FileCheck %s
-; RUN: llc %s -march=genx64 -mcpu=XeHPG -vc-skip-ocl-runtime-info \
+; RUN: %opt_opaque_ptrs %use_old_pass_manager% -GenXFloatControl -march=genx64 -mcpu=XeHPG \
+; RUN: -mtriple=spir64-unknown-unknown -S < %s | FileCheck %s
+; RUN: %llc_typed_ptrs %s -march=genx64 -mcpu=XeHPG -vc-skip-ocl-runtime-info \
+; RUN: -finalizer-opts='-dumpcommonisa -isaasmToConsole' -o /dev/null | \
+; RUN: FileCheck %s --check-prefix=CHECK-VISA
+; RUN: %llc_opaque_ptrs %s -march=genx64 -mcpu=XeHPG -vc-skip-ocl-runtime-info \
 ; RUN: -finalizer-opts='-dumpcommonisa -isaasmToConsole' -o /dev/null | \
 ; RUN: FileCheck %s --check-prefix=CHECK-VISA
 
 ; CHECK-LABEL: define dllexport spir_kernel void @kernel
-; CHECK-NOT: predef
+; CHECK-NEXT: [[AND_READ_PREDEF:[^ ]+]] = call <4 x i32> @llvm.genx.read.predef.reg.v4i32.v4i32(i32 14, <4 x i32> undef)
+; CHECK-NEXT: [[AND_RDREGION:[^ ]+]] = call i32 @llvm.genx.rdregioni.i32.v4i32.i16(<4 x i32> [[AND_READ_PREDEF]], i32 0, i32 1, i32 1, i16 0, i32 undef)
+; CHECK-NEXT: [[AND:[^ ]+]] = and i32 [[AND_RDREGION]], -1265
+; CHECK-NEXT: [[AND_WRREGION:[^ ]+]] = call <4 x i32> @llvm.genx.wrregioni.v4i32.i32.i16.i1(<4 x i32> [[AND_READ_PREDEF]], i32 [[AND]], i32 0, i32 1, i32 1, i16 0, i32 undef, i1 true)
+; CHECK-NEXT: call <4 x i32> @llvm.genx.write.predef.reg.v4i32.v4i32(i32 14, <4 x i32> [[AND_WRREGION]])
+; CHECK-NEXT: [[OR_READ_PREDEF:[^ ]+]] = call <4 x i32> @llvm.genx.read.predef.reg.v4i32.v4i32(i32 14, <4 x i32> undef)
+; CHECK-NEXT: [[OR_RDREGION:[^ ]+]] = call i32 @llvm.genx.rdregioni.i32.v4i32.i16(<4 x i32> [[OR_READ_PREDEF]], i32 0, i32 1, i32 1, i16 0, i32 undef)
+; CHECK-NEXT: [[OR:[^ ]+]] = or i32 [[OR_RDREGION]], 1216
+; CHECK-NEXT: [[OR_WRREGION:[^ ]+]] = call <4 x i32> @llvm.genx.wrregioni.v4i32.i32.i16.i1(<4 x i32> [[OR_READ_PREDEF]], i32 [[OR]], i32 0, i32 1, i32 1, i16 0, i32 undef, i1 true)
 ; CHECK:     ret
 ; CHECK-VISA-LABEL: .function "kernel_BB_0"
-; CHECK-VISA-NOT:  %cr0
+; CHECK-VISA:      and (M1, 1) %cr0(0,0)<1> %cr0(0,0)<0;1,0> 0xfffffb0f:d
+; CHECK-VISA-NEXT: or (M1, 1) %cr0(0,0)<1> %cr0(0,0)<0;1,0> 0x4c0:d
 ; CHECK-VISA:      ret (M1, 1)
 define dllexport spir_kernel void @kernel(i32 %a, i64 %privBase) #0 {
   call spir_func i32 @stackcall(i32 %a) #1

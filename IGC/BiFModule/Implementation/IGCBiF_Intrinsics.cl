@@ -93,18 +93,23 @@ __global void* __builtin_IB_convert_pipe_wo_to_intel_pipe(write_only pipe int);
 // Image writes
 void     __builtin_IB_write_1darr_u1i(int, int2, uint, int);
 void     __builtin_IB_write_1darr_u2i(int, int2, uint2, int);
+void     __builtin_IB_write_1darr_u3i(int, int2, uint3, int);
 void     __builtin_IB_write_1darr_u4i(int, int2, uint4, int);
 void     __builtin_IB_write_1d_u1i(int, int, uint, int);
 void     __builtin_IB_write_1d_u2i(int, int, uint2, int);
+void     __builtin_IB_write_1d_u3i(int, int, uint3, int);
 void     __builtin_IB_write_1d_u4i(int, int, uint4, int);
 void     __builtin_IB_write_2darr_u1i(int, int3, uint, int);
 void     __builtin_IB_write_2darr_u2i(int, int3, uint2, int);
+void     __builtin_IB_write_2darr_u3i(int, int3, uint3, int);
 void     __builtin_IB_write_2darr_u4i(int, int3, uint4, int);
 void     __builtin_IB_write_2d_u1i(int, int2, uint, int);
 void     __builtin_IB_write_2d_u2i(int, int2, uint2, int);
+void     __builtin_IB_write_2d_u3i(int, int2, uint3, int);
 void     __builtin_IB_write_2d_u4i(int, int2, uint4, int);
 void     __builtin_IB_write_3d_u1i(int, int3, uint, int);
 void     __builtin_IB_write_3d_u2i(int, int3, uint2, int);
+void     __builtin_IB_write_3d_u3i(int, int3, uint3, int);
 void     __builtin_IB_write_3d_u4i(int, int3, uint4, int);
 void     __builtin_IB_write_2darr_f(int, int4, float4, int);
 void     __builtin_IB_write_2d_f(int, int2, float4, int);
@@ -516,6 +521,7 @@ uint  __builtin_IB_get_image_bti(uint img);
 
 // ballot intrinsic
 uint __builtin_IB_WaveBallot(bool p);
+uint __builtin_IB_clustered_WaveBallot(bool p, uint cluster_size);
 
 // VA
 void   __builtin_IB_va_erode_64x4( __local uchar* dst, float2 coords, int srcImgId, int i_accelerator );
@@ -565,6 +571,15 @@ float   __builtin_IB_simd_broadcast_f(     float,  uint );
 half    __builtin_IB_simd_broadcast_h(     half,   uint );
 double  __builtin_IB_simd_broadcast_df(    double, uint );
 void    __builtin_IB_sub_group_barrier();
+
+// SubGroup clustered broadcast - for internal use
+uint   __builtin_IB_simd_clustered_broadcast(    uint,   uint, uint );
+bool   __builtin_IB_simd_clustered_broadcast_b(  bool,   uint, uint );
+uchar  __builtin_IB_simd_clustered_broadcast_c(  uchar,  uint, uint );
+ushort __builtin_IB_simd_clustered_broadcast_us( ushort, uint, uint );
+float  __builtin_IB_simd_clustered_broadcast_f(  float,  uint, uint );
+half   __builtin_IB_simd_clustered_broadcast_h(  half,   uint, uint );
+double __builtin_IB_simd_clustered_broadcast_df( double, uint, uint );
 
 // Block read : global address space
 uint    __builtin_IB_simd_block_read_1_global( const __global uint* );
@@ -791,10 +806,10 @@ void __builtin_IB_media_block_write_ulong2(int image, int2 offset, int width, in
 void __builtin_IB_media_block_write_ulong4(int image, int2 offset, int width, int height, ulong4 pixels);
 void __builtin_IB_media_block_write_ulong8(int image, int2 offset, int width, int height, ulong8 pixels);
 
-int __builtin_IB_dp4a_ss(int c, int a, int b) __attribute__((const));
-int __builtin_IB_dp4a_uu(int c, int a, int b) __attribute__((const));
-int __builtin_IB_dp4a_su(int c, int a, int b) __attribute__((const));
-int __builtin_IB_dp4a_us(int c, int a, int b) __attribute__((const));
+int __builtin_IB_dp4a_ss(int c, int a, int b, bool isSaturated) __attribute__((const));
+int __builtin_IB_dp4a_uu(int c, int a, int b, bool isSaturated) __attribute__((const));
+int __builtin_IB_dp4a_su(int c, int a, int b, bool isSaturated) __attribute__((const));
+int __builtin_IB_dp4a_us(int c, int a, int b, bool isSaturated) __attribute__((const));
 
 #define DECL_SUB_GROUP_OPERATION(type, type_abbr, operation, group_type)  \
 type   __builtin_IB_sub_group_##group_type##_##operation##_##type_abbr(type x) __attribute__((const));
@@ -887,6 +902,26 @@ DECL_SUB_GROUP_ALL_GROUPS(type, type_abbr, LogicalOrKHR)   \
 DECL_SUB_GROUP_ALL_GROUPS(type, type_abbr, LogicalXorKHR)
 
 DECL_LOGICAL_OPERATIONS(bool, i1)
+
+// __builtin_IB_sub_group_clustered_scan_IAdd/FAdd
+//
+// At the moment only Add operation is supported for clustered scan.
+// If functionality is extended to match (non-clustered) scan, the macro
+// should be moved to DECL_SUB_GROUP_ALL_GROUPS.
+#define DECL_SUB_GROUP_CLUSTERED_ADD(type, type_abbr, type_sign) \
+type __builtin_IB_sub_group_clustered_scan_##type_sign##Add_##type_abbr(type x, uint cluster_size) __attribute__((const));
+
+DECL_SUB_GROUP_CLUSTERED_ADD(char,   i8,  I)
+DECL_SUB_GROUP_CLUSTERED_ADD(short,  i16, I)
+DECL_SUB_GROUP_CLUSTERED_ADD(int,    i32, I)
+DECL_SUB_GROUP_CLUSTERED_ADD(long,   i64, I)
+DECL_SUB_GROUP_CLUSTERED_ADD(float,  f32, F)
+#if defined(cl_khr_fp64)
+DECL_SUB_GROUP_CLUSTERED_ADD(double, f64, F)
+#endif // defined(cl_khr_fp64)
+#if defined(cl_khr_fp16)
+DECL_SUB_GROUP_CLUSTERED_ADD(half,   f16, F)
+#endif // defined(cl_khr_fp16)
 
 // The following mul/fma with rtz is used internally for int div/rem emulation
 // x * y, using round-to-zero

@@ -203,6 +203,8 @@ set(GenX_Common_Sources_G4_IRBuilder
 set(GenX_Common_Sources_G4_Passes
   Passes/AccSubstitution.cpp
   Passes/AccSubstitution.hpp
+  Passes/SRSubstitution.cpp
+  Passes/SRSubstitution.hpp
   Passes/InstCombine.cpp
   Passes/InstCombine.hpp
   Passes/LVN.cpp
@@ -471,14 +473,7 @@ if (UNIX OR WIN32)
   #set up standard defines from the common WDK path.
   bs_set_wdk(GenX_IR_Exe)
   endif()
-  if(CMAKE_SIZEOF_VOID_P EQUAL 8) #Install only for 64bit
-    # Install GENX_IR binary or not
-    # -DINSTALL_GENX_IR=ON could be used to turn this option on.
-    option(INSTALL_GENX_IR "install GENX_IR or not" ON)
-    if (UNIX AND INSTALL_GENX_IR)
-      install(TARGETS GenX_IR_Exe RUNTIME DESTINATION ${CMAKE_INSTALL_FULL_BINDIR} COMPONENT igc-media)
-    endif ()
-  endif()
+
 
 endif(UNIX OR WIN32)
 

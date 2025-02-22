@@ -40,6 +40,7 @@ typedef enum {
     IGFX_ARROWLAKE = 1273,
     IGFX_BMG = 1274,
     IGFX_LUNARLAKE = 1275,
+    IGFX_PTL = 1300,
     IGFX_MAX_PRODUCT,
 
 
@@ -92,6 +93,7 @@ typedef enum {
     IGFX_XE_HPG_CORE = 0x0c07,  // XE_HPG Family
     IGFX_XE_HPC_CORE = 0x0c08,  // XE_HPC Family
     IGFX_XE2_HPG_CORE = 0x0c09, // XE2_HPG Family
+    IGFX_XE3_CORE     = 0x1e00,  // XE3 Family
     IGFX_MAX_CORE,              // Max Family, for lookup table
 
     IGFX_GENNEXT_CORE          = 0x7ffffffe,  //GenNext
@@ -153,6 +155,9 @@ typedef struct GFX_GMD_ID_DEF
 
 #define GFX_GMD_ARCH_20_RELEASE_XE2_HPG_X2               (1)
 #define GFX_GMD_ARCH_20_RELEASE_XE2_LPG                  (4)
+
+#define GFX_GMD_ARCH_30_RELEASE_XE3_LPG_3000             (0)
+#define GFX_GMD_ARCH_30_RELEASE_XE3_LPG_3001             (1)
 
 #define GFX_GET_GMD_RELEASE_VERSION_RENDER(p)             ((p).sRenderBlockID.GmdID.GMDRelease)
 #define GFX_GET_GMD_RELEASE_VERSION_DISPLAY(p)            ((p).sDisplayBlockID.GmdID.GMDRelease)
@@ -743,6 +748,26 @@ typedef enum __NATIVEGTTYPE
 #define DEV_ID_0BDB                            0x0BDB
 #define DEV_ID_0B69                            0x0B69
 #define DEV_ID_0B6E                            0x0B6E
+
+// BMG
+#define DEV_ID_E202                             0xE202
+#define DEV_ID_E20B                             0xE20B
+#define DEV_ID_E20C                             0xE20C
+#define DEV_ID_E20D                             0xE20D
+#define DEV_ID_E210                             0xE210
+#define DEV_ID_E212                             0xE212
+#define DEV_ID_E215                             0xE215
+#define DEV_ID_E216                             0xE216
+
+// PTL
+#define DEV_ID_B080                             0xB080
+#define DEV_ID_B081                             0xB081
+#define DEV_ID_B082                             0xB082
+#define DEV_ID_B083                             0xB083
+#define DEV_ID_B08F                             0xB08F
+#define DEV_ID_B090                             0xB090
+#define DEV_ID_B0A0                             0xB0A0
+#define DEV_ID_B0B0                             0xB0B0
 
 #define GFX_IS_DG2_G11_CONFIG(d) ( ( d == DEV_ID_56A5 )             ||   \
                                  ( d == DEV_ID_56A6 )             ||   \

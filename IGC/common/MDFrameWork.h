@@ -59,6 +59,10 @@ namespace IGC
     };
 
 #include "RaytracingShaderTypes.h" // ^MDFramework^: .
+enum class ShaderTypeMD
+{
+#include "ShaderTypesIncl.h" // ^MDFramework^: .
+};
 
     enum ResourceTypeEnum
     {
@@ -216,8 +220,6 @@ namespace IGC
     // when generating structured accesses to the Raytracing SW Stack.
     struct RayTracingSWTypes
     {
-        std::vector<llvm::StructType*> FrameStartTys;
-        std::vector<llvm::StructType*> ArgumentTys;
         std::vector<llvm::StructType*> FullFrameTys;
     };
 
@@ -446,7 +448,11 @@ namespace IGC
         bool DisableConstantCoalescing                  = false;
         bool EnableUndefAlphaOutputAsRed                = true;
         bool WaEnableALTModeVisaWA                      = false;
+        bool EnableLdStCombineforLoad                   = false;
+        bool EnableLdStCombinewithDummyLoad             = false;
+        bool EnableIndependentSharedMemoryFenceFunctionality = false;
         bool NewSpillCostFunction                       = false;
+        bool EnableVRT                                  = false;
         bool ForceLargeGRFNum4RQ                        = false;
         bool DisableEUFusion                            = false;
         bool DisableFDivToFMulInvOpt                    = false;
@@ -459,7 +465,9 @@ namespace IGC
         bool ForceLinearWalkOnLinearUAV                 = false;
         bool DisableLscSamplerRouting                   = false;
         bool UseBarrierControlFlowOptimization          = false;
-        bool disableDynamicRQManagement                 = false;
+        bool DisableDynamicRQManagement                 = false;
+        unsigned Quad8InputThreshold                    = 0;
+        bool UseResourceLoopUnrollNested                = false;
     };
 
     enum class ThreadIDLayout
@@ -761,6 +769,9 @@ namespace IGC
         //when true, compiler disables scratch space slot0/slot1 sizes workaround
         bool disableSeparateScratchWA = false;
 
+        // When true, runs TrivialUnnecessaryTGMFenceElimination optimization
+        bool enableRemoveUnusedTGMFence = false;
+
         unsigned int privateMemoryPerWI = 0;
 
         llvm::MapVector<llvm::Function*, unsigned int> PrivateMemoryPerFG;
@@ -780,6 +791,14 @@ namespace IGC
         uint8_t SIMD32_SpillThreshold = 0;
 
         CacheControlOverride m_CacheControlOption;
+
+        // Set to true by StatelessToStateful(Bindless) if any instruction in
+        // a module was promoted to stateless. Used to avoid bindless and bindful
+        // mode in one module.
+        bool ModuleUsesBindless = false;
+
+        llvm::MapVector<llvm::Value*, llvm::Value*> predicationMap;
+        llvm::MapVector<llvm::Value*, llvm::Value*> lifeTimeStartMap;
     };
 
     void serialize(const IGC::ModuleMetaData &moduleMD, llvm::Module* module);

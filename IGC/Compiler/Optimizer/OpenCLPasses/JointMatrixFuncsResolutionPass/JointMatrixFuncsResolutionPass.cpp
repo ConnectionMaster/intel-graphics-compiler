@@ -226,6 +226,14 @@ bool JointMatrixFuncsResolutionPass::runOnModule(Module &M)
         Changed |= runOnFunction(F);
     }
 
+    for (const auto& ResolvedFunctionPair : ResolvedFuncSignatures) {
+        Function *OriginalFunction = ResolvedFunctionPair.first;
+
+        if (OriginalFunction->use_empty()) {
+            OriginalFunction->eraseFromParent();
+        }
+    }
+
     return Changed;
 }
 
@@ -609,6 +617,7 @@ static SupportedParams getSupportedParams(const JointMatrixTypeDescription *desc
         params.columns = maxSliceBitWidth / desc->bitWidth;
         params.bitWidth |= 16;
         params.layouts = 1 << LayoutRowMajor;
+        params.layouts |= 1 << LayoutColumnMajor;
     } else if (desc->layout == LayoutPackedB) {
         params.rows = maxSliceBitWidth / desc->bitWidth;
         params.columns = useSG16 ? 16 : 8;
@@ -671,6 +680,8 @@ static const char *nameLayout(unsigned layout) {
     }
 }
 
+// TODO: Get rid of this function and update ValidateLoadStore and Validate2DBlockLoadStore
+// accordingly.
 static bool isSupprtedLargeSlice(const JointMatrixTypeDescription *desc, bool useSG16) {
     if (!useSG16) {
         if(desc->layout == LayoutPackedA) {
@@ -689,14 +700,17 @@ static bool isSupprtedLargeSlice(const JointMatrixTypeDescription *desc, bool us
     }
 
     if (desc->layout == LayoutPackedA) {
-        if (desc->rows == 16 && desc->columns == 16 && desc->bitWidth == 16)
-            return true;
-        if (desc->rows == 32 && desc->columns == 16 && desc->bitWidth == 16)
-            return true;
+        if (desc->bitWidth != 16) return false;
+        if (desc->rows ==  1 && desc->columns == 32) return true;
+        if (desc->rows == 16 && desc->columns == 16) return true;
+        if (desc->rows == 32 && desc->columns == 16) return true;
+        if (desc->rows == 32 && desc->columns == 32) return true;
     }
 
     if (desc->layout == LayoutPackedB) {
         if (desc->rows == 16 && desc->columns == 64 && desc->bitWidth == 16)
+            return true;
+        if (desc->rows == 32 && desc->columns == 64 && desc->bitWidth == 16)
             return true;
     }
 
@@ -712,6 +726,8 @@ static bool isSupprtedLargeSlice(const JointMatrixTypeDescription *desc, bool us
     return false;
 }
 
+// TODO: Currently this function doesn't take into account large slices, when reporting
+// supported parameters. This should be fixed.
 bool JointMatrixFuncsResolutionPass::ValidateLoadStore
         (bool isLoad, unsigned operationLayout, const JointMatrixTypeDescription *desc, Value *ctx) {
     if (isSupprtedLargeSlice(desc, m_Ctx->platform.hasExecSize16DPAS())) {
@@ -840,25 +856,9 @@ void JointMatrixFuncsResolutionPass::Validate2DBlockLoadStore(GetMatrixFuncNameO
         }
     }
 
-    if (operation == LoadChecked) {
-        if (m_SIMDSize == 32 && !(operationLayout == LayoutRowMajor && desc->bitWidth == 32 && desc->columns == 16)) {
-            std::string msg = "Unsupported parameters for matrix " + operationName + " with SIMD size 32, layout: " + std::to_string(operationLayout) +
-                              ", element size: " + std::to_string(desc->bitWidth) + ", number of columns: " + std::to_string(desc->columns) + ".";
-            m_Ctx->EmitError(msg.c_str(), ctx);
-        }
-    }
     if (operation == StoreChecked) {
-        if (m_SIMDSize == 32) {
-            std::string msg = "Matrix " + operationName + " is not supported for SIMD size 32.";
-            m_Ctx->EmitError(msg.c_str(), ctx);
-        }
         if (operationLayout == LayoutColumnMajor) {
             std::string msg = "Matrix " + operationName + " is not supported for ColumnMajor layout.";
-            m_Ctx->EmitError(msg.c_str(), ctx);
-        }
-        if (getNumRowsPerWI(desc) < desc->rows) {
-            std::string msg = "Unsupported matrix size for " + operationName + ", element size: " + std::to_string(desc->bitWidth)
-             + ", number of rows: " + std::to_string(desc->rows) + ", number of columns: " + std::to_string(desc->columns) + ".";
             m_Ctx->EmitError(msg.c_str(), ctx);
         }
     }
@@ -1164,11 +1164,12 @@ static Type* getAccFloatVec64Type(LLVMContext &ctx) {
     return IGCLLVM::FixedVectorType::get(Type::getFloatTy(ctx), 64);
 }
 
-// Check if it is one off special case: Accumulator 32x64.
+// Check if it is special case: Accumulator 32x64.
 static bool isAccumulator32x64(const JointMatrixTypeDescription &desc) {
     return (desc.layout == LayoutRowMajor && desc.rows == 32 && desc.columns == 64);
 }
-// Check if it is one off special case: Accumulator 32x32.
+
+// Check if it is special case: Accumulator 32x32.
 static bool isAccumulator32x32(const JointMatrixTypeDescription &desc) {
     return (desc.layout == LayoutRowMajor && desc.rows == 32 && desc.columns == 32);
 }
@@ -1205,7 +1206,7 @@ Type *JointMatrixFuncsResolutionPass::ResolveType(Type *opaqueType, JointMatrixT
     if (outDesc != nullptr)
         *outDesc = desc;
 
-    // One off special case: this should ideally be a vector of <float x 128>. However since IGC
+    // Special case: this should ideally be a vector of <float x 128>. However since IGC
     // code gen supports vector operations only on vectors up to 64
     // entries, we model this slice as structure of {<float x 64>, <float x 64>}.
     // Alternative approaches summary:
@@ -1523,14 +1524,12 @@ static const char *getElementName(PrecisionType P) {
 }
 
 static bool isMADSupportedAsBuiltin(unsigned M, unsigned N, unsigned K) {
-    if (M == 16 && N == 16 && K == 16)
-        return true;
-    if (M == 32 && N == 32 && K == 16)
-        return true;
-    if (M == 32 && N == 64 && K == 16)
-        return true;
-    if (M == 1 && N == 64 && K == 16)
-        return true;
+    if (M == 1  && N == 64 && K == 16) return true;
+    if (M == 1  && N == 64 && K == 32) return true;
+    if (M == 16 && N == 16 && K == 16) return true;
+    if (M == 32 && N == 32 && K == 16) return true;
+    if (M == 32 && N == 64 && K == 16) return true;
+    if (M == 32 && N == 64 && K == 32) return true;
     return false;
 }
 
@@ -1692,8 +1691,7 @@ Instruction *JointMatrixFuncsResolutionPass::ResolveMad(CallInst *CI, unsigned O
 
 template <class BuilderT>
 static Type *getResolvedVectorElementType(Type *matrixType, BuilderT *builder) {
-    IGCLLVM::FixedVectorType *ty = dyn_cast<IGCLLVM::FixedVectorType>(matrixType);
-    if (ty && ty->getNumElements() <= 32)
+    if (IGCLLVM::FixedVectorType *ty = dyn_cast<IGCLLVM::FixedVectorType>(matrixType))
         return ty->getElementType();
     if (matrixType->isIntegerTy() || matrixType->isFloatingPointTy())
         return matrixType;
@@ -1825,7 +1823,10 @@ Instruction *JointMatrixFuncsResolutionPass::ResolveFillChecked(CallInst *CI)
      * have a single set of store builtins for floats and integer */
     Value *fillValueCast = builder.CreateBitCast(fillValue, Type::getIntNTy(builder.getContext(), desc.bitWidth));
 
-    std::string funcName = "__builtin_spriv_OpJointMatrixFillCheckedINTEL_i" + std::to_string(desc.bitWidth) + "_" + std::to_string(getNumRowsPerWI(&desc));
+    std::string funcName = "__builtin_spirv_OpJointMatrixFillCheckedINTEL_i" + std::to_string(desc.bitWidth) +
+                           "_i" + std::to_string(desc.contribBitWidth) +
+                           "_k" + std::to_string(desc.columns) +
+                           "_wi" + std::to_string(getNumRowsPerWI(&desc));
     FunctionType *funcType = FunctionType::get(retTy, { arrayTy, yVal->getType(), xVal->getType(),
             heightVal->getType(), widthVal->getType(), fillValueCast->getType() }, false);
     std::vector<Value *> Args = { dst, yVal, xVal, heightVal, widthVal, fillValueCast };
@@ -2673,10 +2674,10 @@ DIType* getOrCreateType(Type* T, Module* M) {
             align = IGCLLVM::getPrefTypeAlign(Layout, T).value();
         #endif
 
-        Optional<unsigned int> opt(llvm::None);
+        std::optional<unsigned int> opt(std::nullopt);
         diType = Builder.createPointerType(
                 nullptr, Layout.getPointerTypeSizeInBits(T),
-                align * CHAR_BIT, /*DWARFAddressSpace=*/opt,
+                align * CHAR_BIT, /*DWARFAddressSpace=*/IGCLLVM::makeLLVMOptional(opt),
                 getTypeName(T));
     }
     else

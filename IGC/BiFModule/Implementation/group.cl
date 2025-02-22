@@ -2229,6 +2229,10 @@ short SPIRV_OVERLOADABLE SPIRV_BUILTIN(GroupNonUniformBroadcast, _i32_i16_i32, )
 {
     if (Execution == Subgroup)
     {
+        if(BIF_FLAG_CTRL_GET(UseOOBChecks))
+        {
+            Id = Id & (get_max_sub_group_size() - 1);
+        }
         return as_ushort(__builtin_IB_simd_shuffle_h(as_half(Value), Id));
     }
     else
@@ -2292,6 +2296,10 @@ double SPIRV_OVERLOADABLE SPIRV_BUILTIN(GroupNonUniformBroadcast, _i32_f64_i32, 
 {
     if (Execution == Subgroup)
     {
+        if(BIF_FLAG_CTRL_GET(UseOOBChecks))
+        {
+            Id = Id & (get_max_sub_group_size() - 1);
+        }
         return __builtin_IB_simd_shuffle_df( Value, Id );
     }
     else
@@ -3221,6 +3229,10 @@ double SPIRV_OVERLOADABLE SPIRV_BUILTIN(GroupNonUniformShuffle, _i32_f64_i32, )(
 {
     if (Execution == Subgroup)
     {
+        if(BIF_FLAG_CTRL_GET(UseOOBChecks))
+        {
+            c = c & (get_max_sub_group_size() - 1);
+        }
         return __builtin_IB_simd_shuffle_df(x, c);
     }
     return 0;
@@ -3232,10 +3244,26 @@ half SPIRV_OVERLOADABLE SPIRV_BUILTIN(GroupNonUniformShuffle, _i32_f16_i32, )(in
 {
     if (Execution == Subgroup)
     {
+        if(BIF_FLAG_CTRL_GET(UseOOBChecks))
+        {
+            c = c & (get_max_sub_group_size() - 1);
+        }
         return __builtin_IB_simd_shuffle_h(x, c);
     }
     return 0;
 }
+#endif // defined(cl_khr_fp16)
+
+GENERATE_SPIRV_VECTOR_FUNCTIONS_3ARGS_SVS(GroupNonUniformShuffle, char,   int, char,   uint, i32, i8,  i32)
+GENERATE_SPIRV_VECTOR_FUNCTIONS_3ARGS_SVS(GroupNonUniformShuffle, short,  int, short,  uint, i32, i16, i32)
+GENERATE_SPIRV_VECTOR_FUNCTIONS_3ARGS_SVS(GroupNonUniformShuffle, int,    int, int,    uint, i32, i32, i32)
+GENERATE_SPIRV_VECTOR_FUNCTIONS_3ARGS_SVS(GroupNonUniformShuffle, long,   int, long,   uint, i32, i64, i32)
+GENERATE_SPIRV_VECTOR_FUNCTIONS_3ARGS_SVS(GroupNonUniformShuffle, float,  int, float,  uint, i32, f32, i32)
+#if defined(cl_khr_fp64)
+GENERATE_SPIRV_VECTOR_FUNCTIONS_3ARGS_SVS(GroupNonUniformShuffle, double, int, double, uint, i32, f64, i32)
+#endif // defined(cl_khr_fp64)
+#if defined(cl_khr_fp16)
+GENERATE_SPIRV_VECTOR_FUNCTIONS_3ARGS_SVS(GroupNonUniformShuffle, half,   int, half,   uint, i32, f16, i32)
 #endif // defined(cl_khr_fp16)
 
 #define DEFN_SUB_GROUP_SHUFFLE_XOR(TYPE, TYPE_ABBR)                                                             \
@@ -3243,7 +3271,9 @@ TYPE SPIRV_OVERLOADABLE SPIRV_BUILTIN(GroupNonUniformShuffleXor, _i32_##TYPE_ABB
 {                                                                                                               \
     c = get_sub_group_local_id() ^ c;                                                                           \
     return SPIRV_BUILTIN(GroupNonUniformShuffle, _i32_##TYPE_ABBR##_i32, )(Execution, x, c);                    \
-}
+}                                                                                                               \
+GENERATE_SPIRV_VECTOR_FUNCTIONS_3ARGS_SVS(GroupNonUniformShuffleXor, TYPE, int, TYPE, uint, i32, TYPE_ABBR, i32)
+
 
 DEFN_SUB_GROUP_SHUFFLE_XOR(char,   i8)
 DEFN_SUB_GROUP_SHUFFLE_XOR(short,  i16)
@@ -3264,6 +3294,10 @@ char SPIRV_OVERLOADABLE SPIRV_BUILTIN(GroupNonUniformShuffleDown, _i32_i8_i32, )
 {
     if (Execution == Subgroup)
     {
+        if(BIF_FLAG_CTRL_GET(UseOOBChecks))
+        {
+            c = c & (get_max_sub_group_size() - 1);
+        }
         return __builtin_IB_simd_shuffle_down_uc(x, 0, c);
     }
     return 0;
@@ -3273,6 +3307,10 @@ short SPIRV_OVERLOADABLE SPIRV_BUILTIN(GroupNonUniformShuffleDown, _i32_i16_i32,
 {
     if (Execution == Subgroup)
     {
+        if(BIF_FLAG_CTRL_GET(UseOOBChecks))
+        {
+            c = c & (get_max_sub_group_size() - 1);
+        }
         return __builtin_IB_simd_shuffle_down_us(x, 0, c);
     }
     return 0;
@@ -3282,6 +3320,10 @@ int SPIRV_OVERLOADABLE SPIRV_BUILTIN(GroupNonUniformShuffleDown, _i32_i32_i32, )
 {
     if (Execution == Subgroup)
     {
+        if(BIF_FLAG_CTRL_GET(UseOOBChecks))
+        {
+            c = c & (get_max_sub_group_size() - 1);
+        }
         return __builtin_IB_simd_shuffle_down(x, 0, c);
     }
     return 0;
@@ -3291,6 +3333,10 @@ long SPIRV_OVERLOADABLE SPIRV_BUILTIN(GroupNonUniformShuffleDown, _i32_i64_i32, 
 {
     if (Execution == Subgroup)
     {
+        if(BIF_FLAG_CTRL_GET(UseOOBChecks))
+        {
+            c = c & (get_max_sub_group_size() - 1);
+        }
         uint2 X = as_uint2(x);
         uint2 result = (uint2)(__builtin_IB_simd_shuffle_down(X.s0, 0, c),
             __builtin_IB_simd_shuffle_down(X.s1, 0, c));
@@ -3303,6 +3349,10 @@ float SPIRV_OVERLOADABLE SPIRV_BUILTIN(GroupNonUniformShuffleDown, _i32_f32_i32,
 {
     if (Execution == Subgroup)
     {
+        if(BIF_FLAG_CTRL_GET(UseOOBChecks))
+        {
+            c = c & (get_max_sub_group_size() - 1);
+        }
         return as_float(__builtin_IB_simd_shuffle_down(as_uint(x), 0, c));
     }
     return 0;
@@ -3313,6 +3363,10 @@ double SPIRV_OVERLOADABLE SPIRV_BUILTIN(GroupNonUniformShuffleDown, _i32_f64_i32
 {
     if (Execution == Subgroup)
     {
+        if(BIF_FLAG_CTRL_GET(UseOOBChecks))
+        {
+            c = c & (get_max_sub_group_size() - 1);
+        }
         uint2 X = as_uint2(x);
         uint2 result = (uint2)(__builtin_IB_simd_shuffle_down(X.s0, 0, c),
             __builtin_IB_simd_shuffle_down(X.s1, 0, c));
@@ -3327,11 +3381,28 @@ half SPIRV_OVERLOADABLE SPIRV_BUILTIN(GroupNonUniformShuffleDown, _i32_f16_i32, 
 {
     if (Execution == Subgroup)
     {
+        if(BIF_FLAG_CTRL_GET(UseOOBChecks))
+        {
+            c = c & (get_max_sub_group_size() - 1);
+        }
         return as_half(__builtin_IB_simd_shuffle_down_us(as_ushort(x), 0, c));
     }
     return 0;
 }
 #endif // defined(cl_khr_fp16)
+
+GENERATE_SPIRV_VECTOR_FUNCTIONS_3ARGS_SVS(GroupNonUniformShuffleDown, char,   int, char,   uint, i32, i8,  i32)
+GENERATE_SPIRV_VECTOR_FUNCTIONS_3ARGS_SVS(GroupNonUniformShuffleDown, short,  int, short,  uint, i32, i16, i32)
+GENERATE_SPIRV_VECTOR_FUNCTIONS_3ARGS_SVS(GroupNonUniformShuffleDown, int,    int, int,    uint, i32, i32, i32)
+GENERATE_SPIRV_VECTOR_FUNCTIONS_3ARGS_SVS(GroupNonUniformShuffleDown, long,   int, long,   uint, i32, i64, i32)
+GENERATE_SPIRV_VECTOR_FUNCTIONS_3ARGS_SVS(GroupNonUniformShuffleDown, float,  int, float,  uint, i32, f32, i32)
+#if defined(cl_khr_fp64)
+GENERATE_SPIRV_VECTOR_FUNCTIONS_3ARGS_SVS(GroupNonUniformShuffleDown, double, int, double, uint, i32, f64, i32)
+#endif // defined(cl_khr_fp64)
+#if defined(cl_khr_fp16)
+GENERATE_SPIRV_VECTOR_FUNCTIONS_3ARGS_SVS(GroupNonUniformShuffleDown, half,   int, half,   uint, i32, f16, i32)
+#endif // defined(cl_khr_fp16)
+
 
 // Shuffle up functions
 #define DEFN_NON_UNIFORM_SHUFFLE_UP(TYPE, TYPE_ABBR)                                                                        \
@@ -3339,10 +3410,15 @@ TYPE SPIRV_OVERLOADABLE SPIRV_BUILTIN(GroupNonUniformShuffleUp, _i32_##TYPE_ABBR
 {                                                                                                                           \
     if (Execution == Subgroup)                                                                                              \
     {                                                                                                                       \
+        if(BIF_FLAG_CTRL_GET(UseOOBChecks))                                                                                 \
+        {                                                                                                                   \
+            c = c & (get_max_sub_group_size() - 1);                                                                         \
+        }                                                                                                                   \
         return intel_sub_group_shuffle_up((TYPE) 0, x, c);                                                                  \
     }                                                                                                                       \
     return 0;                                                                                                               \
-}
+}                                                                                                                           \
+GENERATE_SPIRV_VECTOR_FUNCTIONS_3ARGS_SVS(GroupNonUniformShuffleUp, TYPE, int, TYPE, uint, i32, TYPE_ABBR, i32)
 
 DEFN_NON_UNIFORM_SHUFFLE_UP(char,   i8)
 DEFN_NON_UNIFORM_SHUFFLE_UP(short,  i16)
