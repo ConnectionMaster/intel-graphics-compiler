@@ -9,10 +9,15 @@
 ; Check that bti is assigned to i32 state arguments and
 ; bindless buffers are still passed as kernel arguments.
 
-; RUN: %opt_typed_ptrs %use_old_pass_manager% -GenXBTIAssignment -vc-use-bindless-buffers -march=genx64 -mcpu=Gen9 -S < %s | FileCheck %s --check-prefixes=BUF,CHECK-TYPED-PTRS
-; RUN: %opt_opaque_ptrs %use_old_pass_manager% -GenXBTIAssignment -vc-use-bindless-buffers -march=genx64 -mcpu=Gen9 -S < %s | FileCheck %s --check-prefixes=BUF,CHECK-OPAQUE-PTRS
-; RUN: %opt_typed_ptrs %use_old_pass_manager% -GenXBTIAssignment -vc-use-bindless-images -march=genx64 -mcpu=Gen9 -S < %s | FileCheck %s --check-prefixes=IMG,CHECK-TYPED-PTRS
-; RUN: %opt_opaque_ptrs %use_old_pass_manager% -GenXBTIAssignment -vc-use-bindless-images -march=genx64 -mcpu=Gen9 -S < %s | FileCheck %s --check-prefixes=IMG,CHECK-OPAQUE-PTRS
+; RUN: %opt_legacy_typed %use_old_pass_manager% -GenXBTIAssignment -vc-use-bindless-buffers -march=genx64 -mcpu=XeHPG -S < %s | FileCheck %s --check-prefixes=BUF,CHECK-TYPED-PTRS
+; RUN: %opt_legacy_opaque %use_old_pass_manager% -GenXBTIAssignment -vc-use-bindless-buffers -march=genx64 -mcpu=XeHPG -S < %s | FileCheck %s --check-prefixes=BUF,CHECK-OPAQUE-PTRS
+; RUN: %opt_legacy_typed %use_old_pass_manager% -GenXBTIAssignment -vc-use-bindless-images -march=genx64 -mcpu=XeHPG -S < %s | FileCheck %s --check-prefixes=IMG,CHECK-TYPED-PTRS
+; RUN: %opt_legacy_opaque %use_old_pass_manager% -GenXBTIAssignment -vc-use-bindless-images -march=genx64 -mcpu=XeHPG -S < %s | FileCheck %s --check-prefixes=IMG,CHECK-OPAQUE-PTRS
+
+; RUN: %opt_new_pm_typed -passes=GenXBTIAssignment -vc-use-bindless-buffers -march=genx64 -mcpu=XeHPG -S < %s | FileCheck %s --check-prefixes=BUF,CHECK-TYPED-PTRS
+; RUN: %opt_new_pm_opaque -passes=GenXBTIAssignment -vc-use-bindless-buffers -march=genx64 -mcpu=XeHPG -S < %s | FileCheck %s --check-prefixes=BUF,CHECK-OPAQUE-PTRS
+; RUN: %opt_new_pm_typed -passes=GenXBTIAssignment -vc-use-bindless-images -march=genx64 -mcpu=XeHPG -S < %s | FileCheck %s --check-prefixes=IMG,CHECK-TYPED-PTRS
+; RUN: %opt_new_pm_opaque -passes=GenXBTIAssignment -vc-use-bindless-images -march=genx64 -mcpu=XeHPG -S < %s | FileCheck %s --check-prefixes=IMG,CHECK-OPAQUE-PTRS
 
 target datalayout = "e-p:64:64-i64:64-n8:16:32:64"
 target triple = "spir64-unknown-unknown"
@@ -83,16 +88,16 @@ attributes #0 = { "CMGenxMain" }
 !genx.kernel.internal = !{!4, !9, !14}
 ; BUF: !genx.kernel.internal = !{[[SIMPLE_NODE:![0-9]+]], [[MIXED_NODE:![0-9]+]], [[MIXED_ALL_NODE:![0-9]+]]}
 ; IMG: !genx.kernel.internal = !{[[SIMPLE_NODE:![0-9]+]], [[MIXED_NODE:![0-9]+]], [[MIXED_ALL_NODE:![0-9]+]]}
-; CHECK-TYPED-PTRS-DAG: [[SIMPLE_NODE]] = !{void (i32, i32)* @simple, null, null, null, [[SIMPLE_BTIS:![0-9]+]]}
-; CHECK-OPAQUE-PTRS-DAG: [[SIMPLE_NODE]] = !{ptr @simple, null, null, null, [[SIMPLE_BTIS:![0-9]+]]}
+; CHECK-TYPED-PTRS-DAG: [[SIMPLE_NODE]] = !{void (i32, i32)* @simple, null, null, null, [[SIMPLE_BTIS:![0-9]+]], i32 0}
+; CHECK-OPAQUE-PTRS-DAG: [[SIMPLE_NODE]] = !{ptr @simple, null, null, null, [[SIMPLE_BTIS:![0-9]+]], i32 0}
 ; BUF-DAG: [[SIMPLE_BTIS]] = !{i32 255, i32 0}
 ; IMG-DAG: [[SIMPLE_BTIS]] = !{i32 0, i32 255}
-; CHECK-TYPED-PTRS-DAG: [[MIXED_NODE]] = !{void (i32, i32, i32, i32)* @mixed_srv_uav, null, null, null, [[MIXED_BTIS:![0-9]+]]}
-; CHECK-OPAQUE-PTRS-DAG: [[MIXED_NODE]] = !{ptr @mixed_srv_uav, null, null, null, [[MIXED_BTIS:![0-9]+]]}
+; CHECK-TYPED-PTRS-DAG: [[MIXED_NODE]] = !{void (i32, i32, i32, i32)* @mixed_srv_uav, null, null, null, [[MIXED_BTIS:![0-9]+]], i32 0}
+; CHECK-OPAQUE-PTRS-DAG: [[MIXED_NODE]] = !{ptr @mixed_srv_uav, null, null, null, [[MIXED_BTIS:![0-9]+]], i32 0}
 ; BUF-DAG: [[MIXED_BTIS]] = !{i32 0, i32 2, i32 255, i32 1}
 ; IMG-DAG: [[MIXED_BTIS]] = !{i32 255, i32 255, i32 0, i32 255}
-; CHECK-TYPED-PTRS-DAG: [[MIXED_ALL_NODE]] = !{void (i32, i32, i32, i32, i64, i32, i32)* @mixed_all, null, null, null, [[MIXED_ALL_BTIS:![0-9]+]]}
-; CHECK-OPAQUE-PTRS-DAG: [[MIXED_ALL_NODE]] = !{ptr @mixed_all, null, null, null, [[MIXED_ALL_BTIS:![0-9]+]]}
+; CHECK-TYPED-PTRS-DAG: [[MIXED_ALL_NODE]] = !{void (i32, i32, i32, i32, i64, i32, i32)* @mixed_all, null, null, null, [[MIXED_ALL_BTIS:![0-9]+]], i32 0}
+; CHECK-OPAQUE-PTRS-DAG: [[MIXED_ALL_NODE]] = !{ptr @mixed_all, null, null, null, [[MIXED_ALL_BTIS:![0-9]+]], i32 0}
 ; BUF-DAG: [[MIXED_ALL_BTIS]] = !{i32 1, i32 0, i32 -1, i32 0, i32 255, i32 255, i32 1}
 ; IMG-DAG: [[MIXED_ALL_BTIS]] = !{i32 255, i32 255, i32 -1, i32 255, i32 255, i32 0, i32 255}
 

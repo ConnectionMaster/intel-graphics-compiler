@@ -17,6 +17,7 @@ SPDX-License-Identifier: MIT
 #include "FlowGraph.h"
 #include "Passes/AccSubstitution.hpp"
 #include "PointsToAnalysis.h"
+#include "Passes/SRSubstitution.hpp"
 #include "Passes/InstCombine.hpp"
 #include "Passes/LVN.hpp"
 #include "Passes/MergeScalars.hpp"
@@ -707,6 +708,9 @@ void Optimizer::initOptimizations() {
   OPT_INITIALIZE_PASS(changeMoveType, vISA_ChangeMoveType, TimerID::MISC_OPTS);
   OPT_INITIALIZE_PASS(accSubBeforeRA, vISA_accSubBeforeRA, TimerID::OPTIMIZER);
   OPT_INITIALIZE_PASS(accSubPostSchedule, vISA_accSubstitution, TimerID::OPTIMIZER);
+  OPT_INITIALIZE_PASS(s0SubAfterRA, vISA_EnableAlways, TimerID::OPTIMIZER);
+  OPT_INITIALIZE_PASS(removePseudoMov, vISA_EnableAlways,
+                  TimerID::OPTIMIZER);
   OPT_INITIALIZE_PASS(dce, vISA_EnableDCE, TimerID::OPTIMIZER);
   OPT_INITIALIZE_PASS(reassociateConst, vISA_reassociate, TimerID::OPTIMIZER);
   OPT_INITIALIZE_PASS(split4GRFVars, vISA_split4GRFVar, TimerID::OPTIMIZER);
@@ -819,6 +823,17 @@ void Optimizer::accSubPostSchedule() {
   accSub.run();
 }
 
+void Optimizer::s0SubAfterRA() {
+  if (!builder.enableSendIndirect()) {
+    return;
+  }
+
+  kernel.fg.resetLocalDataFlowData();
+  kernel.fg.localDataFlowAnalysis();
+
+  SRSubPassBeforeRA s0Sub(builder, kernel);
+  s0Sub.run();
+}
 
 void Optimizer::accSubBeforeRA() {
   if (!builder.doAccSub() || !builder.getOption(vISA_doAccSubAfterSchedule)) {
@@ -951,6 +966,8 @@ int Optimizer::optimization() {
     return VISA_SPILL;
   }
 
+
+
   runPass(PI_removeLifetimeOps);
 
   // HW workaround after RA
@@ -990,6 +1007,7 @@ int Optimizer::optimization() {
   runPass(PI_legalizeType);
 
   runPass(PI_changeMoveType);
+  runPass(PI_s0SubAfterRA);
 
   // No pass after this should expect def-use to be preserved as this pass
   // removes raw movs with identical src/dst physical GRFs.
@@ -1052,6 +1070,7 @@ int Optimizer::optimization() {
   //-----------------------------------------------------------------------------------------------------------------
   runPass(PI_addSWSBInfo);
 
+  runPass(PI_removePseudoMov);
 
   runPass(PI_staticProfiling);
 
@@ -1258,7 +1277,52 @@ void Optimizer::reverseOffsetProp(AddrSubReg_Node addrRegInfo[8], int subReg,
   addrRegInfo[subReg].usedImmed = false;
 }
 
+void Optimizer::removePseudoMov() {
+  if (!builder.enableSendIndirect()) {
+    return;
+  }
 
+  for (G4_BB *bb : fg) {
+    INST_LIST_ITER ii(bb->begin()), iend(bb->end());
+    while (ii != iend) {
+      G4_INST *inst = (*ii);
+
+      if (inst->isPseudoAddrMovIntrinsic()) {
+        uint64_t value = 0;
+
+        for (int i = 0; i < inst->getNumSrc(); i++) {
+          G4_Operand *src = inst->getSrc(i);
+
+          if (!src || src->isNullReg()) {
+            continue;
+          }
+
+          vASSERT(src->isAddrExp());
+          G4_RegVar *regVar = src->asAddrExp()->getRegVar();
+          vASSERT(regVar->getPhyReg()->isGreg());
+
+          unsigned int regNum =
+              (static_cast<G4_Greg *>(regVar->getPhyReg()))->getRegNum();
+          regNum += src->asAddrExp()->getOffset() / kernel.getGRFSize();
+          value |= (uint64_t)regNum << 8 * i;
+        }
+        G4_Imm *src = builder.createImm(value, Type_UQ);
+        G4_INST *movInst = builder.createMov(g4::SIMD1, inst->getDst(), src,
+                                             InstOpt_WriteEnable, false);
+        movInst->setToken(inst->getToken());
+        movInst->setTokenType(inst->getTokenType());
+        movInst->setDistance(inst->getDistance());
+        movInst->setDistanceTypeXe(inst->getDistanceTypeXe());
+        bb->insertBefore(ii, movInst);
+        INST_LIST_ITER tmp = ii;
+        ii++;
+        bb->erase(tmp);
+        continue;
+      }
+      ii++;
+    }
+  }
+}
 void Optimizer::FoldAddrImmediate() {
   AddrSubReg_Node *addrRegInfo =
       new AddrSubReg_Node[builder.getNumAddrRegisters()];
@@ -1630,6 +1694,10 @@ static bool canHoist(FlowGraph &fg, G4_BB *bb, INST_LIST_RITER revIter) {
       return false;
     }
 
+    // Do not do def-hoisting for s0 registers
+    if (Dcl && Dcl->getRegFile() == G4_RegFileKind::G4_SCALAR) {
+      return false;
+    }
 
     if (Dcl && Dcl->getRegFile() == G4_RegFileKind::G4_ADDRESS &&
         Dcl->getRegVar() && Dcl->getRegVar()->getPhyReg()) {

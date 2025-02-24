@@ -48,6 +48,8 @@ add_subdirectory(ResourceAllocator)
 add_subdirectory(RewriteLocalSize)
 add_subdirectory(ScalarArgAsPointer)
 add_subdirectory(SetFastMathFlags)
+add_subdirectory(Spv2dBlockIOResolution)
+add_subdirectory(SpvSubgroupMMAResolution)
 add_subdirectory(StackOverflowDetection)
 add_subdirectory(StatelessToStateful)
 add_subdirectory(SubGroupFuncs)
@@ -99,6 +101,8 @@ set(IGC_BUILD__SRC__Optimizer_OpenCLPasses_All
     ${IGC_BUILD__SRC__OpenCLPasses_RewriteLocalSize}
     ${IGC_BUILD__SRC__OpenCLPasses_ScalarArgAsPointer}
     ${IGC_BUILD__SRC__OpenCLPasses_SetFastMathFlags}
+    ${IGC_BUILD__SRC__OpenCLPasses_Spv2dBlockIOResolution}
+    ${IGC_BUILD__SRC__OpenCLPasses_SpvSubgroupMMAResolution}
     ${IGC_BUILD__SRC__OpenCLPasses_StackOverflowDetection}
     ${IGC_BUILD__SRC__OpenCLPasses_StatelessToStateful}
     ${IGC_BUILD__SRC__OpenCLPasses_SubGroupFuncs}
@@ -155,6 +159,8 @@ set(IGC_BUILD__HDR__Optimizer_OpenCLPasses_All
     ${IGC_BUILD__HDR__OpenCLPasses_RewriteLocalSize}
     ${IGC_BUILD__HDR__OpenCLPasses_ScalarArgAsPointer}
     ${IGC_BUILD__HDR__OpenCLPasses_SetFastMathFlags}
+    ${IGC_BUILD__HDR__OpenCLPasses_Spv2dBlockIOResolution}
+    ${IGC_BUILD__HDR__OpenCLPasses_SpvSubgroupMMAResolution}
     ${IGC_BUILD__HDR__OpenCLPasses_StackOverflowDetection}
     ${IGC_BUILD__HDR__OpenCLPasses_StatelessToStatefull}
     ${IGC_BUILD__HDR__OpenCLPasses_SubGroupFuncs}

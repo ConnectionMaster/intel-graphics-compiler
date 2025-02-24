@@ -32,30 +32,6 @@ inline llvm::Argument *getArg(const llvm::Function &F, unsigned ArgNo) {
   return Arg;
 }
 
-inline void addRetAttr(llvm::Function *F, llvm::Attribute::AttrKind Kind) {
-#if LLVM_VERSION_MAJOR < 14
-  F->addAttribute(llvm::AttributeList::ReturnIndex, Kind);
-#else
-  F->addRetAttr(Kind);
-#endif
-}
-
-inline void addRetAttrs(llvm::Function* F, llvm::AttrBuilder &B) {
-#if LLVM_VERSION_MAJOR < 14
-  F->addAttributes(llvm::AttributeList::ReturnIndex, B);
-#else
-  F->addRetAttrs(B);
-#endif
-}
-
-inline void addFnAttrs(llvm::Function* F, llvm::AttrBuilder &B) {
-#if LLVM_VERSION_MAJOR < 14
-  F->addAttributes(llvm::AttributeList::FunctionIndex, B);
-#else
-  F->addFnAttrs(B);
-#endif
-}
-
 inline bool onlyWritesMemory(llvm::Function *F) {
 #if LLVM_VERSION_MAJOR < 14
   return F->doesNotReadMemory();
@@ -84,7 +60,7 @@ inline void splice(llvm::Function* pNewFunc, llvm::Function::iterator it, llvm::
 #if LLVM_VERSION_MAJOR < 16
     pNewFunc->getBasicBlockList().splice(it, pOldFunc->getBasicBlockList(), BB);
 #else
-    pNewFunc->splice(it, pOldFunc);
+    pNewFunc->splice(it, pOldFunc, BB->getIterator());
 #endif
 }
 
@@ -129,10 +105,8 @@ inline void insertBasicBlock(
 }
 
 inline void setMemoryEffects(llvm::Function& F, IGCLLVM::MemoryEffects ME) {
-  for (auto Kind : ME.getOverridenAttrKinds())
-    F.removeFnAttr(Kind);
-  for (const auto MemAttr : ME.getAsAttributeSet(F.getContext()))
-    F.addFnAttr(MemAttr);
+  F.removeFnAttrs(ME.getOverridenAttrKinds());
+  F.addFnAttrs(ME.getAsAttrBuilder(F.getContext()));
 }
 
 inline void setDoesNotAccessMemory(llvm::Function& F) {

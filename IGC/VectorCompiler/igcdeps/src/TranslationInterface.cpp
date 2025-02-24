@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2020-2024 Intel Corporation
+Copyright (C) 2020-2025 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -177,6 +177,10 @@ getPlatformName(const PLATFORM &Platform) {
     if (Product == IGFX_BMG)
       return {"Xe2", RevId};
     break;
+  case IGFX_XE3_CORE:
+    if (Product == IGFX_PTL)
+      return {"Xe3", RevId};
+    LLVM_FALLTHROUGH;
   default:
     break;
   }
@@ -309,6 +313,9 @@ static void adjustTransformationsAndOptimizations(vc::CompileOptions &Opts) {
   if (__IGC_OPAQUE_POINTERS_API_ENABLED ||
       IGC_IS_FLAG_ENABLED(EnableOpaquePointersBackend))
     Opts.EnableOpaquePointers = true;
+
+  Opts.DepressurizerGRFThreshold = IGC_GET_FLAG_VALUE(VCDepressurizerGRFThreshold);
+  Opts.DepressurizerFlagGRFTolerance = IGC_GET_FLAG_VALUE(VCDepressurizerFlagGRFTolerance);
 }
 
 static void adjustKernelMetrics(vc::CompileOptions &Opts) {

@@ -51,15 +51,10 @@ namespace IGC {
     // it is required for correct work of LiveVariables analysis and other
     static void ProcessDbgValueInst(BasicBlock& blk, DominatorTree *DT)
     {
-        BasicBlock::iterator I = blk.end();
-        --I;
-        bool processedBegin = false;
-        do {
-            Instruction* inst = cast<Instruction>(I);
-            processedBegin = (I == blk.begin());
-            if (!processedBegin)
-                --I;
-
+        llvm::DenseMap<Instruction *, Instruction *> PositionMap;
+        for (auto I = blk.rbegin(), E = blk.rend(); I != E; ++I)
+        {
+            Instruction* inst = cast<Instruction>(&*I);
             if (auto* DVI = dyn_cast<DbgValueInst>(inst))
             {
                 // As debug intrinsics are not specified as users of an llvm instructions,
@@ -71,11 +66,15 @@ namespace IGC {
                     {
                         if (!DT->dominates(def, inst))
                         {
-                            auto* instClone = inst->clone();
-                            instClone->insertAfter(def);
-                            Value* undef = UndefValue::get(def->getType());
-                            MetadataAsValue* MAV = MetadataAsValue::get(inst->getContext(), ValueAsMetadata::get(undef));
-                            cast<CallInst>(inst)->setArgOperand(0, MAV);
+                            if (isa<PHINode>(def)) {
+                                // If the instruction is a PHI node, insert the new instruction at the beginning of the block.
+                                PositionMap[inst] = &*def->getParent()->getFirstInsertionPt();
+                            }
+                            else {
+                                // Otherwise, insert the new instruction after the defining instruction.
+                                PositionMap[inst] = def->getNextNonDebugInstruction();
+                                IGC_ASSERT(!isa<BranchInst>(def));
+                            }
                         }
                     }
                 }
@@ -87,7 +86,27 @@ namespace IGC {
                     cast<CallInst>(inst)->setArgOperand(0, MAV);
                 }
             }
-        } while (!processedBegin);
+        }
+        for (auto &[I, Pos] : PositionMap) {
+            I->moveBefore(Pos);
+        }
+    }
+
+    // Check the instruction is a 2d block read
+    static bool is2dBlockRead(Instruction *I)
+    {
+        if (GenIntrinsicInst *Intr = dyn_cast<GenIntrinsicInst>(I))
+        {
+            switch (Intr->getIntrinsicID())
+            {
+            case GenISAIntrinsic::GenISA_LSC2DBlockRead:
+            case GenISAIntrinsic::GenISA_LSC2DBlockReadAddrPayload:
+                return true;
+            default:
+                break;
+            }
+        }
+        return false;
     }
 
     // Check if the instruction is a load or an allowed intrinsic that reads memory
@@ -96,17 +115,8 @@ namespace IGC {
         if (isa<LoadInst>(I))
             return true;
 
-        if (GenIntrinsicInst *Intr = dyn_cast<GenIntrinsicInst>(I))
-        {
-            switch (Intr->getIntrinsicID())
-            {
-                case GenISAIntrinsic::GenISA_LSC2DBlockRead:
-                case GenISAIntrinsic::GenISA_LSC2DBlockReadAddrPayload:
-                    return true;
-                default:
-                    break;
-            }
-        }
+        if (is2dBlockRead(I))
+            return true;
 
         return false;
     }
@@ -233,6 +243,22 @@ namespace IGC {
     {
         return std::count_if(llvm::inst_begin(F), llvm::inst_end(F), [](const auto& I){ return !isDbgIntrinsic(&I); });
     }
+
+    static bool isDPAS(Value *V)
+    {
+        GenIntrinsicInst *Intr = dyn_cast<GenIntrinsicInst>(V);
+        if (!Intr)
+            return false;
+        switch (Intr->getIntrinsicID())
+        {
+        case GenISAIntrinsic::GenISA_dpas:
+        case GenISAIntrinsic::GenISA_sub_group_dpas:
+            return true;
+        default:
+            break;
+        }
+        return false;
+    };
 
     /// ===================== ///
     /// Non-loop code sinking ///
@@ -787,11 +813,12 @@ namespace IGC {
     // Sink in the loop if loop preheader's potential to sink covers at least 20% of registers delta
 // between grf number and max estimated pressure in the loop
 #define LOOPSINK_PREHEADER_IMPACT_THRESHOLD 0.2
+#define LOOPSINK_RESCHEDULE_ITERATIONS 5
 
     // Helper functions for loop sink debug dumps
-#define PrintDump(Contents) if (IGC_IS_FLAG_ENABLED(DumpLoopSink)) {*LogStream << Contents;}
-#define PrintInstructionDump(Inst) if (IGC_IS_FLAG_ENABLED(DumpLoopSink)) {(Inst)->print(*LogStream, false); *LogStream << "\n";}
-#define PrintOUGDump(OUG) if (IGC_IS_FLAG_ENABLED(DumpLoopSink)) {OUG.print(*LogStream); *LogStream << "\n";}
+#define PrintDump(Level, Contents) if (IGC_IS_FLAG_ENABLED(DumpLoopSink) && (Level <= IGC_GET_FLAG_VALUE(LoopSinkDumpLevel))) {*LogStream << Contents;}
+#define PrintInstructionDump(Level, Inst) if (IGC_IS_FLAG_ENABLED(DumpLoopSink) && (Level <= IGC_GET_FLAG_VALUE(LoopSinkDumpLevel))) {(Inst)->print(*LogStream, false); *LogStream << "\n";}
+#define PrintOUGDump(Level, OUG) if (IGC_IS_FLAG_ENABLED(DumpLoopSink) && (Level <= IGC_GET_FLAG_VALUE(LoopSinkDumpLevel))) {OUG.print(*LogStream); *LogStream << "\n";}
 
 
     // Register pass to igc-opt
@@ -801,12 +828,9 @@ namespace IGC {
 #define PASS_ANALYSIS1 false
     IGC_INITIALIZE_PASS_BEGIN(CodeLoopSinking, PASS_FLAG1, PASS_DESCRIPTION1, PASS_CFG_ONLY1, PASS_ANALYSIS1)
         IGC_INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
-        IGC_INITIALIZE_PASS_DEPENDENCY(PostDominatorTreeWrapperPass)
         IGC_INITIALIZE_PASS_DEPENDENCY(LoopInfoWrapperPass)
         IGC_INITIALIZE_PASS_DEPENDENCY(AAResultsWrapperPass)
-        IGC_INITIALIZE_PASS_DEPENDENCY(MetaDataUtilsWrapper)
         IGC_INITIALIZE_PASS_DEPENDENCY(CodeGenContextWrapper)
-        IGC_INITIALIZE_PASS_DEPENDENCY(TranslationTable)
         IGC_INITIALIZE_PASS_DEPENDENCY(IGCLivenessAnalysis)
         IGC_INITIALIZE_PASS_DEPENDENCY(IGCFunctionExternalRegPressureAnalysis)
         IGC_INITIALIZE_PASS_END(CodeLoopSinking, PASS_FLAG1, PASS_DESCRIPTION1, PASS_CFG_ONLY1, PASS_ANALYSIS1)
@@ -854,6 +878,7 @@ namespace IGC {
                 LogStream << "LoopSinkThresholdDelta: " << IGC_GET_FLAG_VALUE(LoopSinkThresholdDelta) << "\n";
                 LogStream << "LoopSinkRollbackThreshold: " << IGC_GET_FLAG_VALUE(LoopSinkRollbackThreshold) << "\n";
                 LogStream << "LoopSinkEnableLoadsRescheduling: " << IGC_GET_FLAG_VALUE(LoopSinkEnableLoadsRescheduling) << "\n";
+                LogStream << "LoopSinkCoarserLoadsRescheduling: " << IGC_GET_FLAG_VALUE(LoopSinkCoarserLoadsRescheduling) << "\n";
                 LogStream << "LoopSinkEnable2dBlockReads: " << IGC_GET_FLAG_VALUE(LoopSinkEnable2dBlockReads) << "\n";
                 LogStream << "LoopSinkEnableVectorShuffle: " << IGC_GET_FLAG_VALUE(LoopSinkEnableVectorShuffle) << "\n";
                 LogStream << "LoopSinkForceRollback: " << IGC_GET_FLAG_VALUE(LoopSinkForceRollback) << "\n";
@@ -865,23 +890,14 @@ namespace IGC {
 
             printGlobalSettings(*LogStream);
 
-            PrintDump("=====================================\n");
-            PrintDump("Function " << F.getName() << "\n");
+            PrintDump(VerbosityLevel::Low, "=====================================\n");
+            PrintDump(VerbosityLevel::Low, "Function " << F.getName() << "\n");
         }
 
         DT = &getAnalysis<DominatorTreeWrapperPass>().getDomTree();
-        PDT = &getAnalysis<PostDominatorTreeWrapperPass>().getPostDomTree();
         LI = &getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
         AA = &getAnalysis<AAResultsWrapperPass>().getAAResults();
-        MDUtils = getAnalysis<MetaDataUtilsWrapper>().getMetaDataUtils();
-        ModMD = getAnalysis<MetaDataUtilsWrapper>().getModuleMetaData();
         TLI = &getAnalysis<TargetLibraryInfoWrapperPass>().getTLI();
-
-        TranslationTable TT;
-        TT.run(F);
-
-        WI = WIAnalysisRunner(&F, LI, DT, PDT, MDUtils, CTX, ModMD, &TT);
-        WI.run();
 
         // Note: FRPE is a Module analysis and currently it runs only once.
         // If function A calls function B then
@@ -891,6 +907,7 @@ namespace IGC {
 
         RPE = &getAnalysis<IGCLivenessAnalysis>();
         FRPE = &getAnalysis<IGCFunctionExternalRegPressureAnalysis>();
+        WI = &FRPE->getWIAnalysis(&F);
 
         // clear caching structures before handling the new function
         MemoizedStoresInLoops.clear();
@@ -899,15 +916,12 @@ namespace IGC {
 
         bool Changed = loopSink(F);
 
-        if (Changed)
-        {
-            IGC_ASSERT(false == verifyFunction(F, &dbgs()));
-        }
-
         if (IGC_IS_FLAG_ENABLED(DumpLoopSink) && IGC_IS_FLAG_DISABLED(PrintToConsole))
         {
             dumpToFile(Log);
         }
+
+        IGC_ASSERT(false == verifyFunction(F, &dbgs()));
 
         return Changed;
     }
@@ -944,7 +958,7 @@ namespace IGC {
             unsigned int &BBPressure = BBPressureEntry.first->second;
             if (BBPressureEntry.second)  // BB was not in the set, need to recompute
             {
-                BBPressure = RPE->getMaxRegCountForBB(*BB, SIMD, &WI);
+                BBPressure = RPE->getMaxRegCountForBB(*BB, SIMD, WI);
             }
             Max = std::max(BBPressure, Max);
         }
@@ -998,20 +1012,20 @@ namespace IGC {
         uint NGRF = CTX->getNumGRFPerThread();
         uint SIMD = numLanes(RPE->bestGuessSIMDSize(F));
 
-        PrintDump("\n");
+        PrintDump(VerbosityLevel::Low, "\n");
         if (!Preheader->getName().empty())
         {
-            PrintDump("Checking loop with preheader " << Preheader->getName() << ": \n");
+            PrintDump(VerbosityLevel::Low, "Checking loop with preheader " << Preheader->getName() << ": \n");
         }
         else if (!Preheader->empty())
         {
-            PrintDump("Checking loop with unnamed preheader. First preheader instruction:\n");
+            PrintDump(VerbosityLevel::Low, "Checking loop with unnamed preheader. First preheader instruction:\n");
             Instruction* First = &Preheader->front();
-            PrintInstructionDump(First);
+            PrintInstructionDump(VerbosityLevel::Low, First);
         }
         else
         {
-            PrintDump("Checking loop with unnamed empty preheader.");
+            PrintDump(VerbosityLevel::Low, "Checking loop with unnamed empty preheader.");
         }
 
         if (IGC_IS_FLAG_ENABLED(LoopSinkEnableLoadsRescheduling))
@@ -1020,11 +1034,10 @@ namespace IGC {
             {
                 for (auto &I : *BB)
                 {
-                    GenIntrinsicInst* GII = dyn_cast<GenIntrinsicInst>(&I);
-                    if (GII && GII->getIntrinsicID() == GenISAIntrinsic::GenISA_LSC2DBlockReadAddrPayload)
+                    if (is2dBlockRead(&I))
                     {
-                        PrintDump(">> Loop has 2D block reads. Enabling loads rescheduling and sinking.\n");
-                        return LoopSinkMode::SinkWhileRegpressureIsHigh;
+                        PrintDump(VerbosityLevel::Low, ">> Loop has 2D block reads. Enabling loads rescheduling and sinking.\n");
+                        return IGC_IS_FLAG_ENABLED(LoopSinkForce2dBlockReadsMaxSink) ? LoopSinkMode::FullSink : LoopSinkMode::SinkWhileRegpressureIsHigh;
                     }
                 }
             }
@@ -1045,11 +1058,11 @@ namespace IGC {
 
         if (PreheaderDefsCandidates.empty())
         {
-            PrintDump(">> No sinking candidates in the preheader.\n");
+            PrintDump(VerbosityLevel::Low, ">> No sinking candidates in the preheader.\n");
             return LoopSinkMode::NoSink;
         }
 
-        uint PreheaderDefsSizeInBytes = RPE->estimateSizeInBytes(PreheaderDefsCandidates, *F, SIMD, &WI);
+        uint PreheaderDefsSizeInBytes = RPE->estimateSizeInBytes(PreheaderDefsCandidates, *F, SIMD, WI);
         uint PreheaderDefsSizeInRegs = RPE->bytesToRegisters(PreheaderDefsSizeInBytes);
 
         // Estimate max pressure in the loop and the external pressure
@@ -1064,17 +1077,17 @@ namespace IGC {
                     (PreheaderDefsSizeInRegs > (MaxLoopPressure - NGRF) * LOOPSINK_PREHEADER_IMPACT_THRESHOLD));
         };
 
-        PrintDump("Threshold to sink = " << NGRF + GRFThresholdDelta << "\n");
-        PrintDump("MaxLoopPressure = " << MaxLoopPressure << "\n");
-        PrintDump("MaxLoopPressure + FunctionExternalPressure = " << MaxLoopPressure + FunctionExternalPressure << "\n");
-        PrintDump("PreheaderDefsSizeInRegs = " << PreheaderDefsSizeInRegs << "\n");
-        PrintDump("PreheaderPotentialThreshold = " << uint((MaxLoopPressure - NGRF) * LOOPSINK_PREHEADER_IMPACT_THRESHOLD) << "\n");
+        PrintDump(VerbosityLevel::Low, "Threshold to sink = " << NGRF + GRFThresholdDelta << "\n");
+        PrintDump(VerbosityLevel::Low, "MaxLoopPressure = " << MaxLoopPressure << "\n");
+        PrintDump(VerbosityLevel::Low, "MaxLoopPressure + FunctionExternalPressure = " << MaxLoopPressure + FunctionExternalPressure << "\n");
+        PrintDump(VerbosityLevel::Low, "PreheaderDefsSizeInRegs = " << PreheaderDefsSizeInRegs << "\n");
+        PrintDump(VerbosityLevel::Low, "PreheaderPotentialThreshold = " << uint((MaxLoopPressure - NGRF) * LOOPSINK_PREHEADER_IMPACT_THRESHOLD) << "\n");
 
         // Sink if the regpressure in the loop is high enough (including function external regpressure)
         if (isSinkCriteriaMet(MaxLoopPressure + FunctionExternalPressure))
             return LoopSinkMode::SinkWhileRegpressureIsHigh;
 
-        PrintDump(">> No sinking.\n");
+        PrintDump(VerbosityLevel::Low, ">> No sinking.\n");
         return LoopSinkMode::NoSink;
     }
 
@@ -1116,7 +1129,7 @@ namespace IGC {
         if (!Preheader)
             return false;
 
-        PrintDump(">> Sinking in the loop with preheader " << Preheader->getName() << "\n");
+        PrintDump(VerbosityLevel::Low, ">> Sinking in the loop with preheader " << Preheader->getName() << "\n");
 
         Function *F = Preheader->getParent();
         uint NGRF = CTX->getNumGRFPerThread();
@@ -1130,15 +1143,15 @@ namespace IGC {
                 (Mode == LoopSinkMode::SinkWhileRegpressureIsHigh))
         {
             NeededRegpressure -= FunctionExternalPressure;
-            PrintDump("Targeting new own regpressure in the loop = " << NeededRegpressure << "\n");
+            PrintDump(VerbosityLevel::Low, "Targeting new own regpressure in the loop = " << NeededRegpressure << "\n");
         }
         else
         {
             Mode = LoopSinkMode::FullSink;
-            PrintDump("Doing full sink.\n");
+            PrintDump(VerbosityLevel::Low, "Doing full sink.\n");
         }
 
-        PrintDump("Initial regpressure:\n" << InitialLoopPressure << "\n");
+        PrintDump(VerbosityLevel::Low, "Initial regpressure:\n" << InitialLoopPressure << "\n");
 
         // We can only affect Preheader and the loop.
         // Collect affected BBs to invalidate cached regpressure
@@ -1147,6 +1160,16 @@ namespace IGC {
         AffectedBBs.insert(Preheader);
         for (BasicBlock *BB: L->blocks())
             AffectedBBs.insert(BB);
+
+        // Save original positions for rollback
+        DenseMap<BasicBlock *, InstrVec> OriginalPositions;
+        for (BasicBlock *BB : AffectedBBs)
+        {
+            InstrVec BBInstructions;
+            for (Instruction &I : *BB)
+                BBInstructions.push_back(&I);
+            OriginalPositions[BB] = std::move(BBInstructions);
+        }
 
         auto rerunLiveness = [&]()
         {
@@ -1213,8 +1236,91 @@ namespace IGC {
             return isSafeToLoopSinkLoad(LI, L);
         };
 
-        // We'll reschedule loads only once, on the first iteration
+        // "Leaf" candidate is the one that doesn't use any other candidate
+        // This function returns the map Instruction *->Candidate * of leaf candidates
+        // and updates the Candidates vector and InstToCandidateMap to contain only non-leaf candidates
+        auto getLeafInstToCandidateMap = [&](BasicBlock *TgtBB, CandidatePtrVec &Candidates, InstToCandidateMap &InstToCandidate)
+        {
+            InstToCandidateMap LeafInstToCandidate;
+            SmallSet<Candidate *, 32> NotLeafCandidates;
+
+            for (Candidate *C : Candidates)
+            {
+                PrintDump(VerbosityLevel::High, "Finding leaf candidates... Checking:\n");
+                for (Instruction *I : *C)
+                {
+                    PrintInstructionDump(VerbosityLevel::High, I);
+                }
+
+                for (Instruction *I : *C)
+                {
+                    // if any operand is a candidate, then this candidate is not a leaf
+                    for (auto OI = I->op_begin(), E = I->op_end(); OI != E; OI++)
+                    {
+                        Instruction *Op = dyn_cast<Instruction>(OI);
+                        if (!Op)
+                            continue;
+
+                        if (InstToCandidate.count(Op))
+                        {
+                            Candidate *OpCandidate = InstToCandidate[Op];
+                            if (OpCandidate != C)
+                            {
+                                PrintDump(VerbosityLevel::High, "Operand uses the current candidate, so is not a leaf:\n");
+                                PrintInstructionDump(VerbosityLevel::High, Op);
+                                NotLeafCandidates.insert(OpCandidate);
+                            }
+                        }
+                    }
+                }
+            }
+            for (Candidate *C : Candidates)
+            {
+                if (NotLeafCandidates.count(C))
+                    continue;
+
+                for (Instruction *I : *C)
+                {
+                    LeafInstToCandidate[I] = C;
+                    InstToCandidate.erase(I);
+                }
+            }
+
+            Candidates = CandidatePtrVec(NotLeafCandidates.begin(), NotLeafCandidates.end());
+            return LeafInstToCandidate;
+        };
+
+        auto rescheduleCandidates = [&] (BasicBlock *BB, CandidateVec &SinkedCandidates, InstToCandidateMap &CurrentInstToCandidate, const int MaxLocalSchedulingIterations, bool Aggressive = false)
+        {
+            bool Changed = false;
+
+            CandidatePtrVec SinkedCandidatesPtrs;
+            for (auto CI = SinkedCandidates.begin(), CE = SinkedCandidates.end(); CI != CE; CI++)
+            {
+                Candidate *C = CI->get();
+                if (C->TgtBB == BB)
+                    SinkedCandidatesPtrs.push_back(C);
+            }
+
+            // Sinking the candidates that don't use other candidates iteratively
+            // Should end with break, using max number of iterations (MaxLocalSchedulingIterations) just to avoid an infinite loop
+            for (int i = 0; i < MaxLocalSchedulingIterations; i++)
+            {
+                PrintDump(VerbosityLevel::Medium, "Local scheduling iteration " << i << "...\n");
+                InstToCandidateMap LeafCurrentInstToCandidate = getLeafInstToCandidateMap(BB, SinkedCandidatesPtrs, CurrentInstToCandidate);
+                if (LeafCurrentInstToCandidate.empty())
+                {
+                    PrintDump(VerbosityLevel::Medium, "No more candidates to schedule in this block.\n");
+                    break;
+                }
+                Changed |= localSink(BB, LeafCurrentInstToCandidate, Aggressive);
+            }
+
+            return Changed;
+        };
+
         bool ReschedulingIteration = IGC_IS_FLAG_ENABLED(LoopSinkEnableLoadsRescheduling);
+        bool LateReschedulingIteration = false;
 
         auto createSimpleCandidates = [&](
             InstSet &SkipInstructions,
@@ -1256,7 +1362,9 @@ namespace IGC {
                     Worthiness = LoopSinkWorthiness::Sink;
                 }
 
-                if (isa<LoadInst>(I))
+                // if LoadInst or GenISA_LSC2DBlockRead (standalone, non-payload allowed 2d load)
+                GenIntrinsicInst *GII = dyn_cast<GenIntrinsicInst>(I);
+                if (isa<LoadInst>(I) || (GII && GII->getIntrinsicID() == GenISAIntrinsic::GenISA_LSC2DBlockRead))
                 {
                     if (!AllowLoadSinking)
                         continue;
@@ -1280,8 +1388,8 @@ namespace IGC {
 
                 IGC_ASSERT(Worthiness == LoopSinkWorthiness::Unknown);
 
-                // 2d block loads are usually large
-                // So the sinking are beneficial when it's safe
+                // Handle payload 2d loads separately as they go together with auxilary intrinsics
+                // 2d block loads are usually large, so the sinking is beneficial when it's safe
                 if (AllowLoadSinking && IGC_IS_FLAG_ENABLED(LoopSinkEnable2dBlockReads))
                     tryCreate2dBlockReadGroupSinkingCandidate(I, L, SkipInstructions, SinkCandidates);
 
@@ -1309,6 +1417,8 @@ namespace IGC {
 
         InstSet SkipInstructions;
 
+        int SinkIterations = 0;
+
         do
         {
             CurrentSinkCandidates.clear();
@@ -1334,7 +1444,7 @@ namespace IGC {
             // Do it only once before starting sinking
             if (ReschedulingIteration)
             {
-                PrintDump("Trying to find loads to reschedule...\n");
+                PrintDump(VerbosityLevel::Low, "Trying to find loads to reschedule...\n");
                 if (IGC_IS_FLAG_ENABLED(LoopSinkEnable2dBlockReads))
                 {
                     // traverse Loop in the reverse order
@@ -1344,14 +1454,43 @@ namespace IGC {
                         for (auto BI = BB->rbegin(), BE = BB->rend(); BI != BE; BI++)
                         {
                             Instruction *I = &*BI;
-                            tryCreate2dBlockReadGroupSinkingCandidate(I, L, SkipInstructions, CurrentSinkCandidates);
+                            GenIntrinsicInst *GII = dyn_cast<GenIntrinsicInst>(I);
+
+                            bool Found2dBlockReads = false;
+
+                            // If it's a non-payload 2d block load we can create candidate if it's safe to move
+                            if (GII && GII->getIntrinsicID() == GenISAIntrinsic::GenISA_LSC2DBlockRead)
+                            {
+                                if (SkipInstructions.count(I))
+                                    continue;
+                                SkipInstructions.insert(I);
+
+                                if (!isSafeToLoopSinkLoad(I, L))
+                                    continue;
+
+                                PrintDump(VerbosityLevel::Medium, "Found 2D block read to reschedule:\n");
+                                PrintInstructionDump(VerbosityLevel::Medium, I);
+
+                                CurrentSinkCandidates.push_back(std::make_unique<Candidate>(I, I->getParent(), LoopSinkWorthiness::IntraLoopSink, I->getNextNode()));
+                                Found2dBlockReads = true;
+                            }
+
+                            // Handle possible payload 2d block loads separately
+                            Found2dBlockReads |= tryCreate2dBlockReadGroupSinkingCandidate(I, L, SkipInstructions, CurrentSinkCandidates);
+
+                            if (Found2dBlockReads && IGC_IS_FLAG_ENABLED(LoopSinkEnableVectorShuffle))
+                            {
+                                // If there are 2d block reads we try to find vector shuffle patterns for rescheduling as well
+                                tryCreateShufflePatternCandidates(BB, L, SkipInstructions, CurrentSinkCandidates);
+                            }
                         }
                     }
                 }
             }
-            else
+            else if (!LateReschedulingIteration)
             {
-                PrintDump("Starting sinking iteration...\n");
+                PrintDump(VerbosityLevel::Low, "Starting sinking iteration...\n");
+                SinkIterations++;
 
                 for (auto &Pair : InstToCandidate)
                     SkipInstructions.insert(Pair.first);
@@ -1360,53 +1499,62 @@ namespace IGC {
                 // because they can enable further sinking of the large loads
                 // Create such candidates first
                 if (IGC_IS_FLAG_ENABLED(LoopSinkEnableVectorShuffle))
-                    tryCreateShufflePatternCandidates(L, SkipInstructions, CurrentSinkCandidates);
+                    tryCreateShufflePatternCandidates(L->getLoopPreheader(), L, SkipInstructions, CurrentSinkCandidates);
 
                 // Create simple (1-instr) candidates for sinking by traversing the preheader once
                 createSimpleCandidates(SkipInstructions, CurrentSinkCandidates);
             }
-
-            // Make decisions for "MaybeSink" candidates
-            CandidateVec ToSink = refineLoopSinkCandidates(CurrentSinkCandidates, LoadChains, L);
+            else
+            {
+                PrintDump(VerbosityLevel::Low, "Late rescheduling iteration...\n");
+            }
 
             // Sink the beneficial instructions
             bool IterChanged = false;
 
-            for (auto &C : ToSink)
+            IterChanged |= LateReschedulingIteration;
+
+            if (!LateReschedulingIteration)
             {
-                if (C->Worthiness == LoopSinkWorthiness::Sink || C->Worthiness == LoopSinkWorthiness::IntraLoopSink)
+                // Make decisions for "MaybeSink" candidates
+                CandidateVec ToSink = refineLoopSinkCandidates(CurrentSinkCandidates, LoadChains, L);
+
+                for (auto &C : ToSink)
                 {
-                    IGC_ASSERT(C->size() > 0);
+                    if (C->Worthiness == LoopSinkWorthiness::Sink || C->Worthiness == LoopSinkWorthiness::IntraLoopSink)
+                    {
+                        IGC_ASSERT(C->size() > 0);
 
-                    SinkedCandidates.push_back(std::move(C));
-                    Candidate *SC = SinkedCandidates.back().get();
+                        SinkedCandidates.push_back(std::move(C));
+                        Candidate *SC = SinkedCandidates.back().get();
 
-                    bool SinkFromPH = SC->Worthiness == LoopSinkWorthiness::Sink;
-                    Instruction *InsertPoint = SinkFromPH ?
-                        &*SC->TgtBB->getFirstInsertionPt() : SC->first()->getNextNode();
+                        bool SinkFromPH = SC->Worthiness == LoopSinkWorthiness::Sink;
+                        Instruction *InsertPoint = SinkFromPH ?
+                            &*SC->TgtBB->getFirstInsertionPt() : SC->first()->getNextNode();
 
-                    for (Instruction *I : *SC) {
-                        PrintDump((SinkFromPH ? "Sinking instruction:\n" : "Scheduling instruction for local sink:\n"));
-                        PrintInstructionDump(I);
+                        for (Instruction *I : *SC) {
+                            PrintDump(VerbosityLevel::Medium, (SinkFromPH ? "Sinking instruction:\n" : "Scheduling instruction for local sink:\n"));
+                            PrintInstructionDump(VerbosityLevel::Medium, I);
 
-                        CurrentInstToCandidate[I] = SC;
-                        InstToCandidate[I] = SC;
+                            CurrentInstToCandidate[I] = SC;
+                            InstToCandidate[I] = SC;
 
-                        I->moveBefore(InsertPoint);
-                        InsertPoint = I;
+                            I->moveBefore(InsertPoint);
+                            InsertPoint = I;
 
-                        if (SinkFromPH)
-                        {
-                            if (isAllowedLoad(I) || isLoadChain(I, LoadChains))
-                                LoadChains.insert(I);
+                            if (SinkFromPH)
+                            {
+                                if (isAllowedLoad(I) || isLoadChain(I, LoadChains))
+                                    LoadChains.insert(I);
+                            }
                         }
+
+                        UndoBlkSet.insert(SC->UndoPos->getParent());
+                        LocalBlkSet.insert(SC->TgtBB);
+
+                        PrintDump(VerbosityLevel::Medium, "\n");
+                        IterChanged = true;
                     }
-
-                    UndoBlkSet.insert(SC->UndoPos->getParent());
-                    LocalBlkSet.insert(SC->TgtBB);
-
-                    PrintDump("\n");
-                    IterChanged = true;
                 }
             }
 
@@ -1422,34 +1570,59 @@ namespace IGC {
                 {
                     InstsSet.insert(Pair.first);
                 }
-                uint SinkedSizeInBytes = RPE->estimateSizeInBytes(InstsSet, *F, SIMD, &WI);
+                uint SinkedSizeInBytes = RPE->estimateSizeInBytes(InstsSet, *F, SIMD, WI);
                 uint SinkedSizeInRegs = RPE->bytesToRegisters(SinkedSizeInBytes);
 
-                // Invoke LocalSink() to move def to its first use
+                if (LateReschedulingIteration)
+                {
+                    for (auto &C : SinkedCandidates)
+                    {
+                        LocalBlkSet.insert(C->TgtBB);
+                    }
+                }
+
+                // Invoke localSink() to move def to its first use
                 if (LocalBlkSet.size() > 0)
                 {
                     for (auto BI = LocalBlkSet.begin(), BE = LocalBlkSet.end(); BI != BE; BI++)
                     {
                         BasicBlock *BB = *BI;
-                        localSink(BB, CurrentInstToCandidate);
+
+                        if (ReschedulingIteration)
+                        {
+                            rescheduleCandidates(BB, SinkedCandidates, CurrentInstToCandidate, LOOPSINK_RESCHEDULE_ITERATIONS);
+                        }
+                        else if (LateReschedulingIteration)
+                        {
+                            InstToCandidateMap InstToCandidateCopy = InstToCandidate;
+                            rescheduleCandidates(BB, SinkedCandidates, InstToCandidateCopy, LOOPSINK_RESCHEDULE_ITERATIONS + SinkIterations, true);
+                        }
+                        else  // sinking iteration
+                        {
+                            localSink(BB, CurrentInstToCandidate);
+                        }
                     }
                     LocalBlkSet.clear();
                 }
 
-                if (MaxLoopPressure - SinkedSizeInRegs > NeededRegpressure)
-                {
-                    // Heuristic to save recalculation of liveness
-                    // The size of the candidates set is not enough to reach the needed regpressure
-                    PrintDump("Running one more iteration without recalculating liveness...\n");
-                    RecomputeMaxLoopPressure = true;
-                    ReschedulingIteration = false;
-                    continue;
-                }
+                if (!LateReschedulingIteration)  // do one more sinking iteration only if it's a sinking iteration
+                    if (MaxLoopPressure - SinkedSizeInRegs > NeededRegpressure)
+                    {
+                        // Heuristic to save recalculation of liveness
+                        // The size of the candidates set is not enough to reach the needed regpressure
+                        PrintDump(VerbosityLevel::Low, "Running one more iteration without recalculating liveness...\n");
+                        RecomputeMaxLoopPressure = true;
+                        ReschedulingIteration = false;
+                        continue;
+                    }
 
                 rerunLiveness();
                 MaxLoopPressure = getMaxRegCountForLoop(L);
                 RecomputeMaxLoopPressure = false;
-                PrintDump("New max loop pressure = " << MaxLoopPressure << "\n");
+                PrintDump(VerbosityLevel::Low, "New max loop pressure = " << MaxLoopPressure << "\n");
+
+                if (LateReschedulingIteration)
+                    break;
 
                 if ((MaxLoopPressure < NeededRegpressure)
                         && (Mode == LoopSinkMode::SinkWhileRegpressureIsHigh))
@@ -1457,26 +1630,32 @@ namespace IGC {
                     AchievedNeededRegpressure = true;
                     if (IGC_IS_FLAG_ENABLED(EnableLoadChainLoopSink) && !LoadChains.empty())
                     {
-                        PrintDump("Allowing only chain sinking...\n");
+                        PrintDump(VerbosityLevel::Low, "Allowing only chain sinking...\n");
                         AllowOnlySingleUseLoadChainSinking = true;
                     }
                     else
                     {
-                        PrintDump("Achieved needed regpressure, finished.\n");
+                        PrintDump(VerbosityLevel::Low, "Achieved needed regpressure, finished.\n");
                         break;
                     }
                 }
             }
-            else if (!ReschedulingIteration)
+            else if (!ReschedulingIteration)  // sinking iteration
             {
                 if (!AllowLoadSinking && IGC_IS_FLAG_ENABLED(EnableLoadsLoopSink))
                 {
-                    PrintDump("Allowing loads...\n");
+                    PrintDump(VerbosityLevel::Low, "Allowing loads...\n");
                     AllowLoadSinking = true;
+                }
+                else if (!AchievedNeededRegpressure &&
+                         Mode == LoopSinkMode::SinkWhileRegpressureIsHigh &&
+                         IGC_IS_FLAG_ENABLED(LoopSinkEnableLateRescheduling))
+                {
+                    LateReschedulingIteration = true;
                 }
                 else
                 {
-                    PrintDump("Nothing to sink, finished.\n");
+                    PrintDump(VerbosityLevel::Low, "Nothing to sink, finished.\n");
                     break;
                 }
             }
@@ -1486,7 +1665,7 @@ namespace IGC {
 
         if (!EverChanged)
         {
-            PrintDump("No changes were made in this loop.\n");
+            PrintDump(VerbosityLevel::Low, "No changes were made in this loop.\n");
             return false;
         }
 
@@ -1496,7 +1675,7 @@ namespace IGC {
             MaxLoopPressure = getMaxRegCountForLoop(L);
         }
 
-        PrintDump("New max loop pressure = " << MaxLoopPressure << "\n");
+        PrintDump(VerbosityLevel::Low, "New max loop pressure = " << MaxLoopPressure << "\n");
 
         bool NeedToRollback = IGC_IS_FLAG_ENABLED(LoopSinkForceRollback);
 
@@ -1510,7 +1689,7 @@ namespace IGC {
         // as a result of such speculative sinking.
         if (MaxLoopPressure > InitialLoopPressure)
         {
-            PrintDump("Loop pressure increased after sinking.\n");
+            PrintDump(VerbosityLevel::Low, "Loop pressure increased after sinking.\n");
             NeedToRollback = true;
         }
 
@@ -1525,9 +1704,9 @@ namespace IGC {
             MaxLoopPressure >= (NGRF + IGC_GET_FLAG_VALUE(LoopSinkRollbackThreshold))
             )
         {
-            PrintDump("AutoGRF is enabled and the needed regpressure is not achieved:\n");
-            PrintDump("New max loop pressure = " << MaxLoopPressure << "\n");
-            PrintDump("Threshold to rollback = " <<
+            PrintDump(VerbosityLevel::Low, "AutoGRF is enabled and the needed regpressure is not achieved:\n");
+            PrintDump(VerbosityLevel::Low, "New max loop pressure = " << MaxLoopPressure << "\n");
+            PrintDump(VerbosityLevel::Low, "Threshold to rollback = " <<
                 NGRF + IGC_GET_FLAG_VALUE(LoopSinkRollbackThreshold) << "\n");
 
             NeedToRollback = true;
@@ -1535,21 +1714,19 @@ namespace IGC {
 
         if (NeedToRollback && IGC_IS_FLAG_DISABLED(LoopSinkDisableRollback))
         {
-            PrintDump(">> Reverting the changes.\n");
+            PrintDump(VerbosityLevel::Low, ">> Reverting the changes.\n\n");
 
-            for (auto CI = SinkedCandidates.rbegin(), CE = SinkedCandidates.rend(); CI != CE; CI++)
+            for (auto &[BB, BBInstructions] : OriginalPositions)
             {
-                Candidate *C = CI->get();
-                Instruction *UndoPos = C->UndoPos;
-                IGC_ASSERT(UndoPos);
-                while (InstToCandidate.count(UndoPos))
+                Instruction *InsertPoint = nullptr;
+                for (Instruction *I : BBInstructions)
                 {
-                    UndoPos = InstToCandidate[UndoPos]->UndoPos;
-                }
-                for (Instruction *I : *C)
-                {
-                    I->moveBefore(UndoPos);
-                    UndoPos = I;
+                    if (InsertPoint)
+                        I->moveAfter(InsertPoint);
+                    else
+                        I->moveBefore(&*BB->getFirstInsertionPt());
+
+                    InsertPoint = I;
                 }
             }
 
@@ -1617,14 +1794,14 @@ namespace IGC {
         if (SkipInstructions.count(cast<Instruction>(AddrPayload)))
             return false;
 
-        PrintDump("Found 2d block read instruction, trying to create candidate group:\n");
-        PrintInstructionDump(I);
-        PrintDump("AddrPayload:\n");
-        PrintInstructionDump(AddrPayload);
+        PrintDump(VerbosityLevel::Medium, "Found 2d block read instruction, trying to create candidate group:\n");
+        PrintInstructionDump(VerbosityLevel::Medium, I);
+        PrintDump(VerbosityLevel::Medium, "AddrPayload:\n");
+        PrintInstructionDump(VerbosityLevel::Medium, AddrPayload);
 
         bool Start = false;
 
-        SmallVector<llvm::Instruction *, 16> CandidateInsts;
+        InstrVec CandidateInsts;
         BasicBlock *TgtBB = nullptr;
 
         // Traversing the PH or the BB in the loop in reverse order
@@ -1633,11 +1810,11 @@ namespace IGC {
 
         if (I->getParent() == PH)
         {
-            PrintDump("Traversing the preheader:\n");
+            PrintDump(VerbosityLevel::High, "Traversing the preheader...\n");
         }
         else
         {
-            PrintDump("Traversing the BB with the instruction:\n");
+            PrintDump(VerbosityLevel::High, "Traversing the BB with the instruction...\n");
         }
 
         for (auto IB = I->getParent()->rbegin(), IE = I->getParent()->rend(); IB != IE;)
@@ -1674,21 +1851,21 @@ namespace IGC {
             // We expect to see only the following intrinsics for this AddrPayload
             if (Id == GenISAIntrinsic::GenISA_LSC2DBlockSetAddrPayloadField)
             {
-                PrintDump("Found GenISA_LSC2DBlockSetAddrPayloadField:\n");
-                PrintInstructionDump(II);
+                PrintDump(VerbosityLevel::High, "Found GenISA_LSC2DBlockSetAddrPayloadField:\n");
+                PrintInstructionDump(VerbosityLevel::High, II);
                 CandidateInsts.push_back(II);
             }
             else if (Id == GenISAIntrinsic::GenISA_LSC2DBlockReadAddrPayload)
             {
-                PrintDump("Found GenISA_LSC2DBlockReadAddrPayload:\n");
-                PrintInstructionDump(II);
+                PrintDump(VerbosityLevel::High, "Found GenISA_LSC2DBlockReadAddrPayload:\n");
+                PrintInstructionDump(VerbosityLevel::High, II);
 
                 if (!isSafeToLoopSinkLoad(II, L))
                 {
-                    PrintDump("Not safe to sink the load, skipping.\n");
+                    PrintDump(VerbosityLevel::High, "Not safe to sink the load, skipping.\n");
                     return false;
                 }
-                PrintDump("Safe to sink the load.\n");
+                PrintDump(VerbosityLevel::High, "Safe to sink the load.\n");
 
                 BasicBlock *CurrentTgtBB = I->getParent() == PH ? findLowestLoopSinkTarget(I, L) : I->getParent();
                 if (!CurrentTgtBB)
@@ -1706,24 +1883,24 @@ namespace IGC {
                         TgtBB = DT->findNearestCommonDominator(TgtBB, CurrentTgtBB);
                         if (!TgtBB)
                         {
-                            PrintDump("No common dominator found, skipping.\n");
+                            PrintDump(VerbosityLevel::High, "No common dominator found, skipping.\n");
                             return false;
                         }
                     }
                     else
                     {
-                        PrintDump("Not all the uses are in the same BB, skipping.\n");
+                        PrintDump(VerbosityLevel::High, "Not all the uses are in the same BB, skipping.\n");
                         return false;
                     }
                 }
 
-                PrintDump("Adding the instruction to this candidate group.\n");
+                PrintDump(VerbosityLevel::High, "Adding the instruction to this candidate group.\n");
                 CandidateInsts.push_back(II);
             }
             else
             {
-                PrintDump("Unexpected intrinsic, skipping:\n");
-                PrintInstructionDump(II);
+                PrintDump(VerbosityLevel::High, "Unexpected intrinsic, skipping:\n");
+                PrintInstructionDump(VerbosityLevel::High, II);
 
                 return false;
             }
@@ -1733,7 +1910,7 @@ namespace IGC {
 
         if (!TgtBB)
         {
-            PrintDump("No target block to sink, skipping.\n");
+            PrintDump(VerbosityLevel::High, "No target block to sink, skipping.\n");
             return false;
         }
 
@@ -1741,19 +1918,18 @@ namespace IGC {
         // All other uses should be in the same BB
         if (CandidateInsts.size() != AddrPayload->getNumUses())
         {
-            PrintDump("Not all the uses of the AddrPayload are in the same BB, skipping.\n");
+            PrintDump(VerbosityLevel::High, "Not all the uses of the AddrPayload are in the same BB, skipping.\n");
             return false;
         }
 
         // Check that all the uses are dominated by the remaining uses
-        // We avoid changing the order of the loads for now
 
         // We have a number of current candidates, they will be placed before their uses.
-        // The remaining instructions are initially places earlier than the current candidates.
+        // The remaining instructions are initially placed earlier than the current candidates.
         // If the remaining instructions are dominated by the current candidates, we can split the current candidates
         // So that they are scheduled separately, because in this case the order will be not changed.
-        auto allUsesAreDominatedByRemainingUses = [&](SmallVector<Instruction *, 16> &CurrentCandidateInsts,
-            SmallPtrSet<Instruction *, 16> &RemainingCandidateInsts)
+        auto allUsesAreDominatedByRemainingUses = [&](InstrVec &CurrentCandidateInsts,
+            InstSet &RemainingCandidateInsts)
         {
             auto instUsesDominateAllCurrentCandidateUses = [&](Instruction *RI)
             {
@@ -1777,16 +1953,13 @@ namespace IGC {
                 return true;
             };
 
-            if (IGC_IS_FLAG_ENABLED(LoopSinkCoarserLoadsRescheduling))
-                return std::all_of(RemainingCandidateInsts.begin(), RemainingCandidateInsts.end(), instUsesDominateAllCurrentCandidateUses);
-            else
-                return std::any_of(RemainingCandidateInsts.begin(), RemainingCandidateInsts.end(), instUsesDominateAllCurrentCandidateUses);
+            return std::all_of(RemainingCandidateInsts.begin(), RemainingCandidateInsts.end(), instUsesDominateAllCurrentCandidateUses);
         };
 
         // If the uses are not dominated by the UndoPoint
         // It's possible that we put some instructions after their uses on rollback
         // So it needs to be checked if we sink not from PH
-        auto allUsesAreDominatedByUndoPoint = [&](SmallVector<Instruction *, 16> &CurrentCandidateInsts, Instruction *UndoPoint)
+        auto allUsesAreDominatedByUndoPoint = [&](InstrVec &CurrentCandidateInsts, Instruction *UndoPoint)
         {
             for (Instruction *CI : CurrentCandidateInsts)
             {
@@ -1802,12 +1975,76 @@ namespace IGC {
             return true;
         };
 
+        auto assertOneLoad = [&](InstrVec &CurrentCandidateInsts)
+        {
+            int NumLoads = 0;
+            for (Instruction *CI : CurrentCandidateInsts)
+            {
+                GenIntrinsicInst *CurIntr = cast<GenIntrinsicInst>(CI);
+                if (CurIntr->getIntrinsicID() == GenISAIntrinsic::GenISA_LSC2DBlockReadAddrPayload)
+                {
+                    NumLoads++;
+                }
+            }
+            IGC_ASSERT(NumLoads == 1);
+        };
+
+        typedef SmallSet<int, 16> FieldIndicesSet;
+
+        auto getAllSetFieldIndices = [&](InstrVec &CurrentCandidateInsts)
+        {
+            FieldIndicesSet AllSetFieldIndices;
+            for (Instruction *CI : CurrentCandidateInsts)
+            {
+                GenIntrinsicInst *CurIntr = cast<GenIntrinsicInst>(CI);
+                if (CurIntr->getIntrinsicID() == GenISAIntrinsic::GenISA_LSC2DBlockSetAddrPayloadField)
+                {
+                    int FieldIndex = cast<ConstantInt>(CurIntr->getOperand(1))->getZExtValue();
+                    AllSetFieldIndices.insert(FieldIndex);
+                }
+            }
+            return AllSetFieldIndices;
+        };
+
+
         // All the uses are a candidate
-        // Try splitting then into separate candidates for better scheduling within a BB
+        // Try splitting them into separate candidates for better scheduling within a BB
         bool SinkFromPH = I->getParent() == PH;
         auto Worthiness = SinkFromPH ? LoopSinkWorthiness::Sink : LoopSinkWorthiness::IntraLoopSink;
-        SmallVector<Instruction *, 16> CurrentCandidateInsts;
-        SmallPtrSet<Instruction *, 16> RemainingCandidateInsts(CandidateInsts.begin(), CandidateInsts.end());
+
+        DenseMap<Instruction *, DenseMap<int, Value *>> AddrPayloadFieldValues;
+        DenseMap<int, Value *> CurrentAddrPayloadFieldValues;
+
+        // Collect information about what fields are set before the load
+        // AddrPayloadFieldValues can then be used to create more SetField intrinsics enabling finer scheduling
+        // in case different fields are set before the load
+
+        // iterate SinkCandidates in reverse order - so the instruction appear in the direct order in the BB
+        for (auto II = CandidateInsts.rbegin(), IE = CandidateInsts.rend(); II != IE; II++)
+        {
+            GenIntrinsicInst *CurIntr = cast<GenIntrinsicInst>(*II);
+
+            if (CurIntr->getIntrinsicID() == GenISAIntrinsic::GenISA_LSC2DBlockSetAddrPayloadField)
+            {
+                int FieldIndex = cast<ConstantInt>(CurIntr->getOperand(1))->getZExtValue();
+                CurrentAddrPayloadFieldValues[FieldIndex] = CurIntr->getOperand(2);
+            }
+            else if (CurIntr->getIntrinsicID() == GenISAIntrinsic::GenISA_LSC2DBlockReadAddrPayload)
+            {
+                AddrPayloadFieldValues[*II] = DenseMap<int, Value *>(CurrentAddrPayloadFieldValues);
+            }
+        }
+
+        // keys of map CurrentAddrPayloadFieldValues contain all fields
+        // that were set at least by one SetField instruction
+        FieldIndicesSet AllFields;
+        for (auto &Pair : CurrentAddrPayloadFieldValues)
+        {
+            AllFields.insert(Pair.first);
+        }
+
+        InstrVec CurrentCandidateInsts;
+        InstSet RemainingCandidateInsts(CandidateInsts.begin(), CandidateInsts.end());
 
         uint NCandidates = 0;
         for (Instruction *I : CandidateInsts)
@@ -1819,26 +2056,86 @@ namespace IGC {
             auto Id = CurIntr->getIntrinsicID();
 
             if (CurrentCandidateInsts.size() > 0 &&
-                Id == GenISAIntrinsic::GenISA_LSC2DBlockReadAddrPayload &&
-                allUsesAreDominatedByRemainingUses(CurrentCandidateInsts, RemainingCandidateInsts) &&
-                (SinkFromPH || allUsesAreDominatedByUndoPoint(CurrentCandidateInsts, CurrentCandidateInsts[0]->getNextNode())))
+                Id == GenISAIntrinsic::GenISA_LSC2DBlockReadAddrPayload)
             {
-                NCandidates++;
-                SinkCandidates.push_back(std::make_unique<Candidate>(CurrentCandidateInsts, TgtBB, Worthiness, CurrentCandidateInsts[0]->getNextNode()));
-                CurrentCandidateInsts.clear();
+                if (!SinkFromPH && !allUsesAreDominatedByUndoPoint(CurrentCandidateInsts, CurrentCandidateInsts[0]))
+                {
+                    PrintDump(VerbosityLevel::High, "Not all the uses are dominated by the UndoPoint, skipping.\n");
+                    return false;
+                }
+
+                if (IGC_IS_FLAG_ENABLED(LoopSinkCoarserLoadsRescheduling))
+                {
+                    if (allUsesAreDominatedByRemainingUses(CurrentCandidateInsts, RemainingCandidateInsts))
+                    {
+                        NCandidates++;
+                        SinkCandidates.push_back(std::make_unique<Candidate>(CurrentCandidateInsts, TgtBB, Worthiness, CurrentCandidateInsts[0]->getNextNode()));
+                        CurrentCandidateInsts.clear();
+                    }
+                }
+                else
+                {
+                    // We are going to create a separate Candidate for every load
+
+                    if (getAllSetFieldIndices(CurrentCandidateInsts) != AllFields)
+                    {
+                        /*
+                        The SetField intrinsics are not in SSA form and the order of them is important,
+                        as when we schedule the load together with the previous SetFields changing the order may affect the result
+
+                        For example, if we change the order of the 2 loads in the following example then load2 will no more have the field #2 == 80
+
+                        call void @llvm.genx.GenISA.LSC2DBlockSetAddrPayloadField.p0i8.i32(i8* %Block2D_AddrPayload, i32 2, i32 80, i1 false)
+                        call void @llvm.genx.GenISA.LSC2DBlockSetAddrPayloadField.p0i8.i32(i8* %Block2D_AddrPayload, i32 5, i32 3, i1 false)
+                        call void @llvm.genx.GenISA.LSC2DBlockSetAddrPayloadField.p0i8.i32(i8* %Block2D_AddrPayload, i32 6, i32 3, i1 false)
+                        %load3 = call <32 x i16> @llvm.genx.GenISA.LSC2DBlockReadAddrPayload.v32i16.p0i8(i8* %Block2D_AddrPayload, i32 0, i32 0, i32 16, i32 16, i32 16, i32 2, i1 false, i1 false, i32 4)
+
+                        call void @llvm.genx.GenISA.LSC2DBlockSetAddrPayloadField.p0i8.i32(i8* %Block2D_AddrPayload, i32 5, i32 2, i1 false)
+                        call void @llvm.genx.GenISA.LSC2DBlockSetAddrPayloadField.p0i8.i32(i8* %Block2D_AddrPayload, i32 6, i32 2, i1 false)
+                        %load2 = call <32 x i16> @llvm.genx.GenISA.LSC2DBlockReadAddrPayload.v32i16.p0i8(i8* %Block2D_AddrPayload, i32 0, i32 0, i32 16, i32 16, i32 16, i32 2, i1 false, i1 false, i32 4)
+
+                        It's possible to create more GenISA_LSC2DBlockSetAddrPayloadField intrinsic calls, in this example
+                        Create SetField to set field 2 to 80 before load2.
+
+                        For this AddrPayloadFieldValues[BlockRead] can be used. If the field is not set in the AddrPayloadFieldValues[BlockRead]
+                        then the field should be taken from AddrPayload operands.
+
+                        For now it's unsupported as we can only have fields 5 and 6, so we skip the candidate creations for this AddrPayload completely.
+                        */
+
+                        PrintDump(VerbosityLevel::High, "Not all the fields are set, skipping the payload.\n");
+                        PrintDump(VerbosityLevel::High, "2d Block read:")
+                        Instruction *BlockRead = cast<Instruction>(CurrentCandidateInsts[0]);
+                        PrintInstructionDump(VerbosityLevel::High, BlockRead);
+                        PrintDump(VerbosityLevel::High, "AddrPayload:");
+                        PrintInstructionDump(VerbosityLevel::High, AddrPayload);
+
+                        return false;
+                    }
+
+                    assertOneLoad(CurrentCandidateInsts);
+                    NCandidates++;
+                    SinkCandidates.push_back(std::make_unique<Candidate>(CurrentCandidateInsts, TgtBB, Worthiness, CurrentCandidateInsts[0]->getNextNode()));
+                    CurrentCandidateInsts.clear();
+                }
             }
             CurrentCandidateInsts.push_back(I);
             RemainingCandidateInsts.erase(I);
         }
-        if (CurrentCandidateInsts.size() > 0 &&
-            (SinkFromPH || allUsesAreDominatedByUndoPoint(CurrentCandidateInsts, CurrentCandidateInsts[0]->getNextNode())))
+
+        if (CurrentCandidateInsts.size() > 0)
         {
+            if (!SinkFromPH && !allUsesAreDominatedByUndoPoint(CurrentCandidateInsts, CurrentCandidateInsts[0]))
+            {
+                PrintDump(VerbosityLevel::High, "Not all the uses are dominated by the UndoPoint, skipping.\n");
+                return false;
+            }
             NCandidates++;
             SinkCandidates.push_back(std::make_unique<Candidate>(CurrentCandidateInsts, TgtBB, Worthiness, CurrentCandidateInsts[0]->getNextNode()));
         }
 
-        PrintDump("Successfully created " << NCandidates << " candidates.\n");
-        return true;
+        PrintDump(VerbosityLevel::Medium, "Successfully created " << NCandidates << " candidates.\n");
+        return NCandidates > 0;
     }
 
     CodeLoopSinking::StoresVec CodeLoopSinking::getAllStoresInLoop(Loop *L)
@@ -1848,7 +2145,7 @@ namespace IGC {
         // if all the stores for this loop are not memoized yet, do it first
         if (!MemoizedStoresInLoops.count(L))
         {
-            llvm::SmallVector<Instruction *, 32>& StoresInLoop = MemoizedStoresInLoops[L];
+            StoresVec& StoresInLoop = MemoizedStoresInLoops[L];
             for (BasicBlock *BB: L->blocks())
             {
                 for (Instruction &I : *BB)
@@ -1864,11 +2161,13 @@ namespace IGC {
     }
 
     bool CodeLoopSinking::tryCreateShufflePatternCandidates(
+        BasicBlock *BB,
         Loop *L,
         InstSet &SkipInstructions,
         CandidateVec &SinkCandidates)
     {
         BasicBlock *Preheader = L->getLoopPreheader();
+        bool SinkFromPH = BB == Preheader;
 
         // It's possible that a large vector is shuffled to different smaller vectors
         // but if all the vector components are used only in ExtractElement and
@@ -1882,7 +2181,7 @@ namespace IGC {
         // a particular dest vector
         auto SourceVectorIsFullyShuffled = [&](
             Value *SourceVec,
-            SmallVector<InsertElementInst *, 4> &IEs,
+            SmallVectorImpl<InsertElementInst *> &IEs,
             DenseMap<InsertElementInst *, InstSet> &DestVecMap)
         {
             auto SourceVectorType = dyn_cast<IGCLLVM::FixedVectorType>(SourceVec->getType());
@@ -1916,7 +2215,7 @@ namespace IGC {
                     ShuffleInst.insert(CurrentIE);
 
                     ExtractElementInst *CurrentEE = dyn_cast<ExtractElementInst>(CurrentIE->getOperand(1));
-                    if (!CurrentEE || CurrentEE->getParent() != Preheader ||
+                    if (!CurrentEE || CurrentEE->getParent() != BB ||
                         (CurrentEE->getOperand(0) != SourceVec) || !CurrentEE->hasOneUse())
                     {
                         return false;
@@ -1935,7 +2234,7 @@ namespace IGC {
                     if (!CurrentIE)
                         break;
 
-                    if (CurrentIE->getParent() != Preheader)
+                    if (CurrentIE->getParent() != BB)
                         break;
                 }
 
@@ -1970,11 +2269,11 @@ namespace IGC {
 
         bool Changed = false;
 
-        PrintDump("Trying to create shuffle pattern candidates...\n");
+        PrintDump(VerbosityLevel::Low, "Trying to create shuffle pattern candidates...\n");
 
         // Map {Source vector Value : InsertElement instructions that create a new vector}
         SmallDenseMap<Value *, SmallVector<InsertElementInst *, 4>> SourceVectors;
-        for (Instruction &I : *Preheader)
+        for (Instruction &I : *BB)
         {
             if (auto *IE = dyn_cast<InsertElementInst>(&I))
             {
@@ -1982,15 +2281,22 @@ namespace IGC {
                     continue;
 
                 ExtractElementInst *EE = dyn_cast<ExtractElementInst>(IE->getOperand(1));
-                if (EE && EE->getParent() == Preheader)
-                {
-                    SourceVectors[EE->getVectorOperand()].push_back(IE);
-                }
+                if (!EE)
+                    continue;
+                if (EE->getParent() != BB)
+                    continue;
+                Instruction *Source = dyn_cast<Instruction>(EE->getVectorOperand());
+                if (!Source)
+                    continue;
+                if (!isAllowedLoad(Source))
+                    continue;
+
+                SourceVectors[EE->getVectorOperand()].push_back(IE);
             }
         }
 
         DenseMap<InsertElementInst *, InstSet> DestVecToShuffleInst;
-        SmallVector<Candidate, 16> ShuffleCandidates;
+        CandidateVec ShuffleCandidates;
         DenseMap<Instruction *, Candidate *> ShuffleInstToCandidate;
 
         for (auto &VecIEs : SourceVectors)
@@ -2017,7 +2323,8 @@ namespace IGC {
                     break;
                 }
 
-                BasicBlock *TgtBB = findLowestLoopSinkTarget(cast<Instruction>(DestVec), L);
+                BasicBlock *TgtBB = SinkFromPH ? findLowestLoopSinkTarget(cast<Instruction>(DestVec), L) : BB;
+
                 if (!TgtBB)
                     break;
 
@@ -2035,16 +2342,16 @@ namespace IGC {
                     auto &ShuffleInst = Pair.second;
                     auto *TgtBB = DestVecToTgtBB[DestVec];
 
-                    PrintDump("Instruction is a part of shuffle pattern, create a candidate:\n");
-                    PrintDump("DestVector used in the loop:\n");
-                    PrintInstructionDump(DestVec);
+                    PrintDump(VerbosityLevel::Medium, "Instruction is a part of shuffle pattern, create a candidate:\n");
+                    PrintDump(VerbosityLevel::Medium, "DestVector used in the loop:\n");
+                    PrintInstructionDump(VerbosityLevel::Medium, DestVec);
 
-                    ShuffleCandidates.emplace_back(Candidate::InstrVec{}, TgtBB, LoopSinkWorthiness::Sink, nullptr);
+                    ShuffleCandidates.push_back(std::make_unique<Candidate>(InstrVec{}, TgtBB, SinkFromPH ? LoopSinkWorthiness::Sink : LoopSinkWorthiness::IntraLoopSink, nullptr));
                     Changed = true;
 
                     for (Instruction *I : ShuffleInst)
                     {
-                        ShuffleInstToCandidate[I] = &ShuffleCandidates.back();
+                        ShuffleInstToCandidate[I] = ShuffleCandidates.back().get();
                     }
                 }
             }
@@ -2052,9 +2359,9 @@ namespace IGC {
 
         CandidatePtrVec ShuffleCandidatesOrdered;
 
-        // Traverse PH in reverse order and populate Candidates instructions so that they are in the right order
+        // Traverse BB in reverse order and populate Candidates instructions so that they are in the right order
         // Populate the ShuffleCandidatesOrdered with Candidates in the right order
-        for (auto IB = Preheader->rbegin(), IE = Preheader->rend(); IB != IE; ++IB)
+        for (auto IB = BB->rbegin(), IE = BB->rend(); IB != IE; ++IB)
         {
             Instruction *I = &*IB;
 
@@ -2144,8 +2451,8 @@ namespace IGC {
     /// instruction in the loop using alias information
     bool CodeLoopSinking::isSafeToLoopSinkLoad(Instruction *InstToSink, Loop *L)
     {
-        PrintDump("Checking if it is safe to sink the load:\n");
-        PrintInstructionDump(InstToSink);
+        PrintDump(VerbosityLevel::High, "Checking if it is safe to sink the load:\n");
+        PrintInstructionDump(VerbosityLevel::High, InstToSink);
 
         if (!L || !AA)
             return false;
@@ -2155,7 +2462,7 @@ namespace IGC {
 
         if (!isAllowedLoad(InstToSink))
         {
-            PrintDump("Unsupported load\n");
+            PrintDump(VerbosityLevel::High, "Unsupported load\n");
             return false;
         }
 
@@ -2216,8 +2523,8 @@ namespace IGC {
         {
             for (Instruction *I: *Stores)
             {
-                PrintDump("Store:\n");
-                PrintInstructionDump(I);
+                PrintDump(VerbosityLevel::High, "Store:\n");
+                PrintInstructionDump(VerbosityLevel::High, I);
 
                 bool UnsupportedStore = true;
                 if (GenIntrinsicInst *Intr = dyn_cast<GenIntrinsicInst>(I))
@@ -2231,26 +2538,29 @@ namespace IGC {
                         case GenISAIntrinsic::GenISA_LSC2DBlockPrefetchAddrPayload:
                         case GenISAIntrinsic::GenISA_LSC2DBlockPrefetch:
                         case GenISAIntrinsic::GenISA_LSC2DBlockSetAddrPayloadField:
-                            PrintDump("Load/prefetch instruction, may not alias\n");
+                            PrintDump(VerbosityLevel::High, "Load/prefetch instruction, may not alias\n");
                             continue;
 
                         // Change only registers
                         case GenISAIntrinsic::GenISA_LSC2DBlockCreateAddrPayload:
                         case GenISAIntrinsic::GenISA_dpas:
                         case GenISAIntrinsic::GenISA_sub_group_dpas:
-                            PrintDump("Not a real store instruction, may not alias\n");
+                            PrintDump(VerbosityLevel::High, "Not a real store instruction, may not alias\n");
                             continue;
 
                         // Wave intrinsics
                         case GenISAIntrinsic::GenISA_WaveShuffleIndex:
                         case GenISAIntrinsic::GenISA_WaveBroadcast:
+                        case GenISAIntrinsic::GenISA_WaveClusteredBroadcast:
                         case GenISAIntrinsic::GenISA_WaveBallot:
                         case GenISAIntrinsic::GenISA_WaveInverseBallot:
+                        case GenISAIntrinsic::GenISA_WaveClusteredBallot:
                         case GenISAIntrinsic::GenISA_WaveAll:
                         case GenISAIntrinsic::GenISA_WaveClustered:
                         case GenISAIntrinsic::GenISA_WaveInterleave:
                         case GenISAIntrinsic::GenISA_WavePrefix:
-                            PrintDump("Not a real store instruction, may not alias\n");
+                        case GenISAIntrinsic::GenISA_WaveClusteredPrefix:
+                            PrintDump(VerbosityLevel::High, "Not a real store instruction, may not alias\n");
                             continue;
 
                         // Supported writes
@@ -2270,7 +2580,7 @@ namespace IGC {
 
                 if (UnsupportedStore)
                 {
-                    PrintDump("Unsupported store\n");
+                    PrintDump(VerbosityLevel::High, "Unsupported store\n");
 
                     if (L->contains(I->getParent()))
                         BlacklistedLoops.insert(L);
@@ -2280,13 +2590,13 @@ namespace IGC {
                 MemoryLocation B = getMemLoc(I);
                 if (!A.Ptr || !B.Ptr || AA->alias(A, B))
                 {
-                    PrintDump("May alias\n");
+                    PrintDump(VerbosityLevel::High, "May alias\n");
                     return false;
                 }
             }
         }
 
-        PrintDump("Safe\n");
+        PrintDump(VerbosityLevel::High, "Safe\n");
         return true;
     }
 
@@ -2448,7 +2758,7 @@ namespace IGC {
                 int DstSize = getDstSize(V);
                 if (!DstSize)
                     return false;
-                if (WI.isUniform(V))
+                if (WI->isUniform(V))
                     continue;
                 AccSave -= DstSize / 8;
             }
@@ -2465,7 +2775,7 @@ namespace IGC {
                     int DstSize = getDstSize(V);
                     if (!DstSize)
                         return false;
-                    if (WI.isUniform(V))
+                    if (WI->isUniform(V))
                         continue;
                     AllUsersAreUniform = false;
                     AccSave += DstSize / 8;
@@ -2557,12 +2867,12 @@ namespace IGC {
         for (OperandUseGroup &OUG : InstUseInfo)
         {
 
-            PrintDump("Checking if sinking the group is beneficial:\n");
-            PrintOUGDump(OUG);
+            PrintDump(VerbosityLevel::Medium, "Checking if sinking the group is beneficial:\n");
+            PrintOUGDump(VerbosityLevel::Medium, OUG);
 
             if (!isBeneficialToSink(OUG))
                 continue;
-            PrintDump(">> Beneficial to sink.\n\n");
+            PrintDump(VerbosityLevel::Medium, ">> Beneficial to sink.\n\n");
             for (auto &C : OUG.Users)
             {
                 (*C)->Worthiness = LoopSinkWorthiness::Sink;
@@ -2576,23 +2886,75 @@ namespace IGC {
     // Sink to the use within basic block
     bool CodeLoopSinking::localSink(
             BasicBlock *BB,
-            InstToCandidateMap &InstToCandidate
+            InstToCandidateMap &InstToCandidate,
+            bool Aggressive
         )
     {
-        auto isPartOfUnsplittableGroup = [](Instruction *Inst)
-        {
-            if (GenIntrinsicInst *Intr = dyn_cast<GenIntrinsicInst>(Inst))
-            {
-                switch (Intr->getIntrinsicID())
-                {
-                case GenISAIntrinsic::GenISA_dpas:
-                case GenISAIntrinsic::GenISA_sub_group_dpas:
-                    if (IGC_IS_FLAG_ENABLED(LoopSinkAvoidSplittingDPAS))
-                        return true;
-                default:
-                    break;
+        // A dpas macro sequence is a sequence of dpas without other
+        // instructions in the middle. If a macro sequence is used in
+        // this BB, skip sinking as code is likely manually-tuned code.
+        //
+        // The macro sequence normally has 8 dpas at least. Here, if there
+        // are 8 dpas in the BB, assume the BB has a macro sequence.
+        bool hasDPASMacro = false;
+        if (IGC_IS_FLAG_ENABLED(LoopSinkSkipDPASMacro)) {
+            int numDpas = 0;
+            for (auto &II : *BB) {
+                Instruction *I = &II;
+                if (isDPAS(I)) {
+                  ++numDpas;
                 }
             }
+            hasDPASMacro = (numDpas >= 8);
+        }
+
+        auto isPartOfUnsplittableGroup = [&](Instruction *Inst)
+        {
+            auto haveCommonParameter = [](Instruction *Inst, Instruction *PrevInst)
+            {
+                for (unsigned i = 0; i < Inst->getNumOperands(); ++i)
+                {
+                    for (unsigned j = 0; j < PrevInst->getNumOperands(); ++j)
+                    {
+                        Instruction *OpI = dyn_cast<Instruction>(Inst->getOperand(i));
+                        Instruction *OpPI = dyn_cast<Instruction>(PrevInst->getOperand(j));
+                        if (OpI && OpPI && OpI == OpPI)
+                            return true;
+                    }
+                }
+                return false;
+            };
+
+            if (IGC_IS_FLAG_ENABLED(LoopSinkAvoidSplittingDPAS) && isDPAS(Inst))
+            {
+                if (!Aggressive)
+                    return true;
+
+                // Aggressive local scheduling allows to sink in between DPASes
+                // But we place only between DPAS instructions that don't have common parameters
+                // (heuristic)
+                PrintDump(VerbosityLevel::High, "Checking DPAS:\n");
+                PrintInstructionDump(VerbosityLevel::High, Inst);
+
+                Instruction *PrevInst = Inst->getPrevNode();
+                if (!PrevInst || !isDPAS(PrevInst))
+                {
+                    if (PrevInst)
+                    {
+                        PrintDump(VerbosityLevel::High, "Previous instruction is not DPAS:\n");
+                        PrintInstructionDump(VerbosityLevel::High, PrevInst);
+                    }
+                    return false;
+                }
+
+                PrintDump(VerbosityLevel::High, "Checking previous DPAS:\n");
+                PrintInstructionDump(VerbosityLevel::High, PrevInst);
+
+                bool HCP = haveCommonParameter(Inst, PrevInst);
+                PrintDump(VerbosityLevel::High, "Have common parameter: " << HCP << "\n");
+                return HCP;
+            }
+
             return false;
         };
 
@@ -2603,9 +2965,12 @@ namespace IGC {
 
             bool BreakAfterGroup = isPartOfUnsplittableGroup(StartInsertPoint);
             if (!BreakAfterGroup && !isAllowedLoad(InstToMove))
+            {
+                PrintDump(VerbosityLevel::High, "Not part of unsplittable group and not a load. Place immediately.\n");
                 return StartInsertPoint;
+            }
 
-            int Cnt = IGC_GET_FLAG_VALUE(CodeSinkingLoadSchedulingInstr);
+            int Cnt = is2dBlockRead(InstToMove) ? IGC_GET_FLAG_VALUE(CodeSinking2dLoadSchedulingInstr) : IGC_GET_FLAG_VALUE(CodeSinkingLoadSchedulingInstr);
 
             Instruction *InsertPoint = StartInsertPoint;
             Instruction *I = StartInsertPoint->getPrevNode();
@@ -2616,16 +2981,6 @@ namespace IGC {
                     break;
                 if (std::any_of(I->use_begin(), I->use_end(),
                         [InstToMove](auto &U) {return llvm::cast<Instruction>(&U) == InstToMove;}))
-                    break;
-
-                if (isPartOfUnsplittableGroup(I))
-                {
-                    BreakAfterGroup = true;
-                    InsertPoint = I;
-                    I = I->getPrevNode();
-                    continue;
-                }
-                else if (BreakAfterGroup)
                     break;
 
                 if (I->mayWriteToMemory())
@@ -2640,11 +2995,21 @@ namespace IGC {
                     }
                 }
 
-                if (--Cnt <= 0)
-                    break;
-
                 InsertPoint = I;
                 I = I->getPrevNode();
+
+                if (isPartOfUnsplittableGroup(InsertPoint))
+                {
+                    BreakAfterGroup = true;
+                    continue;
+                }
+                else
+                {
+                    if (BreakAfterGroup)
+                        break;
+                    else if (--Cnt <= 0)
+                        break;
+                }
             }
             return InsertPoint;
         };
@@ -2656,13 +3021,13 @@ namespace IGC {
             if (isa<PHINode>(Use))
                 continue;
 
-            PrintDump("Local sink: Checking use: ");
-            PrintInstructionDump(Use);
+            PrintDump(VerbosityLevel::High, "Local sink: Checking use: ");
+            PrintInstructionDump(VerbosityLevel::High, Use);
 
             auto UseCit = InstToCandidate.find(Use);
             if (UseCit != InstToCandidate.end())
             {
-                PrintDump("The instruction was sinked, skipping.\n");
+                PrintDump(VerbosityLevel::High, "The instruction was sinked, skipping.\n");
                 continue;
             }
 
@@ -2675,12 +3040,16 @@ namespace IGC {
                 if (Def->getParent() != BB)
                     continue;
 
+                // Skip load if there is DPAS macro
+                if (hasDPASMacro && isAllowedLoad(Def))
+                    continue;
+
                 auto Cit = InstToCandidate.find(Def);
                 if (Cit == InstToCandidate.end())
                     continue;
 
-                PrintDump("Found candidate to local sink:\n");
-                PrintInstructionDump(Def);
+                PrintDump(VerbosityLevel::Medium, "Found candidate to local sink:\n");
+                PrintInstructionDump(VerbosityLevel::Medium, Def);
 
                 Candidate *C = Cit->second;
 
@@ -2689,8 +3058,8 @@ namespace IGC {
 
                 Instruction *InsertPoint = getInsertPointBeforeUse(MainInst, Use);
 
-                PrintDump("Inserting before:\n");
-                PrintInstructionDump(InsertPoint);
+                PrintDump(VerbosityLevel::Medium, "Inserting before:\n");
+                PrintInstructionDump(VerbosityLevel::Medium, InsertPoint);
 
                 // Candidate can be a group of several instructions, so sinking the whole Candidate
                 for (Instruction *CI : *C)

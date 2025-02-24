@@ -40,6 +40,7 @@ void BIFFlagCtrlResolution::FillFlagCtrl() {
   // inserted for this flag. If needed feed class BIFFlagCtrlResolution
   // with new value from outside.
   BIF_FLAG_CTRL_SET(PlatformType, PtrCGC->platform.GetProductFamily());
+  BIF_FLAG_CTRL_SET(RenderFamily, PtrCGC->platform.getPlatformInfo().eRenderCoreFamily);
   BIF_FLAG_CTRL_SET(
       FlushDenormals,
       ((PtrCGC->m_floatDenormMode32 == FLOAT_DENORM_FLUSH_TO_ZERO) ||
@@ -91,6 +92,18 @@ void BIFFlagCtrlResolution::FillFlagCtrl() {
     BIF_FLAG_CTRL_SET(UseHighAccuracyMath, false);
   }
 
+  // Stateless to stateful optimization checks if the offset of GEP instruction is positive.
+  // This is done with the assumption that the sign bit of global_id will be always off.
+  // This assume interferes with instcombine pass, so it is skipped unless really needed, that is:
+  //   1) StatelessToStateful pass is enabled, AND
+  //   2) Buffers don't use implicit bufferOffsetArg.
+  bool useAssumeInGetGlobalId = PtrCGC->m_DriverInfo.SupportsStatelessToStatefulBufferTransformation() &&
+      !PtrCGC->getModuleMetaData()->compOpt.GreaterThan4GBBufferRequired &&
+      IGC_IS_FLAG_ENABLED(EnableStatelessToStateful) &&
+      !((IGC_IS_FLAG_ENABLED(EnableSupportBufferOffset) || PtrCGC->getModuleMetaData()->compOpt.HasBufferOffsetArg)) &&
+      !PtrCGC->getModuleMetaData()->compOpt.OptDisable;
+  BIF_FLAG_CTRL_SET(UseAssumeInGetGlobalId, useAssumeInGetGlobalId);
+
   BIF_FLAG_CTRL_SET(EnableSWSrgbWrites,
                     IGC_GET_FLAG_VALUE(cl_khr_srgb_image_writes));
   BIF_FLAG_CTRL_SET(MaxHWThreadIDPerSubDevice,
@@ -103,6 +116,7 @@ void BIFFlagCtrlResolution::FillFlagCtrl() {
     BIF_FLAG_CTRL_SET(JointMatrixLoadStoreOpt, IGC_GET_FLAG_VALUE(JointMatrixLoadStoreOpt));
   }
 
+  BIF_FLAG_CTRL_SET(UseOOBChecks, PtrCGC->platform.needsOutOfBoundsBuiltinChecks());
 }
 
 #undef BIF_FLAG_CTRL_SET

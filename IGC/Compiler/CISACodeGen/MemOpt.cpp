@@ -13,8 +13,6 @@ SPDX-License-Identifier: MIT
 #include <llvmWrapper/Analysis/MemoryLocation.h>
 #include <llvmWrapper/Analysis/TargetLibraryInfo.h>
 #include <llvmWrapper/Analysis/AliasSetTracker.h>
-#include <llvm/Analysis/AliasAnalysis.h>
-#include "llvm/Analysis/AliasSetTracker.h"
 #include <llvm/Analysis/InstructionSimplify.h>
 #include <llvm/Analysis/ScalarEvolution.h>
 #include <llvm/Analysis/ScalarEvolutionExpressions.h>
@@ -82,8 +80,6 @@ namespace {
 
         bool AllowNegativeSymPtrsForLoad = false;
         bool AllowVector8LoadStore = false;
-
-        unsigned Limit = IGC_GET_FLAG_VALUE(MemOptWindowSize);
 
         // Map of profit vector lengths per scalar type. Each entry specifies the
         // profit vector length of a given scalar type.
@@ -523,8 +519,6 @@ bool MemOpt::runOnFunction(Function& F) {
     CGC = getAnalysis<CodeGenContextWrapper>().getCodeGenContext();
     TLI = &getAnalysis<TargetLibraryInfoWrapperPass>().getTLI();
 
-
-
     if (ProfitVectorLengths.empty())
         buildProfitVectorLengths(F);
 
@@ -641,6 +635,7 @@ bool MemOpt::removeRedBlockRead(GenIntrinsicInst* LeadingBlockRead,
     TrivialMemRefListTy& ToOpt, unsigned& sg_size)
 {
     MemRefListTy::iterator MI = aMI;
+    const unsigned Limit = IGC_GET_FLAG_VALUE(MemOptWindowSize);
     const unsigned windowEnd = Limit + MI->second;
     auto ME = MemRefs.end();
 
@@ -1212,6 +1207,7 @@ bool MemOpt::mergeLoad(LoadInst* LeadingLoad,
     // List of instructions need dependency check.
     SmallVector<Instruction*, 8> CheckList;
 
+    const unsigned Limit = IGC_GET_FLAG_VALUE(MemOptWindowSize);
     // Given the Start position of the Window is MI->second,
     // the End postion of the Window is "limit + Windows' start".
     const unsigned windowEnd = Limit + MI->second;
@@ -1565,6 +1561,7 @@ bool MemOpt::mergeStore(StoreInst* LeadingStore,
     // List of instructions need dependency check.
     SmallVector<Instruction*, 8> CheckList;
 
+    const unsigned Limit = IGC_GET_FLAG_VALUE(MemOptWindowSize);
     // Given the Start position of the Window is MI->second,
     // the End postion of the Window is "limit + Windows' start".
     const unsigned windowEnd = Limit + MI->second;
@@ -2716,6 +2713,8 @@ namespace {
             return splitVectorType(V, LdStKind::IS_LOAD);
         }
 
+        void AllowDummyLoadCoalescing(const InstAndOffsetPairs& Loads);
+
         // GatherCopy:
         //   copy multiple values (arg: Vals) into a single Dst (return value)
         //   (It's a packed copy, thus size(all Vals) = size(Dst).
@@ -2822,7 +2821,7 @@ bool IGC::doLdStCombine(const CodeGenContext* CGC) {
     uint32_t keyval = IGC_GET_FLAG_VALUE(EnableLdStCombine);
     if ((keyval & 0x3) == 1 && !CGC->platform.LSCEnabled())
         return false;
-    return ((keyval & 0x3) != 0);
+    return ((keyval & 0x3) || (keyval & 0x4));
 }
 
 uint32_t IGC::getMaxStoreBytes(const CodeGenContext* CGC) {
@@ -3296,7 +3295,8 @@ void LdStCombine::combineStores()
 
             // Keep store candidates for checking alias to see if those
             // stores can be moved to the place of the last store.
-            AliasSetTracker AST = IGCLLVM::createAliasSetTracker(m_AA);
+            auto batchAARes = IGCLLVM::AliasAnalysis::createAAresults(m_AA);
+            AliasSetTracker AST = IGCLLVM::createAliasSetTracker(batchAARes);
 
             AST.add(base);
             for (auto JI = std::next(II); JI != IE; ++JI) {
@@ -3351,9 +3351,13 @@ void LdStCombine::combineLoads()
     if ((IGC_GET_FLAG_VALUE(EnableLdStCombine) & 0x4) == 0)
         return;
 
-    // Start with OCL, then apply to other APIs.
     if (m_CGC->type != ShaderType::OPENCL_SHADER)
-        return;
+    {
+        if (!m_CGC->getModuleMetaData()->compOpt.EnableLdStCombineforLoad)
+        {
+            return;
+        }
+    }
 
     // All load candidates with addr = common-base + const-offset
     InstAndOffsetPairs Loads;
@@ -3407,7 +3411,8 @@ void LdStCombine::combineLoads()
 
             // Keep store/maywritemem/fence insts for checking alias to see if those
             // stores block load candidates from moving to the first (leading) load.
-            AliasSetTracker AST = IGCLLVM::createAliasSetTracker(m_AA);
+            auto batchAARes = IGCLLVM::AliasAnalysis::createAAresults(m_AA);
+            AliasSetTracker AST = IGCLLVM::createAliasSetTracker(batchAARes);
 
             for (auto JI = std::next(II); JI != IE; ++JI) {
                 Instruction* I = &*JI;
@@ -3437,6 +3442,14 @@ void LdStCombine::combineLoads()
                         }
                     }
                 }
+            }
+
+            //Experiment: If its the last element of the load and does not fit the DWORD alignment,
+            //It creates a dummy load with the same alignment type as the previous load
+            if (m_CGC->type != ShaderType::OPENCL_SHADER)
+            {
+                if (m_CGC->getModuleMetaData()->compOpt.EnableLdStCombinewithDummyLoad)
+                    AllowDummyLoadCoalescing(Loads);
             }
 
             //   Note: For now, each load is considered once. For example,
@@ -3800,6 +3813,64 @@ void LdStCombine::createBundles(BasicBlock* BB, InstAndOffsetPairs& LoadStores)
     }
 
     markVisited(LoadStores);
+}
+
+void LdStCombine::AllowDummyLoadCoalescing(const InstAndOffsetPairs& Loads)
+{
+    // Currently supports only this pattern.
+    // % 164 = add i32 % 114, 1020
+    // % 165 = and i32 % 164, 1020
+    // % 166 = getelementptr[1024 x half], [1024 x half] addrspace(3) * null, i32 0, i32 % 165
+    // %167 = load half, half addrspace(3) * %166, align 8
+    // % 168 = or i32 % 165, 1
+    // % 169 = getelementptr[1024 x half], [1024 x half] addrspace(3) * null, i32 0, i32 % 168
+    // % 170 = load half, half addrspace(3) * %169, align 2
+    // % 171 = or i32 % 165, 2
+    // % 172 = getelementptr[1024 x half], [1024 x half] addrspace(3) * null, i32 0, i32 % 171
+    // % 173 = load half, half addrspace(3) * %172, align 4
+    // to
+    // % 164 = add i32 % 114, 1020
+    // % 165 = and i32 % 164, 1020
+    // % 166 = getelementptr[1024 x half], [1024 x half] addrspace(3) * null, i32 0, i32 % 165
+    // %167 = load half, half addrspace(3) * %166, align 8
+    // % 168 = or i32 % 165, 1
+    // % 169 = getelementptr[1024 x half], [1024 x half] addrspace(3) * null, i32 0, i32 % 168
+    // % 170 = load half, half addrspace(3) * %169, align 2
+    // % 171 = or i32 % 165, 2
+    // % 172 = getelementptr[1024 x half], [1024 x half] addrspace(3) * null, i32 0, i32 % 171
+    // % 173 = load half, half addrspace(3) * %172, align 4
+    // % 174 = add i32 % 165, 3
+    // % 175 = getelementptr[1024 x half], [1024 x half] addrspace(3) * null, i32 0, i32 % 174
+    // % 176 = load half, half addrspace(3) * %175, align 2
+    int size = Loads.size();
+    LdStInfo LastLoad = Loads[size - 1];
+    uint32_t LastLoadSize = (uint32_t)m_DL->getTypeStoreSize(LastLoad.Inst->getType());
+    uint32_t currLoadSize = LastLoadSize + LastLoad.ByteOffset;
+    if (currLoadSize % 4)
+    {
+        //Replicating the last load to make it DWORD aligned
+        uint32_t newLoadSize = LastLoadSize;
+        if (!((currLoadSize + newLoadSize) % 4))
+        {
+            LoadInst* lead = static_cast<LoadInst*>(LastLoad.Inst);
+            Value* ldPtr = lead->getPointerOperand();
+            if (auto gep = dyn_cast<GetElementPtrInst>(ldPtr))
+            {
+                if ((gep->getNumOperands() == 3) && (isa<ConstantPointerNull>(gep->getPointerOperand())))
+                {
+                    IRBuilder<> irBuilder(LastLoad.Inst);
+                    Value* AddInst = irBuilder.CreateAdd(gep->getOperand(2), irBuilder.getInt32(1));
+                    Value* gepArg[] = { gep->getOperand(1), AddInst };
+                    Value* Addr = irBuilder.CreateInBoundsGEP(gep->getSourceElementType(),
+                        gep->getOperand(0), gepArg);
+                    Instruction* dummyLoad = static_cast<Instruction*>
+                        (irBuilder.CreateLoad(cast<GetElementPtrInst>(Addr)->getResultElementType(), Addr));
+                    (void)dummyLoad;
+                }
+            }
+        }
+    }
+    return;
 }
 
 // A member of layout struct can be a vector type. This function will decide
@@ -5163,23 +5234,50 @@ void getStructMemberOffsetAndType_2(const DataLayout* DL,
     return;
 }
 
+static void searchForDefinedMembers(const ConstantAggregate* S, const std::vector<unsigned>& currentIndices, SmallVectorImpl<std::vector<unsigned>>& fieldsTBC)
+{
+    for (unsigned i = 0; i < S->getNumOperands(); i++)
+    {
+        auto indices = currentIndices;
+        indices.push_back(i);
+        auto* E = S->getAggregateElement(i);
+        if (isa<UndefValue>(E))
+            continue;
+
+        if (auto* SE = dyn_cast<ConstantAggregate>(E))
+        {
+            searchForDefinedMembers(SE, indices, fieldsTBC);
+        }
+        else
+        {
+            fieldsTBC.push_back(indices);
+        }
+
+    }
+}
+
 void getAllDefinedMembers (const Value* IVI,
-    std::list<ArrayRef<unsigned>>& fieldsTBC)
+    SmallVectorImpl<std::vector<unsigned>>& fieldsTBC)
 {
     IGC_ASSERT(IVI != nullptr);
     const Value* V = IVI;
     while (isa<InsertValueInst>(V))
     {
         const InsertValueInst* I = cast<const InsertValueInst>(V);
-        fieldsTBC.push_front(I->getIndices());
+        fieldsTBC.push_back(I->getIndices().vec());
         V = I->getOperand(0);
     }
-    if (!isa<UndefValue>(V))
+
+    // at the end we may have a constant struct like this:
+    // % 28 = insertvalue % __StructSOALayout_ < { i32 194816, i32 undef, i32 undef, <1 x float> undef } > , i32 % 17, 1
+    // we should traverse it and find the indices pointing to the constant values
+    if (auto* S = dyn_cast<ConstantAggregate>(V))
     {
-        // Don't know for sure, assume all have been defined.
-        fieldsTBC.clear();
-        StructType* stTy = cast<StructType>(IVI->getType());
-        fieldsTBC.insert(fieldsTBC.end(), 0, stTy->getNumElements() - 1);
+        std::vector<unsigned> indices = {};
+        searchForDefinedMembers(S, indices, fieldsTBC);
     }
+
+    // reverse the vector to get the ascending order of indices
+    std::reverse(fieldsTBC.begin(), fieldsTBC.end());
 }
 }

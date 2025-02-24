@@ -34,44 +34,27 @@ TypesLegalizationPass::TypesLegalizationPass()
   initializeTypesLegalizationPassPass( *PassRegistry::getPassRegistry() );
 }
 
-TypesLegalizationPass::TypesLegalizationPass(bool legalizePhi, bool legalizeExtractValue, bool legalizeStore)
-  : FunctionPass( TypesLegalizationPass::ID ),
-    m_LegalizePhi(legalizePhi),
-    m_LegalizeExtractValue(legalizeExtractValue),
-    m_LegalizeStore(legalizeStore) {
-  initializeTypesLegalizationPassPass( *PassRegistry::getPassRegistry() );
-}
-
 void TypesLegalizationPass::visitExtractValueInst( ExtractValueInst &ev ) {
-  if(m_LegalizeExtractValue)
-  {
-    m_ExtractValueInst.push_back(&ev);
-  }
+  m_ExtractValueInst.push_back(&ev);
 }
 
 void TypesLegalizationPass::visitStoreInst( StoreInst &storeInst ) {
-  if(m_LegalizeStore)
+  Value *arg = storeInst.getOperand( 0 );
+  if(arg != NULL)
   {
-    Value *arg = storeInst.getOperand( 0 );
-    if(arg != NULL)
-    {
-      Type *type = arg->getType();
+    Type *type = arg->getType();
 
-      if((type != NULL) && type->isAggregateType()) {
-        m_StoreInst.push_back( &storeInst );
-      }
+    if((type != NULL) && type->isAggregateType()) {
+      m_StoreInst.push_back( &storeInst );
     }
   }
 }
 
 void TypesLegalizationPass::visitPHINode( PHINode &phi ) {
-  if(m_LegalizePhi)
-  {
-    Type *type = phi.getType();
+  Type *type = phi.getType();
 
-    if((type != NULL) && type->isAggregateType()) {
-      m_PhiNodes.push_back( &phi );
-    }
+  if((type != NULL) && type->isAggregateType()) {
+    m_PhiNodes.push_back( &phi );
   }
 }
 
@@ -113,12 +96,6 @@ Value* TypesLegalizationPass::CreateGEP(IGCLLVM::IRBuilder<>& builder, Type* Ty,
         gepIndices.push_back(builder.getInt32(idx));
     }
     return builder.CreateGEP(Ty, ptr, gepIndices);
-}
-
-// Depricated because it uses typed pointers and
-// should no longer be used in LLVM 14+ compatible code.
-Value* TypesLegalizationPass::CreateGEP( IGCLLVM::IRBuilder<> &builder,Value *ptr,SmallVector<unsigned,8> &indices ) {
-  return CreateGEP(builder, IGCLLVM::getNonOpaquePtrEltTy(ptr->getType()), ptr, indices);
 }
 
 ///////////////////////////////////////////////////////////////////////
@@ -223,13 +200,6 @@ TypesLegalizationPass::ResolveValue( Instruction *ip,Value *val,SmallVector<unsi
     }
     return ResolveValue( civ,civ->getAggregateOperand(),indices );
   }
-  else if(InsertElementInst* ie =
-    dyn_cast<InsertElementInst>(val))
-  {
-    IRBuilder<> builder( ie );
-    IGC_ASSERT(indices.size() == 1);
-    return builder.CreateExtractElement( ie,builder.getInt32( indices[0] ) );
-  }
   else if(LoadInst* ld = dyn_cast<LoadInst>(val))
   {
     IGCLLVM::IRBuilder<> builder( ld );
@@ -260,31 +230,35 @@ TypesLegalizationPass::ResolveValue( Instruction *ip,Value *val,SmallVector<unsi
       switch (II->getIntrinsicID())
       {
       case Intrinsic::uadd_with_overflow:
+      case Intrinsic::sadd_with_overflow:
+      case Intrinsic::ssub_with_overflow:
+      case Intrinsic::usub_with_overflow:
+      case Intrinsic::smul_with_overflow:
+      case Intrinsic::umul_with_overflow:
       {
           // This gets handled in the legalizer.
           IRBuilder<> builder(ip);
           return builder.CreateExtractValue(val, indices);
       }
       default:
+          IGC_ASSERT_MESSAGE(0, "Unsupported intrinsic instruction!");
           break;
       }
   }
-  else if ((isa<Argument>(val) || isa<CallInst>(val)) &&
-    (val->getType()->isStructTy() || val->getType()->isArrayTy())) {
-    // Handle struct and array types of arguments or call instructions return value
+  else if (isa<CallInst>(val) && (val->getType()->isStructTy() || val->getType()->isArrayTy())) {
+    // Handle struct and array types of call instructions return value
     IRBuilder<> builder(ip);
     return builder.CreateExtractValue(val, indices);
   }
-  else if (PHINode* phi = dyn_cast<PHINode>(val))
-  {
-      IRBuilder<> builder(phi);
-      PHINode* newPhi = builder.CreatePHI(ip->getType(), phi->getNumIncomingValues());
-      for (unsigned i = 0; i < phi->getNumIncomingValues(); i++)
-      {
-          Value* v = ResolveValue(ip, phi->getIncomingValue(i), indices);
-          newPhi->addIncoming(v, phi->getIncomingBlock(i));
-      }
-      return newPhi;
+  else if (isa<Argument>(val)) {
+
+    IGC_ASSERT_MESSAGE(!val->getType()->isStructTy(), "Illegal IR. Structures are passed as a pointer to a struct with the byval attribute.!");
+
+    if ((val->getType()->isArrayTy()))
+    {
+      IRBuilder<> builder(ip);
+      return builder.CreateExtractValue(val, indices);
+    }
   }
   else if (SelectInst* select = dyn_cast<SelectInst>(val))
   {

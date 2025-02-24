@@ -8,7 +8,7 @@
 
 ; REQUIRES: regkeys
 ;
-; RUN: igc_opt --ocl --platformpvc --igc-private-mem-resolution --regkey EnablePrivMemNewSOATranspose=2  -S %s | FileCheck %s
+; RUN: igc_opt --typed-pointers --ocl --platformpvc --igc-private-mem-resolution --regkey EnablePrivMemNewSOATranspose=2  -S %s | FileCheck %s
 ;
 
 ; CHECK-LABEL: @test
@@ -41,7 +41,8 @@ entry:
 ;;  common code for each buffer
 ;;
 ; CHECK:       %idx = zext i32 %ix to i64
-; CHECK:       [[T10:%.*]] = mul i32 [[simdSize]], 0
+; CHECK:       [[T10_0:%.*]] = mul i32 [[simdSize]], 0
+; CHECK:       [[T10:%.*]] = add i32 0, [[T10_0]]
 ; CHECK:       [[T11:%.*]] = mul i32 [[simdLaneId]], 4
 ; CHECK:       [[T12:%.*]] = add i32 [[T10]], [[T11]]
 ; CHECK:       [[bufferOffset:%.*]] = add {{.*}} i32 [[perThreadOffset]], [[T12]]

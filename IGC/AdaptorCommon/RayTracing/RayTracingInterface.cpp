@@ -103,7 +103,7 @@ static void setupRegionBTIs(CodeGenContext* pContext)
             rtInfo.SWStackSurfaceStateOffset = BaseOffset++;
         }
 
-        if (IGC_IS_FLAG_DISABLED(DisableStatefulRTSyncStackAccess4RTShader))
+        if (IGC_IS_FLAG_DISABLED(DisableStatefulRTSyncStackAccess4RTShader) && pContext->m_DriverInfo.allowStatefulStackForSyncRaytracing())
         {
             rtInfo.RTSyncStackAddrspace = getAddrspace();
             rtInfo.RTSyncStackSurfaceStateOffset = BaseOffset++;
@@ -125,6 +125,10 @@ static void setupRTMemoryStyle(CodeGenContext* pContext)
 
     rtInfo.MemStyle = RTMemoryStyle::Xe;
 
+    if (pContext->bvhInfo.uses64Bit)
+    {
+        rtInfo.MemStyle = RTMemoryStyle::Xe3;
+    }
 }
 
 
@@ -141,7 +145,7 @@ void RayTracingInlineLowering(CodeGenContext* pContext)
     if (IGC_IS_FLAG_ENABLED(OverrideTMax))
         mpm.add(createOverrideTMaxPass(IGC_GET_FLAG_VALUE(OverrideTMax)));
 
-    if (pContext->platform.isDynamicRayQueryDynamicRayManagementMechanismEnabled() && !pContext->getModuleMetaData()->compOpt.disableDynamicRQManagement)
+    if (pContext->platform.isDynamicRayQueryDynamicRayManagementMechanismEnabled() && !pContext->getModuleMetaData()->compOpt.DisableDynamicRQManagement)
     {
         mpm.add(CreateDynamicRayManagementPass());
     }

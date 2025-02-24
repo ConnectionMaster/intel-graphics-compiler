@@ -38,12 +38,19 @@ SPDX-License-Identifier: MIT
 #include "GenXDebugInfo.h"
 #include "GenXModule.h"
 
+#include "vc/GenXCodeGen/GenXFixInvalidFuncName.h"
+#include "vc/GenXCodeGen/GenXLowerAggrCopies.h"
 #include "vc/GenXCodeGen/GenXOCLRuntimeInfo.h"
+#include "vc/GenXCodeGen/GenXReduceIntSize.h"
+#include "vc/GenXCodeGen/GenXRegionCollapsing.h"
+#include "vc/GenXCodeGen/GenXVerify.h"
 #include "vc/GenXCodeGen/TargetMachine.h"
 #include "vc/GenXOpts/GenXOpts.h"
 #include "vc/Support/BackendConfig.h"
 #include "vc/Support/PassManager.h"
 
+#include "llvmWrapper/ADT/Optional.h"
+#include "llvmWrapper/Support/TargetRegistry.h"
 #include "llvm/Analysis/BasicAliasAnalysis.h"
 #include "llvm/Analysis/Passes.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
@@ -51,19 +58,36 @@ SPDX-License-Identifier: MIT
 #include "llvm/CodeGen/TargetLoweringObjectFileImpl.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
 #include "llvm/IR/LegacyPassManager.h"
+#include "llvm/IR/PassManager.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Pass.h"
 #include "llvm/PassRegistry.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Passes/PassPlugin.h"
 #include "llvm/Support/CommandLine.h"
-#include "llvmWrapper/Support/TargetRegistry.h"
-#include <llvmWrapper/ADT/Optional.h>
 #include "llvm/Transforms/IPO.h"
 #include "llvm/Transforms/IPO/AlwaysInliner.h"
+#include "llvm/Transforms/IPO/GlobalDCE.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Scalar/CorrelatedValuePropagation.h"
+#include "llvm/Transforms/Scalar/DCE.h"
+#include "llvm/Transforms/Scalar/EarlyCSE.h"
+#include "llvm/Transforms/Scalar/IndVarSimplify.h"
+#include "llvm/Transforms/Scalar/InferAddressSpaces.h"
+#include "llvm/Transforms/Scalar/JumpThreading.h"
+#include "llvm/Transforms/Scalar/LICM.h"
+#include "llvm/Transforms/Scalar/LoopDeletion.h"
+#include "llvm/Transforms/Scalar/LoopIdiomRecognize.h"
+#include "llvm/Transforms/Scalar/LoopRotation.h"
+#include "llvm/Transforms/Scalar/LoopUnrollPass.h"
+#include "llvm/Transforms/Scalar/Reassociate.h"
+#include "llvm/Transforms/Scalar/SROA.h"
+#include "llvm/Transforms/Scalar/SimplifyCFG.h"
 #include "llvm/Transforms/Utils.h"
+#include "llvm/Transforms/Utils/Mem2Reg.h"
 
 using namespace llvm;
 
@@ -172,7 +196,12 @@ void initializeGenXPasses(PassRegistry &registry) {
   initializeGenXImportOCLBiFPass(registry);
   initializeGenXBIFFlagCtrlResolutionPass(registry);
   initializeGenXSimplifyPass(registry);
+#if LLVM_VERSION_MAJOR < 16
+  initializeCMABILegacyPass(registry);
+#else  // LLVM_VERSION_MAJOR < 16
+  initializeCMABILegacyPass(registry);
   initializeCMABIPass(registry);
+#endif // LLVM_VERSION_MAJOR < 16
   initializeCMLowerVLoadVStorePass(registry);
   initializeGenXLowerJmpTableSwitchPass(registry);
   initializeGenXGlobalValueLoweringPass(registry);
@@ -212,6 +241,7 @@ void initializeGenXPasses(PassRegistry &registry) {
   initializeGenXDetectPointerArgPass(registry);
   initializeGenXLCECalculationPass(registry);
   initializeGenXFloatControlPass(registry);
+  initializeGenXCountIndirectStatelessPass(registry);
   // WRITE HERE MORE PASSES IF IT'S NEEDED;
 }
 
@@ -378,14 +408,14 @@ static std::unique_ptr<TargetLoweringObjectFile> createTLOF(const Triple &TT) {
 GenXTargetMachine::GenXTargetMachine(const Target &T, const Triple &TT,
                                      StringRef CPU, StringRef FS,
                                      const TargetOptions &Options,
-                                     llvm::Optional<Reloc::Model> RM,
-                                     llvm::Optional<CodeModel::Model> CM,
+                                     IGCLLVM::optional<Reloc::Model> RM,
+                                     IGCLLVM::optional<CodeModel::Model> CM,
                                      CodeGenOpt::Level OL, bool Is64Bit,
                                      std::unique_ptr<GenXBackendConfig> BC)
-    : IGCLLVM::LLVMTargetMachine(T, getDL(Is64Bit), TT, CPU, FS, Options,
-                                 RM ? IGCLLVM::makeOptional(RM).value() : Reloc::Model::Static,
-                                 CM ? IGCLLVM::makeOptional(CM).value() : CodeModel::Model::Small,
-                                 OL),
+    : IGCLLVM::LLVMTargetMachine(
+          T, getDL(Is64Bit), TT, CPU, FS, Options,
+          RM ? IGCLLVM::getValue(RM) : Reloc::Model::Static,
+          CM ? IGCLLVM::getValue(CM) : CodeModel::Model::Small, OL),
       TLOF(createTLOF(getTargetTriple())), BC(std::move(BC)), Is64Bit(Is64Bit),
       Subtarget(TT, CPU.str(), FS.str()) {}
 
@@ -403,8 +433,8 @@ TargetPassConfig *GenXTargetMachine::createPassConfig(PassManagerBase &PM) {
 GenXTargetMachine32::GenXTargetMachine32(const Target &T, const Triple &TT,
                                          StringRef CPU, StringRef FS,
                                          const TargetOptions &Options,
-                                         llvm::Optional<Reloc::Model> RM,
-                                         llvm::Optional<CodeModel::Model> CM,
+                                         IGCLLVM::optional<Reloc::Model> RM,
+                                         IGCLLVM::optional<CodeModel::Model> CM,
                                          CodeGenOpt::Level OL, bool JIT,
                                          std::unique_ptr<GenXBackendConfig> BC)
     : GenXTargetMachine(T, TT, CPU, FS, Options, RM, CM, OL, false,
@@ -413,20 +443,19 @@ GenXTargetMachine32::GenXTargetMachine32(const Target &T, const Triple &TT,
 GenXTargetMachine64::GenXTargetMachine64(const Target &T, const Triple &TT,
                                          StringRef CPU, StringRef FS,
                                          const TargetOptions &Options,
-                                         llvm::Optional<Reloc::Model> RM,
-                                         llvm::Optional<CodeModel::Model> CM,
+                                         IGCLLVM::optional<Reloc::Model> RM,
+                                         IGCLLVM::optional<CodeModel::Model> CM,
                                          CodeGenOpt::Level OL, bool JIT,
                                          std::unique_ptr<GenXBackendConfig> BC)
     : GenXTargetMachine(T, TT, CPU, FS, Options, RM, CM, OL, true,
                         std::move(BC)) {}
 
 namespace vc {
-std::unique_ptr<llvm::TargetMachine>
-createGenXTargetMachine(const Target &T, Triple TT, StringRef CPU,
-                        StringRef Features, const TargetOptions &Options,
-                        llvm::Optional<Reloc::Model> RM,
-                        llvm::Optional<CodeModel::Model> CM, CodeGenOpt::Level OL,
-                        std::unique_ptr<GenXBackendConfig> BC) {
+std::unique_ptr<llvm::TargetMachine> createGenXTargetMachine(
+    const Target &T, Triple TT, StringRef CPU, StringRef Features,
+    const TargetOptions &Options, IGCLLVM::optional<Reloc::Model> RM,
+    IGCLLVM::optional<CodeModel::Model> CM, CodeGenOpt::Level OL,
+    std::unique_ptr<GenXBackendConfig> BC) {
   if (is32BitArch(TT))
     return std::make_unique<GenXTargetMachine32>(T, TT, CPU, Features, Options,
                                                  RM, CM, OL, false /*JIT*/,
@@ -507,6 +536,8 @@ bool GenXTargetMachine::addPassesToEmitFile(PassManagerBase &PM,
   vc::addPass(PM, createPromoteMemoryToRegisterPass());
   /// .. include:: GenXDetectPointerArg.cpp
   vc::addPass(PM, createGenXDetectPointerArgPass());
+  /// .. include:: GenXCountIndirectStateless.cpp
+  vc::addPass(PM, createGenXCountIndirectStatelessPass());
 
   // All passes which modify the LLVM IR are now complete; run the verifier
   // to ensure that the IR is valid.
@@ -744,6 +775,7 @@ bool GenXTargetMachine::addPassesToEmitFile(PassManagerBase &PM,
   /// This is a standard LLVM pass to hoist/sink the loop invariant code after
   /// legalization.
   vc::addPass(PM, createLICMPass());
+  vc::addPass(PM, createEarlyCSEPass());
   /// DeadCodeElimination
   /// -------------------
   /// This is a standard LLVM pass, run at this point in the GenX backend. It
@@ -849,6 +881,7 @@ bool GenXTargetMachine::addPassesToEmitFile(PassManagerBase &PM,
   return false;
 }
 
+#if LLVM_VERSION_MAJOR < 16
 void GenXTargetMachine::adjustPassManager(PassManagerBuilder &PMBuilder) {
   // Fix function names.
   PMBuilder.addExtension(
@@ -986,7 +1019,7 @@ void GenXTargetMachine::adjustPassManager(PassManagerBuilder &PMBuilder) {
 
   // CM ABI.
   auto AddCMABI = [](const PassManagerBuilder &Builder, PassManagerBase &PM) {
-    PM.add(createCMABIPass());
+    PM.add(createCMABILegacyPass());
   };
   PMBuilder.addExtension(PassManagerBuilder::EP_ModuleOptimizerEarly, AddCMABI);
   PMBuilder.addExtension(PassManagerBuilder::EP_EnabledOnOptLevel0, AddCMABI);
@@ -1022,3 +1055,137 @@ void GenXTargetMachine::adjustPassManager(PassManagerBuilder &PMBuilder) {
   };
   PMBuilder.addExtension(PassManagerBuilder::EP_Peephole, AddGenXPeephole);
 }
+
+#else // LLVM_VERSION_MAJOR < 16
+
+void GenXTargetMachine::registerPassBuilderCallbacks(PassBuilder &PB) {
+
+  PB.registerAnalysisRegistrationCallback([=](ModuleAnalysisManager &MAM) {
+    MAM.registerPass([&] { return CMABIAnalysisPass(); });
+    MAM.registerPass([&] { return GenXBackendConfigPass(); });
+  });
+
+  PB.registerPipelineStartEPCallback([this](ModulePassManager &PM,
+                                            OptimizationLevel Level) {
+    // Fix function names.
+    PM.addPass(createModuleToFunctionPassAdaptor(GenXFixInvalidFuncNamePass()));
+
+    // Lower aggr copies.
+    PM.addPass(createModuleToFunctionPassAdaptor(GenXLowerAggrCopiesPass()));
+
+    // Packetize.
+    PM.addPass(GenXLegalizeGVLoadUsesPass());
+#ifndef NDEBUG
+    // PM.addPass(GenXVerifyPass(GenXVerifyStage::PostSPIRVReader));
+#endif
+    PM.addPass(
+        createModuleToFunctionPassAdaptor(GenXTranslateIntrinsicsPass()));
+    PM.addPass(GenXTranslateSPIRVBuiltinsPass(BC->getResult()));
+    PM.addPass(AlwaysInlinerPass());
+    PM.addPass(AlwaysInlinerPass());
+    PM.addPass(GenXPrintfPhiClonningPass());
+    PM.addPass(createModuleToFunctionPassAdaptor(InstCombinePass()));
+    PM.addPass(GenXPrintfResolutionPass(this));
+    PM.addPass(GenXImportOCLBiFPass());
+    PM.addPass(GenXBIFFlagCtrlResolutionPass());
+    PM.addPass(createModuleToFunctionPassAdaptor(GenXTypeLegalizationPass()));
+    PM.addPass(GenXPacketizePass());
+    PM.addPass(AlwaysInlinerPass());
+    PM.addPass(GenXPrintfLegalizationPass());
+    PM.addPass(GlobalDCEPass());
+    PM.addPass(createModuleToFunctionPassAdaptor(PromotePass()));
+
+    PM.addPass(createModuleToFunctionPassAdaptor(InferAddressSpacesPass()));
+    PM.addPass(createModuleToFunctionPassAdaptor(EarlyCSEPass(true)));
+    PM.addPass(createModuleToFunctionPassAdaptor(
+        SimplifyCFGPass(SimplifyCFGOptions().hoistCommonInsts(true))));
+    PM.addPass(createModuleToFunctionPassAdaptor(InstCombinePass()));
+    PM.addPass(createModuleToFunctionPassAdaptor(DCEPass()));
+    PM.addPass(
+        createModuleToFunctionPassAdaptor(SROAPass(SROAOptions::ModifyCFG)));
+    PM.addPass(createModuleToFunctionPassAdaptor(InferAddressSpacesPass()));
+    PM.addPass(createModuleToFunctionPassAdaptor(EarlyCSEPass(true)));
+    PM.addPass(createModuleToFunctionPassAdaptor(SimplifyCFGPass()));
+    PM.addPass(createModuleToFunctionPassAdaptor(InstCombinePass()));
+    PM.addPass(createModuleToFunctionPassAdaptor(DCEPass()));
+
+    // vldst.
+    if (EmitVLoadStore) {
+      // this->OptLevel > 0
+      // Inline
+      PM.addPass(
+          createModuleToFunctionPassAdaptor(SROAPass(SROAOptions::ModifyCFG)));
+      PM.addPass(createModuleToFunctionPassAdaptor(EarlyCSEPass(true)));
+      PM.addPass(createModuleToFunctionPassAdaptor(JumpThreadingPass()));
+      PM.addPass(createModuleToFunctionPassAdaptor(SimplifyCFGPass()));
+      PM.addPass(
+          createModuleToFunctionPassAdaptor(CorrelatedValuePropagationPass()));
+      PM.addPass(createModuleToFunctionPassAdaptor(GenXReduceIntSizePass()));
+      PM.addPass(createModuleToFunctionPassAdaptor(InstCombinePass()));
+      PM.addPass(AlwaysInlinerPass());
+      PM.addPass(GlobalDCEPass());
+      PM.addPass(createModuleToFunctionPassAdaptor(InstCombinePass()));
+
+      // Unroll
+      PM.addPass(createModuleToFunctionPassAdaptor(SimplifyCFGPass()));
+      PM.addPass(createModuleToFunctionPassAdaptor(ReassociatePass()));
+      PM.addPass(createModuleToFunctionPassAdaptor(
+          createFunctionToLoopPassAdaptor(LoopRotatePass())));
+      // TODO: Check LICM-options
+      PM.addPass(createModuleToFunctionPassAdaptor(
+          createFunctionToLoopPassAdaptor(LICMPass(100, 250, false),
+                                          /*UseMemorySSA=*/true,
+                                          /*UseBlockFrequencyInfo=*/true)));
+      PM.addPass(createModuleToFunctionPassAdaptor(EarlyCSEPass(true)));
+
+      PM.addPass(createModuleToFunctionPassAdaptor(InstCombinePass()));
+
+      if (!BC->disableIndvarsOpt()) {
+        PM.addPass(createModuleToFunctionPassAdaptor(
+            createFunctionToLoopPassAdaptor(IndVarSimplifyPass())));
+      }
+      PM.addPass(createModuleToFunctionPassAdaptor(
+          createFunctionToLoopPassAdaptor(LoopIdiomRecognizePass())));
+
+      PM.addPass(createModuleToFunctionPassAdaptor(
+          createFunctionToLoopPassAdaptor(LoopDeletionPass())));
+      // TODO: pass 'simple' options to LoopUnrollPass
+      PM.addPass(createModuleToFunctionPassAdaptor(LoopUnrollPass()));
+      PM.addPass(createModuleToFunctionPassAdaptor(InstCombinePass()));
+      // Simplify region accesses.
+      PM.addPass(
+          createModuleToFunctionPassAdaptor(GenXRegionCollapsingPass(this)));
+      PM.addPass(createModuleToFunctionPassAdaptor(EarlyCSEPass(true)));
+      PM.addPass(createModuleToFunctionPassAdaptor(DCEPass()));
+      // }
+      PM.addPass(createModuleToFunctionPassAdaptor(CMLowerVLoadVStorePass()));
+    }
+
+    // AddIndirect
+    PM.addPass(GenXCloneIndirectFunctionsPass());
+    PM.addPass(GenXTrampolineInsertionPass());
+
+    // AddLinkageCorruptor
+    PM.addPass(GenXLinkageCorruptorPass());
+
+    // AddCMImpParam
+    PM.addPass(CMImpParamPass(Subtarget.hasThreadPayloadInMemory()));
+
+    // CM ABI.
+    PM.addPass(CMABIPass());
+
+    // BTI assignment.
+    PM.addPass(GenXBTIAssignmentPass());
+
+    PM.addPass(CMKernelArgOffsetPass(Subtarget.getGRFByteSize(),
+                                     BC->useBindlessImages()));
+  });
+
+  // AddGenXPeephole
+  PB.registerPeepholeEPCallback(
+      [this](FunctionPassManager &PM, OptimizationLevel Level) {
+        PM.addPass(GenXSimplifyPass());
+      });
+}
+
+#endif // LLVM_VERSION_MAJOR < 16

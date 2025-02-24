@@ -163,12 +163,12 @@ public:
 
 
 template<bool preserveNames = true, typename T = llvm::ConstantFolder,
-    typename InserterTyDef() = llvm::IRBuilderDefaultInserter>
-class LLVM3DBuilder : public llvm::IGCIRBuilder<T, InserterTyDef()>
+    typename InserterTy = llvm::IRBuilderDefaultInserter>
+class LLVM3DBuilder : public llvm::IGCIRBuilder<T, InserterTy>
 {
 public:
     LLVM3DBuilder(llvm::LLVMContext &pCtx, const PLATFORM &pPlatform)
-        : llvm::IGCIRBuilder<T, InserterTyDef()>(pCtx),
+        : llvm::IGCIRBuilder<T, InserterTy>(pCtx),
         m_Platform(new genplatform(&pPlatform))
     {
             Init();
@@ -258,6 +258,24 @@ public:
         llvm::Value* srcAddressV,
         llvm::Value* srcAddressW,
         llvm::Value* lod);
+
+    llvm::Value* Create_typedwriteMS(
+        llvm::Value* dstBuffer,
+        llvm::Value* srcAddressU,
+        llvm::Value* srcAddressV,
+        llvm::Value* srcAddressW,
+        llvm::Value* sampleIdx,
+        llvm::Value* float_X,
+        llvm::Value* float_Y,
+        llvm::Value* float_Z,
+        llvm::Value* float_W);
+
+    llvm::Value* Create_typedreadMS(
+        llvm::Value* dstBuffer,
+        llvm::Value* srcAddressU,
+        llvm::Value* srcAddressV,
+        llvm::Value* srcAddressW,
+        llvm::Value* sampleIdx);
 
     llvm::Value* Create_typedread_msaa2D(
         llvm::Value* srcBuffer,

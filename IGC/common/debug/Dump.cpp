@@ -32,7 +32,6 @@ SPDX-License-Identifier: MIT
 #include <iomanip>
 #include <mutex>
 #include <algorithm>
-#include <regex>
 #include "Probe/Assertion.h"
 
 using namespace IGC;
@@ -162,6 +161,7 @@ DumpName DumpName::DispatchMode(ShaderDispatchMode mode) const
     case ShaderDispatchMode::SINGLE_PATCH:
     case ShaderDispatchMode::DUAL_PATCH:
     case ShaderDispatchMode::EIGHT_PATCH:
+    case ShaderDispatchMode::QUAD_SIMD8_DYNAMIC:
         copy.m_ShaderMode = mode;
         break;
     default:
@@ -308,6 +308,22 @@ std::string DumpName::AbsolutePath(OutputFolderName folder) const
 
         underscore = true;
     }
+
+    if (m_retryId.has_value() && m_retryId.value())
+    {
+            ss << "_" << m_retryId.value();
+    }
+
+    if (m_cgFlag.has_value())
+    {
+        const auto cgfv = m_cgFlag.value();
+
+        IGC_ASSERT(cgfv < CG_FLAG_size);
+        ss << (underscore ? "_" : "");
+        ss << CG_FLAG_STR[cgfv];
+        underscore = true;
+    }
+
     if(m_pass.has_value())
     {
         if(m_pass->m_index.has_value())
@@ -324,39 +340,6 @@ std::string DumpName::AbsolutePath(OutputFolderName folder) const
         underscore = true;
     }
 
-    if (m_cgFlag.has_value() && m_cgFlag.value() != FLAG_CG_ALL_SIMDS)
-    {
-        ss << (underscore ? "_" : "");
-        if (m_cgFlag.value() == FLAG_CG_STAGE1_FAST_COMPILE)
-        {
-            ss << "FastStage1";
-        }
-        else if (m_cgFlag.value() == FLAG_CG_STAGE1_BEST_PERF)
-        {
-            ss << "BestStage1";
-        }
-        else
-        {
-            IGC_ASSERT(m_cgFlag.value() == FLAG_CG_STAGE1_FASTEST_COMPILE);
-            ss << "FastestStage1";
-        }
-
-        underscore = true;
-    }
-    else if (m_cgFlag.has_value())
-    {
-        ss << (underscore ? "_" : "");
-        ss << "RestStage2";
-        underscore = true;
-    }
-
-    if (m_retryId.has_value())
-    {
-        if (m_retryId.value())
-        {
-            ss << "_" << m_retryId.value();
-        }
-    }
     if(m_simdWidth.has_value())
     {
         ss << (underscore ? "_" : "")
@@ -383,6 +366,12 @@ std::string DumpName::AbsolutePath(OutputFolderName folder) const
         {
             ss << (underscore ? "_" : "")
                 << "EightPatch";
+            underscore = true;
+        }
+        if (m_ShaderMode.value() == ShaderDispatchMode::QUAD_SIMD8_DYNAMIC)
+        {
+            ss << (underscore ? "_" : "")
+                << "QuadSIMD8Dynamic";
             underscore = true;
         }
     }
@@ -440,13 +429,7 @@ std::string DumpName::RelativePath() const
 
 bool DumpName::allow() const
 {
-    const char* regex = IGC_GET_REGKEYSTRING(ShaderDumpFilter);
-    if (!regex || *regex == '\0')
-        return true;
-
-    std::regex fileRegex(regex);
-
-    return std::regex_search(RelativePath(), fileRegex);
+    return doesRegexMatch(RelativePath(), IGC_GET_REGKEYSTRING(ShaderDumpFilter));
 }
 
 namespace {
@@ -649,9 +632,12 @@ void Dump::flush()
     }
     if (!isText(m_type))
         mode |= std::ios_base::binary;
-    std::ofstream asmFile(m_name.str(), mode);
-    asmFile << m_string;
-    asmFile.close();
+    if (m_name.allow())
+    {
+        std::ofstream asmFile(m_name.str(), mode);
+        asmFile << m_string;
+        asmFile.close();
+    }
     m_string.clear();
 }
 
@@ -730,11 +716,6 @@ ShaderHash ShaderHashOGL(QWORD glslHash, QWORD nosHash)
     return shaderHash;
 }
 
-std::string GetDumpName(const IGC::CShader* pProgram, const char* ext)
-{
-    return GetDumpNameObj(pProgram, ext).str();
-}
-
 DumpName GetDumpNameObj(const IGC::CShader* pProgram, const char* ext)
 {
     IGC::CodeGenContext* context = pProgram->GetContext();
@@ -756,7 +737,7 @@ DumpName GetDumpNameObj(const IGC::CShader* pProgram, const char* ext)
 
     dumpName = dumpName.PostFix(shaderName);
     dumpName = dumpName.DispatchMode(pProgram->m_ShaderDispatchMode);
-    dumpName = dumpName.SIMDSize(pProgram->m_dispatchSize).Retry(context->m_retryManager.GetRetryId()).Extension(ext);
+    dumpName = dumpName.SIMDSize(pProgram->m_State.m_dispatchSize).Retry(context->m_retryManager.GetRetryId()).Extension(ext);
 
     return dumpName;
 }

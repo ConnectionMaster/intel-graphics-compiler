@@ -175,7 +175,7 @@ bool hasPartialMixMode() const {
 
 // whether EOT sources need to be assigned r112-r127
 bool hasEOTGRFBinding() const {
-  return true;
+  return getPlatformGeneration() < PlatformGen::XE3;
 }
 
 bool hasSmov() const { return getPlatformGeneration() < PlatformGen::XE; }
@@ -464,18 +464,31 @@ uint32_t getNumAddrRegisters() const {
     return 16;
 }
 
-uint32_t getGRFNumOfAddrRegisters() const {
-    // The element size of address register is 16 bits
-    return ((getNumAddrRegisters() * 2 - 1) / numEltPerGRF<Type_UB>() + 1);
+// each address register is 16 bits
+uint32_t getNumAddrRegistersInGRFSizeSWSB() const {
+    if (hasThreeALUPipes() || hasFourALUPipes()) {
+      return ((16 * G4_WSIZE) + numEltPerGRF<Type_UB>() - 1) / numEltPerGRF<Type_UB>();
+    } else {
+      return 0;
+    }
 }
 
 uint32_t getNumScalarRegisters(void) {
+  if (auto n = getuint32Option(vISA_ScalarPipe)) {
+    return n;
+  }
   if (enableSendIndirect()) {
     return 1;
   }
   return 0;
 }
 
+uint32_t getScalarRegisterSizeInBytes() {
+  if (getuint32Option(vISA_ScalarPipe)) {
+    return 64; // 64 Bytes in s0
+  }
+  return 32; // 32B in s0
+}
 
 bool encodeAccWrEn() const { return getPlatform() < Xe_PVC; }
 
@@ -735,7 +748,7 @@ bool hasWriteCombine() const {
 }
 
 bool hasA0WARHWissue() {
-  return getPlatform() >= Xe_XeHPSDV;
+  return getPlatform() >= Xe_XeHPSDV && getPlatform() < Xe2;
 }
 
 bool hasFtoPackedHFMove() const { return getPlatform() >= Xe_DG2; }
@@ -747,7 +760,10 @@ bool hasQ2FInIntegerPipe() const {
 }
 
 bool enableSendIndirect() const {
-  return false;
+  return getuint32Option(vISA_EnableGatherWithImmPreRA) &&
+    (getuint32Option(vISA_EnableGatherWithImmPreRA) < 4) &&
+    (kernel.getInt32KernelAttr(Attributes::ATTR_Target) == VISA_3D) &&
+    getPlatform() >= Xe3;
 }
 
 unsigned int getMaxPTSS() const {
@@ -837,15 +853,11 @@ bool noSrc0Src1OverlapSend() const {
 
 
 bool WARLocalization() const {
-  if (getOption(vISA_SWSBMakeLocalWAR) && (getPlatform() >= Xe2)) {
+  if (getOption(vISA_SWSBMakeLocalWAR)) {
     return true;
   }
 
   return false;
-}
-
-bool hasPVCSendWARWA() const {
-  return hasDFInst() && (getPlatform() == Xe_PVC || getPlatform() == Xe_PVCXT);
 }
 
 bool PVCSendWARWA() const {
@@ -884,8 +896,8 @@ bool supports4GRFAlign() const {
   return false;
 }
 
-bool needA0WARForSend() const {
-  return false;
+bool needA0WAR() const {
+  return (getPlatform() >= Xe2);
 }
 
 bool alwaysAllowGlobalFlagOpt() const {
@@ -923,4 +935,5 @@ bool needTGMDoubleFenceWA() const {
 bool useDynamicAddrForExDesc() const {
   return getOption(vISA_dynamicAddrForExDescInLscSend);
 }
+
 // end HW capabilities

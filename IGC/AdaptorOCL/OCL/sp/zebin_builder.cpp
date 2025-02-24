@@ -420,6 +420,9 @@ void ZEBinaryBuilder::addRuntimeSymbols(const IGC::SOpenCLProgramInfo& annotatio
     if (annotations.m_hasCrossThreadOffsetRelocations)
         mBuilder.addSymbol(vISA::CROSS_THREAD_OFF_R0_RELOCATION_NAME, /*addr*/0, /*size*/0,
             llvm::ELF::STB_GLOBAL, llvm::ELF::STT_NOTYPE, /*sectionId*/-1);
+    if (annotations.m_hasPerThreadOffsetRelocations)
+        mBuilder.addSymbol(vISA::PER_THREAD_OFF_RELOCATION_NAME, /*addr*/0, /*size*/0,
+            llvm::ELF::STB_GLOBAL, llvm::ELF::STT_NOTYPE, /*sectionId*/-1);
 }
 
 void ZEBinaryBuilder::addProgramSymbols(const IGC::SOpenCLProgramInfo& annotations)
@@ -550,6 +553,7 @@ void ZEBinaryBuilder::addKernelExecEnv(const SOpenCLKernelInfo& annotations,
     env.inline_data_payload_size = annotations.m_threadPayload.PassInlineDataSize;
     env.offset_to_skip_per_thread_data_load = annotations.m_threadPayload.OffsetToSkipPerThreadDataLoad;;
     env.offset_to_skip_set_ffid_gp = annotations.m_threadPayload.OffsetToSkipSetFFIDGP;
+    env.generate_local_id = annotations.m_threadPayload.generateLocalID;
 
     // extract required_sub_group_size from kernel attribute list
     // it will be in the format of "intel_reqd_sub_group_size(16)"
@@ -883,12 +887,12 @@ void ZEBinaryBuilder::addElfSections(void* elfBin, size_t elfSize)
                                 }
 
                                 unsigned int relocType = relocEntry.r_info & 0xF;
-                                zebin::R_TYPE_ZEBIN zebinType = R_ZE_NONE;
+                                zebin::R_TYPE_ZEBIN zebinType = R_NONE;
 
                                 if (relocType == ELF::R_X86_64_64)
-                                    zebinType = R_ZE_SYM_ADDR;
+                                    zebinType = R_SYM_ADDR;
                                 else if (relocType == ELF::R_X86_64_32)
-                                    zebinType = R_ZE_SYM_ADDR_32;
+                                    zebinType = R_SYM_ADDR_32;
                                 else
                                     IGC_ASSERT_MESSAGE(false, "Unsupported ELF relocation type");
 
@@ -955,11 +959,9 @@ void ZEBinaryBuilder::addKernelDebugEnv(const SOpenCLKernelInfo& annotations,
                                         const CBTILayout& layout,
                                         zeInfoKernel& zeinfoKernel)
 {
-    zeInfoDebugEnv& env = zeinfoKernel.debug_env;
-    env.sip_surface_bti = layout.GetSystemThreadBindingTableIndex();
-    // Now set the sip surface offset to 0 directly. Currently the surface offset
-    // is computed locally when creating patch tokens.
-    env.sip_surface_offset = 0;
+    // TODO: Check if we could remove sip surface related fields.
+    // Leave sip_surface_bti and sip_surface_offset unset as runtime does not
+    // require BTI 0 and bindless offset should be purely managed by driver.
 }
 
 void ZEBinaryBuilder::addKernelVISAAsm(const std::string& kernel,

@@ -12,6 +12,7 @@ SPDX-License-Identifier: MIT
 #include "FastSparseBitVector.h"
 #include "../FlowGraph.h"
 #include "../G4_IR.hpp"
+#include "G4_Declare.h"
 #include "LocalScheduler_G4IR.h"
 #include "../Mem_Manager.h"
 #include "../Timer.h"
@@ -38,6 +39,7 @@ class PointsToAnalysis;
 } // namespace vISA
 
 // FIXME, build a table for different platforms
+#define SWSB_MAX_S0_DEPENDENCE_DISTANCE 2
 #define SWSB_MAX_MATH_DEPENDENCE_DISTANCE 18
 #define SWSB_MAX_ALU_DEPENDENCE_DISTANCE_VALUE 7u
 
@@ -128,6 +130,7 @@ typedef enum _FOOTPRINT_TYPE {
   GRF_T = 1,
   ACC_T = 2,
   FLAG_T = 4,
+  S0_T = 8,
   A0_T = 16
 } FOOTPRINT_TYPE;
 
@@ -138,6 +141,8 @@ struct SBFootprint {
   const unsigned short RightB;
   unsigned short offset = 0;
   bool isPrecision = false;
+  bool isFcvtByteType = false;
+  bool isCmpUseOnly = false;
   G4_INST *inst;
 
   // FIXME: The choice of C-style linked list seems suspect given that there are
@@ -153,13 +158,14 @@ struct SBFootprint {
     isPrecision = false;
   }
   SBFootprint(FOOTPRINT_TYPE ft, G4_Type t, unsigned short LB,
-              unsigned short RB, G4_INST *i)
-      : fType(ft), type((unsigned short)t), LeftB(LB), RightB(RB), inst(i) {
+              unsigned short RB, G4_INST *i, bool isByteType = false)
+      : fType(ft), type((unsigned short)t), LeftB(LB), RightB(RB), inst(i), isFcvtByteType(isByteType) {
     isPrecision = false;
   }
   SBFootprint(FOOTPRINT_TYPE ft, GenPrecision p, unsigned short LB,
-              unsigned short RB, G4_INST *i)
-      : fType(ft), type((unsigned short)p), LeftB(LB), RightB(RB), inst(i), isPrecision(true) {
+              unsigned short RB, G4_INST *i, bool isByteType = false)
+      : fType(ft), type((unsigned short)p), LeftB(LB), RightB(RB), inst(i),
+        isPrecision(true), isFcvtByteType(isByteType) {
   }
 
   void setOffset(unsigned short o) { offset = o; }
@@ -261,6 +267,7 @@ private:
   int integerID = -1;
   int floatID = -1;
   int longID = -1;
+  int s0ID = -1;
   int mathID = -1;
   int DPASID = -1;
   unsigned short DPASSize = 0;
@@ -348,6 +355,7 @@ public:
   int getIntegerID() const { return integerID; }
   int getFloatID() const { return floatID; }
   int getLongID() const { return longID; }
+  int getS0ID() const { return s0ID; }
   int getMathID() const { return mathID; }
   int getDPASID() const { return DPASID; }
   unsigned short getDPASSize() const { return DPASSize; }
@@ -355,6 +363,7 @@ public:
   void setIntegerID(int id) { integerID = id; }
   void setFloatID(int id) { floatID = id; }
   void setLongID(int id) { longID = id; }
+  void setS0ID(int id) { s0ID = id; }
   void setMathID(int id) { mathID = id; }
   void setDPASID(int id) { DPASID = id; }
   void addDPASSize(unsigned short size) { DPASSize += size; }
@@ -553,7 +562,9 @@ public:
   ~LiveGRFBuckets() {}
   bool isEmpty() {return empty;}
   int getNumOfBuckets() const { return numOfBuckets; }
-
+  const std::vector<SBBUCKET_VECTOR> &getAllBuckets() const {
+    return nodeBucketsArray;
+  }
   // The iterator which is used to scan the node vector of each bucket
   class BN_iterator {
   public:
@@ -599,11 +610,13 @@ typedef std::list<G4_BB_SB *> BB_SWSB_LIST;
 typedef BB_SWSB_LIST::iterator BB_SWSB_LIST_ITER;
 
 typedef struct _SWSB_INDEXES {
+  int setFirstA0 = 0;
   int instIndex = 0;
   int ALUIndex = 0;
   int integerIndex = 0;
   int floatIndex = 0;
   int longIndex = 0;
+  int s0Index = 0;
   int DPASIndex = 0;
   int mathIndex = 0;
   unsigned latestDepALUID[PIPE_DPAS] = {0};
@@ -614,6 +627,15 @@ typedef struct _SWSB_LOOP {
   int entryBBID = -1;
   int endBBID = -1;
 } SWSB_LOOP;
+
+struct BucketNodeInfo {
+  int globalID;
+  G4_Declare *topDeclare;
+  const SBFootprint *liveFootprint;
+  G4_INST *liveInst;
+  Gen4_Operand_Number liveOpnd;
+};
+using BucketInfos = std::vector<std::vector<BucketNodeInfo>>;
 
 class G4_BB_SB {
 private:
@@ -630,6 +652,7 @@ private:
   int integerID;
   int floatID;
   int longID;
+  int s0ID;
   int mathID;
   int DPASID;
   unsigned latestDepALUID[PIPE_DPAS];
@@ -661,7 +684,6 @@ public:
 
   int send_start = -1;
   int send_end = -1;
-
   unsigned loopStartBBID = -1; // The start BB ID of live range
   unsigned loopEndBBID = -1;   // The start BB ID of live range
 
@@ -712,8 +734,8 @@ public:
     last_send_node = -1;
     totalGRFNum = builder.kernel.getNumRegTotal();
     globalRegisterNum = totalGRFNum + builder.getNumScalarRegisters();
-    if (builder.needA0WARForSend()) {
-      globalRegisterNum += builder.getGRFNumOfAddrRegisters();
+    if (builder.needA0WAR()) {
+      globalRegisterNum += builder.getNumAddrRegistersInGRFSizeSWSB();
     }
 
     SBDDD(bb, lb, globalLB, GRFAlignedGlobalSendsLB, SBNodes, SBSendNodes,
@@ -740,6 +762,8 @@ public:
   SBFootprint *getFootprintForFlag(G4_Operand *opnd,
                                    Gen4_Operand_Number opnd_num, G4_INST *inst);
   SBFootprint *getFootprintForA0(G4_Operand *opnd, Gen4_Operand_Number opnd_num,
+                                 G4_INST *inst);
+  SBFootprint *getFootprintForS0(G4_Operand *opnd, Gen4_Operand_Number opnd_num,
                                  G4_INST *inst);
   bool getFootprintForOperand(SBNode *node, G4_INST *inst, G4_Operand *opnd,
                               Gen4_Operand_Number opnd_num);
@@ -774,7 +798,7 @@ public:
   bool hasInternalDependence(SBNode *nodeFirst, SBNode *nodeNext);
 
   bool is2xFPBlockCandidate(G4_INST *inst, bool accDST);
-  bool hasExtraOverlap(G4_INST *liveInst, G4_INST *curInst,
+  bool hasExtraOverlap(const G4_INST *liveInst, const G4_INST *curInst,
                        const SBFootprint *liveFootprint,
                        const SBFootprint *curFootprint,
                        const Gen4_Operand_Number curOpnd, IR_Builder *builder);
@@ -793,11 +817,8 @@ public:
                                     bool &sameDstSrc);
 
   // Global SBID dependence analysis
-  bool handleCallForMayKilled(SparseBitVector *allDstGlobalIDs,
-                              SparseBitVector *allSrcGlobalIDs);
-
-  void setSendOpndMayKilled(LiveGRFBuckets *globalSendsLB, SBNODE_VECT &SBNodes,
-                            PointsToAnalysis &p);
+  void setSendOpndMayKilled(SBNODE_VECT &SBNodes, PointsToAnalysis &p,
+                            BucketInfos &bucketInfos);
   void
   setSendGlobalIDMayKilledByCurrentBB(std::vector<SparseBitVector> &dstTokenBit,
                                   std::vector<SparseBitVector> &srcTokenBit,
@@ -810,7 +831,7 @@ public:
   void clearKilledBucketNodeXeLP(LiveGRFBuckets *LB, int ALUID);
 
   void clearKilledBucketNodeXeHP(LiveGRFBuckets *LB, int integerID, int floatID,
-                                 int longID, int mathID);
+                                 int longID, int mathID, int s0ID);
 
   bool hasInternalDependenceWithinDPAS(SBNode *node) const;
   bool hasRAWDependenceBetweenDPASNodes(SBNode *node, SBNode *nextNode) const;
@@ -1091,10 +1112,6 @@ class SWSB {
                        INST_LIST_ITER inst_it, int newInstID, BitSet *dstTokens,
                        BitSet *srcTokens, bool &keepDst, bool removeAllToken);
 
-  void SWSBInitializeGlobalSends(SparseBitVector &allDstGlobalIDs,
-                                 SparseBitVector &allSrcGlobalIDs,
-                                 LiveGRFBuckets &globalSendsLB);
-
   void
   SWSBInitializeGlobalNodesInBuckets(std::vector<SparseBitVector> &dstGlobalIDs,
                                      std::vector<SparseBitVector> &srcGlobalIDs,
@@ -1159,8 +1176,8 @@ public:
   {
     globalRegisterNum =
         kernel.getNumRegTotal() + k.fg.builder->getNumScalarRegisters();
-    if (k.fg.builder->needA0WARForSend()) {
-      globalRegisterNum += k.fg.builder->getGRFNumOfAddrRegisters();
+    if (k.fg.builder->needA0WAR()) {
+      globalRegisterNum += k.fg.builder->getNumAddrRegistersInGRFSizeSWSB();
     }
 
     indexes.instIndex = 0;

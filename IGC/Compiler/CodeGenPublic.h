@@ -87,6 +87,7 @@ namespace IGCOpts
 
 namespace IGC
 {
+    struct BifLLVMModule;
     class CodeGenContext;
 
     struct SProgramOutput
@@ -332,6 +333,7 @@ namespace IGC
         bool hasGenericAddressSpacePointers{};
         bool hasDebugInfo{};        //<! true only if module contains debug info !llvm.dbg.cu
         bool hasAtomics{};
+        bool hasLocalAtomics{};
         bool hasDiscard{};
         bool hasTypedRead{};
         bool hasTypedwrite{};
@@ -369,6 +371,8 @@ namespace IGC
         unsigned int num1DAccesses{};
         unsigned int num2DAccesses{};
         unsigned int numSLMAccesses{};
+        unsigned int numSLMStores{};
+        unsigned int numSLMLoads{};
     };
 
     struct SSimplePushInfo
@@ -450,6 +454,7 @@ namespace IGC
         SIMD16_OFFSET = SIMD_INFO_RESERVED,
         SIMD32_OFFSET = SIMD_INFO_RESERVED*2,
         DUAL_SIMD8_OFFSET = SIMD_INFO_RESERVED * 3,
+        QUAD_SIMD8_DYNAMIC_OFFSET = SIMD_INFO_RESERVED*6,
     };
 
     struct SKernelProgram
@@ -692,6 +697,7 @@ namespace IGC
         LegacySymbolTable m_legacySymbolTable;
         ZEBinGlobalHostAccessTable m_zebinGlobalHostAccessTable;
         bool m_hasCrossThreadOffsetRelocations = false;
+        bool m_hasPerThreadOffsetRelocations = false;
     };
 
     class CBTILayout
@@ -972,6 +978,12 @@ namespace IGC
         unsigned int        m_constantPayloadNextAvailableGRFOffset = 0;
         ConstantPayloadInfo m_constantPayloadOffsets;
 
+        // Contains the data (bytecode, enabling bit) for BIF functions
+        // provided externally.
+        size_t m_numBifModules = 0;
+        BifLLVMModule* m_bifModules = nullptr;
+        // If this flag is enabled, STOC level emulation will be added to every AnyHitShader.
+        bool m_enableSubTriangleOpacityEmulation = false;
         void* gtpin_init = nullptr;
         bool m_hasLegacyDebugInfo = false;
         bool m_hasEmu64BitInsts = false;
@@ -1008,12 +1020,6 @@ namespace IGC
         uint32_t HdcEnableIndexSize = 0;
         std::vector<RoutingIndex> HdcEnableIndexValues;
 
-        // Flag per function/kernel informing about if it has
-        // expensive loops and needs trigger retry compilation
-        std::unordered_map<llvm::Function*, bool> m_FuncHasExpensiveLoops;
-
-        bool HasFuncExpensiveLoop(llvm::Function* pFunc);
-
         // Raytracing (any shader type)
         BVHInfo bvhInfo;
         // Immediate constant buffer promotion is enabled for all optimization except for Direct storage case
@@ -1028,6 +1034,7 @@ namespace IGC
         // Map to store global offsets in original global buffer
         std::map<std::string, uint64_t> inlineProgramScopeGlobalOffsets;
         std::vector<std::string> entry_names;
+        uint m_spillAllowed = 0;
     private:
         //For storing error message
         std::stringstream oclErrorMessage;
@@ -1155,6 +1162,7 @@ namespace IGC
             return llvmCtxWrapper->m_allLayoutStructTypes;
         }
 
+        bool isSWSubTriangleOpacityCullingEmulationEnabled() const;
 
         unsigned int GetSIMDInfoOffset(SIMDMode simd, ShaderDispatchMode mode)
         {
@@ -1180,10 +1188,14 @@ namespace IGC
             case ShaderDispatchMode::DUAL_SIMD8:
                 offset = DUAL_SIMD8_OFFSET;
                 break;
+            case ShaderDispatchMode::QUAD_SIMD8_DYNAMIC:
+                offset = QUAD_SIMD8_DYNAMIC_OFFSET;
+                break;
 
             default:
                 break;
             }
+            IGC_ASSERT(offset < 64);
             return offset;
         }
 
@@ -1204,7 +1216,7 @@ namespace IGC
 
         uint64_t GetSIMDInfo() { return m_SIMDInfo; }
 
-        SIMDMode GetSIMDMode();
+        SIMDMode GetSIMDMode() const;
 
         virtual std::optional<SIMDMode> knownSIMDSize() const {
             return std::nullopt;
@@ -1277,6 +1289,11 @@ namespace IGC
                 return true;
 
             return false;
+        }
+
+        bool hasSpills(uint mscratchSpaceUsedBySpills)
+        {
+            return (mscratchSpaceUsedBySpills > m_spillAllowed);
         }
     };
 

@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2020-2023 Intel Corporation
+Copyright (C) 2020-2025 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -151,6 +151,13 @@ static cl::opt<bool>
                          cl::desc("Find, report and fixup clobbered GV load "
                                   "users before coalescing happened."));
 
+static cl::opt<unsigned> DepressurizerGRFThresholdOpt(
+    "depressurizer-grf-threshold", cl::Hidden,
+    cl::desc("Threshold for GRF pressure reduction"));
+static cl::opt<unsigned> DepressurizerFlagGRFToleranceOpt(
+    "depressurizer-flag-grf-tolerance", cl::Hidden,
+    cl::desc("Threshold for disabling flag pressure reduction"));
+
 //===----------------------------------------------------------------------===//
 //
 // Backend config related stuff.
@@ -198,6 +205,8 @@ void GenXBackendOptions::enforceLLVMOptions() {
                            VCIgnoreLoopUnrollThresholdOnPragma);
   enforceOptionIfSpecified(InteropSubgroupSize, InteropSubgroupSizeOpt);
   enforceOptionIfSpecified(CheckGVClobbering, CheckGVClobberingOpt);
+  enforceOptionIfSpecified(DepressurizerGRFThreshold, DepressurizerGRFThresholdOpt);
+  enforceOptionIfSpecified(DepressurizerFlagGRFTolerance, DepressurizerFlagGRFToleranceOpt);
 }
 
 static std::unique_ptr<MemoryBuffer>
@@ -234,17 +243,29 @@ void GenXBackendData::setOwningBiFModuleIf(
     setOwningBiFModule(Kind, std::move(ModuleBuffer));
 }
 
-GenXBackendConfig::GenXBackendConfig()
-    : ImmutablePass(ID), Options{GenXBackendOptions::InitFromLLVMOpts{}},
-      Data{GenXBackendData::InitFromLLMVOpts{}} {
+GenXBackendConfig::GenXBackendConfig() : ImmutablePass(ID) {
   initializeGenXBackendConfigPass(*PassRegistry::getPassRegistry());
 }
 
 GenXBackendConfig::GenXBackendConfig(GenXBackendOptions &&OptionsIn,
                                      GenXBackendData &&DataIn)
-    : ImmutablePass(ID), Options(std::move(OptionsIn)),
-      Data(std::move(DataIn)) {
+    : ImmutablePass(ID),
+      GenXBackendConfigResult(std::move(OptionsIn), std::move(DataIn)) {
   initializeGenXBackendConfigPass(*PassRegistry::getPassRegistry());
 }
 
 INITIALIZE_PASS(GenXBackendConfig, DEBUG_TYPE, DEBUG_TYPE, false, true)
+
+#if LLVM_VERSION_MAJOR >= 16
+
+AnalysisKey GenXBackendConfigPass::Key;
+
+GenXBackendConfigPass::Result
+GenXBackendConfigPass::run(llvm::Module &M,
+                           llvm::AnalysisManager<llvm::Module> &AM) {
+
+  GenXBackendConfig BC;
+  return std::move(BC.getResult());
+}
+
+#endif

@@ -158,6 +158,7 @@ void ResolveOCLRaytracingBuiltins::defineOpaqueTypes() {
 
     IGC_ASSERT(rtFenceTy && rtGlobalsTy);
 
+
     SmallVector<Type*, 4> Tys{
         PointerType::get(rtFenceTy, ADDRESS_SPACE_PRIVATE),
         PointerType::get(rtGlobalsTy, ADDRESS_SPACE_GLOBAL),
@@ -184,8 +185,8 @@ Description:
 Returns a pointer to the data structure which the RT hardware operates on.
 The RT Stack address is computed as:
     syncStackSize = sizeof(HitInfo)*2 + (sizeof(Ray) + sizeof(TravStack))*RTDispatchGlobals.maxBVHLevels;
-    syncBase = RTDispatchGlobals.rtMemBasePtr - (DSSID * NUM_SIMD_LANES_PER_DSS + StackID + 1)*syncStackSize;
-Where DSSID is an index which uniquely identifies the DSS in the machine (across tiles), and StackID is compute as below:
+    syncBase = RTDispatchGlobals.rtMemBasePtr - (DSSID * NUM_SIMD_LANES_PER_DSS + StackID + 1)*syncStackSize; */
+/* Where DSSID is an index which uniquely identifies the DSS in the machine (across tiles), and StackID is compute as below:
     With fused EUs (e.g. in DG2) :
       StackID[10:0] (msb to lsb) = (EUID[3:0]<<7) | (THREAD_ID[2:0]<<4) | SIMD_LANE_ID[3:0]
 
@@ -361,6 +362,7 @@ void ResolveOCLRaytracingBuiltins::handleGetRTGlobalBuffer(llvm::CallInst& callI
     callInst.eraseFromParent();
 }
 
+
 /*
 Handler for
 void __builtin_IB_intel_init_ray_query(
@@ -382,6 +384,7 @@ void ResolveOCLRaytracingBuiltins::handleInitRayQuery(llvm::CallInst& callInst) 
 
     m_builder->SetInsertPoint(&callInst);
 
+
     auto storeToAlloca = [&](unsigned argIndex)
     {
         auto ptr = m_builder->CreateGEP(alloca->getAllocatedType(), alloca, { m_builder->getInt32(0), m_builder->getInt32(argIndex) });
@@ -391,6 +394,7 @@ void ResolveOCLRaytracingBuiltins::handleInitRayQuery(llvm::CallInst& callInst) 
 
     for (unsigned argIndex = 0; argIndex < numArgs; argIndex++)
         storeToAlloca(argIndex);
+
 
     callInst.replaceAllUsesWith(alloca);
     callInst.eraseFromParent();
@@ -428,7 +432,7 @@ void ResolveOCLRaytracingBuiltins::handleUpdateRayQuery(llvm::CallInst& callInst
 Handler for the following builtins:
 rtfence_t        __builtin_IB_intel_query_rt_fence(intel_ray_query_t);
 rtglobals_t      __builtin_IB_intel_query_rt_globals(intel_ray_query_t);
-global RTStack*  __builtin_IB_intel_query_rt_stack(intel_ray_query_t);
+global void*  __builtin_IB_intel_query_rt_stack(intel_ray_query_t);
 TraceRayCtrl     __builtin_IB_intel_query_ctrl(intel_ray_query_t);
 uint             __builtin_IB_intel_query_bvh_level(intel_ray_query_t);
 

@@ -15,8 +15,6 @@ SPDX-License-Identifier: MIT
 #include <llvm/IR/IRBuilder.h>
 #include "common/LLVMWarningsPop.hpp"
 
-#include "Compiler/MetaDataUtilsWrapper.h"
-
 #include <string>
 #include <queue>
 
@@ -79,7 +77,8 @@ namespace IGC
             });
         }
 
-        void setPromotedAttributes(llvm::Function* newFunction, llvm::AttributeList& attributeList);
+        template<typename T>
+        void setPromotedAttributes(T* callOrFunc, const llvm::AttributeList& attributeList);
 
         llvm::Value* getOrCreatePromotedValue(llvm::Value* value);
         llvm::Function* promoteFunction(llvm::Function* function);

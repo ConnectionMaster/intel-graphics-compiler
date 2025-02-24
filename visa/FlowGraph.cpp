@@ -8,32 +8,19 @@ SPDX-License-Identifier: MIT
 
 
 #include "FlowGraph.h"
-#include "BitSet.h"
 #include "BuildIR.h"
 #include "CFGStructurizer.h"
 #include "DebugInfo.h"
 #include "G4_Kernel.hpp"
 #include "Option.h"
-#include "PhyRegUsage.h"
 #include "visa_wa.h"
-
-#include "BinaryEncodingIGA.h"
-#include "iga/IGALibrary/api/iga.h"
-#include "iga/IGALibrary/api/iga.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
-#include <fstream>
-#include <functional>
 #include <iostream>
 #include <iterator>
 #include <random>
-#include <set>
-#include <sstream>
-#include <string>
-#include <unordered_map>
-#include <unordered_set>
 
 using namespace vISA;
 
@@ -1327,6 +1314,15 @@ void FlowGraph::handleReturn(Label_BB_Map &labelMap,
         G4_BB *retAddr = bb->Succs.front(); // return BB must be the front
         bb->removeSuccEdge(retAddr);
         retAddr->removePredEdge(bb);
+      }
+    }
+
+    if (bb->isLastInstEOT() && !bb->back()->isReturn()) {
+      G4_BB *succ = bb->getPhysicalSucc();
+      if (succ && succ->Preds.empty() &&
+           succ->getBBType() != G4_BB_INIT_TYPE) {
+        succ->Preds.push_back(bb);
+        bb->Succs.push_back(succ);
       }
     }
   }
@@ -3678,6 +3674,7 @@ void FlowGraph::addSaveRestorePseudoDeclares(IR_Builder &builder) {
     pseudoVCEDcl = builder.createDeclare(
         "VCE_SAVE", G4_GRF, builder.numEltPerGRF<Type_UD>(),
         static_cast<unsigned short>(numRowsVCE), Type_UD);
+    pseudoDcls.insert(pseudoVCEDcl);
   } else {
     pseudoVCEDcl->getRegVar()->setPhyReg(NULL, 0);
   }
@@ -3710,9 +3707,23 @@ void FlowGraph::addSaveRestorePseudoDeclares(IR_Builder &builder) {
     name = builder.getNameString(64, "SFLAG_%d", i);
     G4_Declare *saveFLAG = builder.createDeclare(
         name, G4_FLAG, (uint16_t)builder.getNumFlagRegisters(), 1, Type_UW);
-    fcallToPseudoDclMap[callSite->asCFInst()] = {VCA, saveA0, saveFLAG};
+    fillPseudoDclMap(callSite->asCFInst(), VCA, saveA0, saveFLAG);
     i++;
   }
+}
+
+void FlowGraph::fillPseudoDclMap(G4_InstCF *cfInst, G4_Declare *VCA,
+                                 G4_Declare *saveA0, G4_Declare *saveFlag) {
+  fcallToPseudoDclMap[cfInst] = {VCA, saveA0, saveFlag};
+  pseudoDcls.insert({VCA, saveA0, saveFlag});
+  pseudoVCADcls.insert(VCA);
+  pseudoA0Dcls.insert(saveA0);
+  vISA_ASSERT((3 * fcallToPseudoDclMap.size() + 1) == pseudoDcls.size(),
+              "Found inconsistency between fcallToPseudoDclMap and pseudoDcls");
+  vISA_ASSERT(fcallToPseudoDclMap.size() == pseudoVCADcls.size(),
+              "Found inconsistency between fcallToPseudoDclMap and pseudoVCADcls");
+  vISA_ASSERT(fcallToPseudoDclMap.size() == pseudoA0Dcls.size(),
+              "Found inconsistency between fcallToPseudoDclMap and pseudoA0Dcls");
 }
 
 //
@@ -4599,6 +4610,15 @@ uint32_t RelocationEntry::getTargetOffset(const IR_Builder &builder) const {
     vASSERT(opndPos == 1);
     // Src1.imm[31:0] mapped to Instruction [127:96]
     return 12;
+  case G4_mad:
+    vASSERT(relocType == R_SYM_ADDR_16);
+    // Src0.imm[15:0] mapped to Instruction [79:64]
+    // Src2.imm[15:0] mapped to Instruction [127:112]
+    if (opndPos == 1)
+      return 8;
+    else if (opndPos == 3)
+      return 14;
+    break;
   case G4_send:
   case G4_sendc:
   case G4_sends:
@@ -4631,6 +4651,8 @@ const char *RelocationEntry::getTypeString(RelocationType relocType) {
     return "R_GLOBAL_IMM_32";
   case RelocationType::R_SEND:
     return "R_SEND";
+  case RelocationType::R_SYM_ADDR_16:
+    return "R_SYM_ADDR_16";
   default:
     vISA_ASSERT_UNREACHABLE("unhandled relocation type");
     return "??";

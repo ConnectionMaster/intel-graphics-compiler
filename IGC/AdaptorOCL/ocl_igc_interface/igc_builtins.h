@@ -30,6 +30,8 @@ CIF_DEFINE_INTERFACE_VER(IgcBuiltins, 1) {
         using AlgorithmCoder = CIF::Coder<Algorithm_t>;
 
         static constexpr auto sort = AlgorithmCoder::Enc("SORT");
+        static constexpr auto clusteredSort = AlgorithmCoder::Enc("CLUSTER_SORT");
+        static constexpr auto clusteredSortedOrdinal = AlgorithmCoder::Enc("CSORTED_ORD");
     } BuiltinAlgorithm;
 
     typedef struct BuiltinMemoryType {

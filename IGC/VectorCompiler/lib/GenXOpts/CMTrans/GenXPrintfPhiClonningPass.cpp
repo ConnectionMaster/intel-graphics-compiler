@@ -33,6 +33,7 @@ SPDX-License-Identifier: MIT
 ///    ret
 //===----------------------------------------------------------------------===//
 
+#include "llvmWrapper/IR/Function.h"
 #include "llvmWrapper/IR/Operator.h"
 #include "vc/GenXOpts/GenXOpts.h"
 #include "vc/Support/BackendConfig.h"
@@ -41,7 +42,6 @@ SPDX-License-Identifier: MIT
 #include "vc/Utils/General/IRBuilder.h"
 #include <llvm/Transforms/Utils/Cloning.h>
 #include <map>
-#include "llvmWrapper/IR/Function.h"
 
 #define DEBUG_TYPE "print-phi-clonning"
 
@@ -84,10 +84,23 @@ INITIALIZE_PASS_DEPENDENCY(GenXBackendConfig)
 INITIALIZE_PASS_END(GenXPrintfPhiClonning, "GenXPrintfPhiClonning",
                     "GenXPrintfPhiClonning", false, false)
 
-ModulePass *llvm::createGenXPrintfPhiClonningPass() {
+namespace llvm {
+ModulePass *createGenXPrintfPhiClonningPass() {
   initializeGenXPrintfPhiClonningPass(*PassRegistry::getPassRegistry());
   return new GenXPrintfPhiClonning;
 }
+} // namespace llvm
+
+#if LLVM_VERSION_MAJOR >= 16
+PreservedAnalyses
+GenXPrintfPhiClonningPass::run(llvm::Module &M,
+                               llvm::AnalysisManager<llvm::Module> &) {
+  GenXPrintfPhiClonning GenXPhi;
+  if (GenXPhi.runOnModule(M))
+    return PreservedAnalyses::none();
+  return PreservedAnalyses::all();
+}
+#endif
 
 void GenXPrintfPhiClonning::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.addRequired<GenXBackendConfig>();

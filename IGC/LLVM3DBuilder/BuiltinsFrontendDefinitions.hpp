@@ -311,6 +311,64 @@ inline llvm::Value* LLVM3DBuilder<preserveNames, T, Inserter>::Create_typedread(
 }
 
 template<bool preserveNames, typename T, typename Inserter>
+inline llvm::Value* LLVM3DBuilder<preserveNames, T, Inserter>::Create_typedwriteMS(
+    llvm::Value* dstBuffer,
+    llvm::Value* srcAddressU,
+    llvm::Value* srcAddressV,
+    llvm::Value* srcAddressW,
+    llvm::Value* sampleIdx,
+    llvm::Value* float_X,
+    llvm::Value* float_Y,
+    llvm::Value* float_Z,
+    llvm::Value* float_W)
+{
+    llvm::Module* module = this->GetInsertBlock()->getParent()->getParent();
+
+    llvm::Function* pFuncTypedWriteMS = llvm::GenISAIntrinsic::getDeclaration(
+        module, llvm::GenISAIntrinsic::GenISA_typedwriteMS, dstBuffer->getType());
+
+    llvm::Value* args[] = {
+        dstBuffer,
+        srcAddressU,
+        srcAddressV,
+        srcAddressW,
+        sampleIdx,
+        float_X,
+        float_Y,
+        float_Z,
+        float_W,
+    };
+
+    llvm::Value* typedwrite = this->CreateCall(pFuncTypedWriteMS, args);
+    return typedwrite;
+}
+
+template<bool preserveNames, typename T, typename Inserter>
+inline llvm::Value* LLVM3DBuilder<preserveNames, T, Inserter>::Create_typedreadMS(
+    llvm::Value* srcBuffer,
+    llvm::Value* srcAddressU,
+    llvm::Value* srcAddressV,
+    llvm::Value* srcAddressW,
+    llvm::Value* sampleIdx)
+{
+    llvm::Module* module = this->GetInsertBlock()->getParent()->getParent();
+
+    llvm::Function* pFuncTypedReadMS = llvm::GenISAIntrinsic::getDeclaration(
+        module, llvm::GenISAIntrinsic::GenISA_typedreadMS, srcBuffer->getType());
+
+    llvm::Value* args[] = {
+        srcBuffer,
+        srcAddressU,
+        srcAddressV,
+        srcAddressW,
+        sampleIdx
+    };
+
+    llvm::Value* typedread = this->CreateCall(pFuncTypedReadMS, args);
+    return typedread;
+}
+
+template<bool preserveNames, typename T, typename Inserter>
 inline llvm::Value* LLVM3DBuilder<preserveNames, T, Inserter>::Create_typedread_msaa2D(
     llvm::Value* srcBuffer,
     llvm::Value* sampleIdx,
@@ -3596,7 +3654,7 @@ llvm::Value* LLVM3DBuilder<preserveNames, T, Inserter>::CreateDFloor(llvm::Value
         "  %39 = ashr i64 %1, 31                                                    \n"
         "  %.op = and i64 %39, -4616189618054758400                                 \n"
         "  %40 = bitcast i64 %.op to double                                         \n"
-        "  %41 = select i1 %38, double 0.000000e+00, double %40                     \n"
+        "  %41 = select i1 %38, double -0.000000e+00, double %40                    \n"
         "  %42 = fadd double %33, %41                                               \n"
         "  ret double %42                                                           \n"
         "}";
@@ -3688,7 +3746,7 @@ llvm::Value* LLVM3DBuilder<preserveNames, T, Inserter>::CreateDCeil(llvm::Value 
         "  %40 = and i64 %39, -4607182418800017408                                  \n"
         "  %.op = add nsw i64 %40, 4607182418800017408                              \n"
         "  %41 = bitcast i64 %.op to double                                         \n"
-        "  %42 = select i1 %38, double 0.000000e+00, double %41                     \n"
+        "  %42 = select i1 %38, double -0.000000e+00, double %41                    \n"
         "  %43 = fadd double %33, %42                                               \n"
         "  ret double %43                                                           \n"
         "}";

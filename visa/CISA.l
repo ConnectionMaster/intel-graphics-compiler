@@ -53,6 +53,11 @@ static unsigned char           FENCEOptions(const char* str);
 static COMMON_ISA_VME_OP_MODE  VMEType(const char *str);
 static CHANNEL_OUTPUT_FORMAT   Get_Channel_Output(const char* str);
 static void                    appendStringLiteralChar(char c, char *buf, size_t *len);
+
+static bool buildOptionPresent = false;
+void resetGlobalVariables() {
+    buildOptionPresent = false;
+}
 %}
 
 %option yylineno
@@ -65,6 +70,17 @@ static void                    appendStringLiteralChar(char c, char *buf, size_t
 \n {
       return NEWLINE;
    }
+
+"//Build option:"[ \t]*\"([^\"\n]*)\"[ \t]* {
+    if(pBuilder->getOptions()->getOption(vISA_ParseBuildOptions)) {
+        if(buildOptionPresent)
+            YY_FATAL_ERROR("more then one instance of build options");
+        buildOptionPresent = true;
+        TRACE("** BUILD_OPTION\n");
+        CISAlval.string = strdup(yytext);
+        return BUILD_OPTION_LINE;
+    }
+}
 
 [ \t] { /*drop non-newline spaces*/}
 "//"[^\n]* {
@@ -441,6 +457,13 @@ lsc_load|lsc_load_quad|lsc_load_status {
         // CISAlval.lsc_opcode = ISA_LSC_UNTYPED OR ISA_LSC_TYPED;
         return LSC_LOAD_MNEMONIC;
     }
+lsc_load_quad_msrt {
+    TRACE("** lsc_load* INST");
+        CISAlval.lsc_subOpcode = str2lscop(yytext);
+        // this is set in the parser based on the SFID
+        // CISAlval.lsc_opcode = ISA_LSC_UNTYPED OR ISA_LSC_TYPED;
+        return LSC_LOAD_MSRT_MNEMONIC;
+    }
 lsc_load_strided {
         TRACE("** lsc_load_strided INST");
         CISAlval.lsc_subOpcode = str2lscop(yytext);
@@ -462,6 +485,13 @@ lsc_store|lsc_store_quad|lsc_store_uncompressed|lsc_ccs_update {
         // this is set in the parser based on the SFID
         // CISAlval.lsc_opcode = ISA_LSC_UNTYPED OR ISA_LSC_TYPED;
         return LSC_STORE_MNEMONIC;
+    }
+lsc_store_quad_msrt {
+        TRACE("** lsc_store* INST");
+        CISAlval.lsc_subOpcode = str2lscop(yytext);
+        // this is set in the parser based on the SFID
+        // CISAlval.lsc_opcode = ISA_LSC_UNTYPED OR ISA_LSC_TYPED;
+        return LSC_STORE_MSRT_MNEMONIC;
     }
 lsc_store_strided {
         TRACE("** lsc_store_strided INST");

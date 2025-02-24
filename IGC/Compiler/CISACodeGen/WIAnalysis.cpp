@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2017-2023 Intel Corporation
+Copyright (C) 2017-2024 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -22,8 +22,8 @@ SPDX-License-Identifier: MIT
 #include <llvm/Support/Debug.h>
 #include <llvm/IR/Constants.h>
 #include "common/LLVMWarningsPop.hpp"
+
 #include <string>
-#include <stack>
 #include <sstream>
 #include "Probe/Assertion.h"
 
@@ -168,7 +168,6 @@ namespace IGC {
         const llvm::BasicBlock* full_join;
         llvm::DenseSet<llvm::BasicBlock*> influence_region;
         llvm::SmallPtrSet<llvm::BasicBlock*, 4> partial_joins;
-        llvm::BasicBlock* fork_blk = nullptr;
     };
 } // namespace IGC
 
@@ -892,32 +891,47 @@ void WIAnalysisRunner::calculate_dep(const Value* val)
     }
 }
 
-bool WIAnalysisRunner::isRegionInvariant(const llvm::Instruction* defi, BranchInfo* brInfo, unsigned level)
+bool WIAnalysisRunner::isRegionInvariant(const llvm::Instruction* defi, BranchInfo* brInfo)
 {
-    if (level >= 4)
+    constexpr uint8_t MAX_DEPTH = 4;
+    struct RegionOperand{
+        const llvm::Instruction* inst;
+        uint8_t operandNum;
+    };
+
+    llvm::SmallVector<RegionOperand, MAX_DEPTH> operands;
+    operands.push_back({defi, 0});
+
+    while (!operands.empty())
     {
-        return false;
-    }
-    if (isa<PHINode>(defi))
-    {
-        return false;
-    }
-    const unsigned nOps = defi->getNumOperands();
-    for (unsigned i = 0; i < nOps; ++i)
-    {
-        Value* op = defi->getOperand(i);
-        Instruction* srci = dyn_cast<Instruction>(op);
-        if (srci)
+        auto& rop = operands.back();
+        if (isa<PHINode>(rop.inst))
         {
-            if (!brInfo->influence_region.count(srci->getParent()))
+            return false;
+        }
+
+        if (rop.operandNum < rop.inst->getNumOperands())
+        {
+            Value* op = rop.inst->getOperand(rop.operandNum);
+            rop.operandNum++;
+            auto* srci = dyn_cast<Instruction>(op);
+            if (srci)
             {
-                // go on to check the next operand
-                continue;
+                if (!brInfo->influence_region.count(srci->getParent()))
+                {
+                    // go on to check the next operand
+                    continue;
+                }
+                if (operands.size() + 1 > MAX_DEPTH)
+                {
+                    return false;
+                }
+                operands.push_back({srci, 0});
             }
-            else if (!isRegionInvariant(srci, brInfo, level + 1))
-            {
-                return false;
-            }
+        }
+        else
+        {
+            operands.pop_back();
         }
     }
     return true;
@@ -1039,7 +1053,7 @@ void WIAnalysisRunner::update_cf_dep(const IGCLLVM::TerminatorInst* inst)
             // all the sources are outside the region.
             // However this is only as good as we can get because we
             // only search limited depth
-            if (isRegionInvariant(defi, &br_info, 0))
+            if (isRegionInvariant(defi, &br_info))
             {
                 continue;
             }
@@ -1411,7 +1425,9 @@ WIAnalysis::WIDependancy WIAnalysisRunner::calculate_dep(const CallInst* inst)
         intrinsic_name == llvm_cycleCounter ||
         intrinsic_name == llvm_waveShuffleIndex ||
         intrinsic_name == llvm_waveBroadcast ||
+        intrinsic_name == llvm_waveClusteredBroadcast ||
         intrinsic_name == llvm_waveBallot ||
+        intrinsic_name == llvm_waveClusteredBallot ||
         intrinsic_name == llvm_waveAll ||
         intrinsic_name == llvm_waveClustered ||
         intrinsic_name == llvm_waveInterleave ||
@@ -2325,79 +2341,71 @@ BranchInfo::BranchInfo(const IGCLLVM::TerminatorInst* inst, const BasicBlock* ip
     : cbr(inst),
     full_join(ipd)
 {
-    const BasicBlock* fork_blk = inst->getParent();
+    auto* fork_blk = const_cast<BasicBlock*>(inst->getParent());
     IGC_ASSERT_MESSAGE(cbr == fork_blk->getTerminator(), "block terminator mismatch");
 
+    llvm::SmallVector<BasicBlock*, 4> WorkSet;
     if (cbr->getNumSuccessors() != 2) {
-        std::set<const BasicBlock*> Reached;
-        for (auto SI = succ_begin(fork_blk),
-            SE = succ_end(fork_blk); SI != SE; ++SI) {
-            auto Succ = *SI;
+        llvm::DenseSet<BasicBlock*> Reached;
+        llvm::DenseSet<BasicBlock*> Visited;
+        for (auto* Succ : successors(fork_blk))
+        {
             if (Succ == full_join)
                 continue;
-            std::set<const BasicBlock*> Visited;
-            std::stack<const BasicBlock*> WorkSet;
-            WorkSet.push(Succ);
+            Visited.clear();
+            WorkSet.push_back(Succ);
             while (!WorkSet.empty()) {
-                const BasicBlock* BB = WorkSet.top();
-                WorkSet.pop();
+                BasicBlock* BB = WorkSet.pop_back_val();
                 Visited.insert(BB);
                 influence_region.insert(const_cast<BasicBlock*>(BB));
                 if (Reached.count(BB))
                     partial_joins.insert(const_cast<BasicBlock*>(BB));
-                for (auto I = succ_begin(BB), E = succ_end(BB); I != E; ++I) {
-                    auto SBB = *I;
+                for (auto* SBB : successors(BB))
+                {
                     if (SBB != full_join && !Visited.count(SBB))
-                        WorkSet.push(SBB);
+                        WorkSet.push_back(SBB);
                 }
             }
             // Merge Visited into Reached.
-            for (auto BB : Visited)
-                Reached.insert(BB);
+            Reached.insert(Visited.begin(), Visited.end());
         }
+        return;
     }
-    else {
-        std::set<BasicBlock*> f_set, t_set;
-        std::stack<BasicBlock*> work_set;
-        if (cbr->getSuccessor(0) != full_join)
+    llvm::DenseSet<BasicBlock*> f_set, t_set;
+    if (cbr->getSuccessor(0) != full_join)
+    {
+        WorkSet.push_back(cbr->getSuccessor(0));
+        while (!WorkSet.empty())
         {
-            work_set.push(cbr->getSuccessor(0));
-            while (!work_set.empty())
+            BasicBlock* cur_blk = WorkSet.pop_back_val();
+            f_set.insert(cur_blk);
+            influence_region.insert(cur_blk);
+            for (auto* succ_blk : successors(cur_blk))
             {
-                BasicBlock* cur_blk = work_set.top();
-                work_set.pop();
-                f_set.insert(cur_blk);
-                influence_region.insert(cur_blk);
-                for (succ_iterator SI = succ_begin(cur_blk), E = succ_end(cur_blk); SI != E; ++SI)
+                if (succ_blk != full_join && !f_set.count(succ_blk))
                 {
-                    BasicBlock* succ_blk = (*SI);
-                    if (succ_blk != full_join && !f_set.count(succ_blk))
-                    {
-                        work_set.push(succ_blk);
-                    }
+                    WorkSet.push_back(succ_blk);
                 }
             }
         }
-        if (cbr->getSuccessor(1) != full_join)
+    }
+    if (cbr->getSuccessor(1) != full_join)
+    {
+        WorkSet.push_back(cbr->getSuccessor(1));
+        while (!WorkSet.empty())
         {
-            work_set.push(cbr->getSuccessor(1));
-            while (!work_set.empty())
+            BasicBlock* cur_blk = WorkSet.pop_back_val();
+            t_set.insert(cur_blk);
+            influence_region.insert(cur_blk);
+            if (f_set.count(cur_blk))
             {
-                BasicBlock* cur_blk = work_set.top();
-                work_set.pop();
-                t_set.insert(cur_blk);
-                influence_region.insert(cur_blk);
-                if (f_set.count(cur_blk))
+                partial_joins.insert(cur_blk);
+            }
+            for (auto* succ_blk : successors(cur_blk))
+            {
+                if (succ_blk != full_join && !t_set.count(succ_blk))
                 {
-                    partial_joins.insert(cur_blk);
-                }
-                for (succ_iterator SI = succ_begin(cur_blk), E = succ_end(cur_blk); SI != E; ++SI)
-                {
-                    BasicBlock* succ_blk = (*SI);
-                    if (succ_blk != full_join && !t_set.count(succ_blk))
-                    {
-                        work_set.push(succ_blk);
-                    }
+                    WorkSet.push_back(succ_blk);
                 }
             }
         }

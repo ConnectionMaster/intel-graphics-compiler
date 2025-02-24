@@ -39,7 +39,6 @@ See LICENSE.TXT for details.
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/FormattedStream.h"
 #include "llvm/Support/LEB128.h"
-#include <optional>
 #include "common/LLVMWarningsPop.hpp"
 // clang-format on
 
@@ -52,6 +51,7 @@ See LICENSE.TXT for details.
 #include "VISAModule.hpp"
 
 #include <list>
+#include <optional>
 #include <unordered_set>
 
 #include "Probe/Assertion.h"
@@ -211,14 +211,19 @@ void DbgVariable::emitExpression(CompileUnit *CU, IGC::DIEBlock *Block) const {
     }
     I->appendToVector(Elements);
   }
-  bool isStackValueNeeded = false;
-  if (currentLocationIsSimpleIndirectValue()) {
-    // drop OP_deref and don't emit DW_OP_stack_value.
+  const bool isSimpleIndirect = currentLocationIsSimpleIndirectValue();
+  if (isSimpleIndirect)
+    // drop OP_deref
     Elements.erase(Elements.begin());
-  } else if (!currentLocationIsMemoryAddress() &&
-             !currentLocationIsImplicit() && !currentLocationIsVector()) {
-    isStackValueNeeded = true;
+  bool shouldResetStackValue = currentLocationIsImplicit();
+  if (shouldResetStackValue && !Elements.empty() &&
+      *Elements.rbegin() == dwarf::DW_OP_stack_value) {
+    Elements.pop_back();
   }
+  const bool isFirstHalf = this->RegType == DbgRegisterType::FirstHalf;
+  bool isStackValueNeeded = !isSimpleIndirect &&
+                            !currentLocationIsMemoryAddress() &&
+                            !currentLocationIsVector() && !isFirstHalf;
 
   for (auto elem : Elements) {
     auto BF = DIEInteger::BestForm(false, elem);
@@ -496,7 +501,7 @@ DIE *DwarfDebug::updateSubprogramScopeDIE(CompileUnit *SPCU, DISubprogram *SP) {
     }
   }
 
-  if (m_pModule && m_pModule->getFunction() &&
+  if (m_pModule->getFunction() &&
       m_pModule->getFunction()->getSubprogram() == SP &&
       m_pModule->GetType() == VISAModule::ObjectType::SUBROUTINE) {
     SPCU->addUInt(SPDie, dwarf::DW_AT_calling_convention, dwarf::DW_FORM_data1,
@@ -613,7 +618,7 @@ void DwarfDebug::encodeRange(CompileUnit *TheCU, DIE *ScopeDIE,
     return;
 
   // Resolve VISA index to Gen IP here.
-  std::vector<std::pair<unsigned int, unsigned int>> AllGenISARanges;
+  VISAModule::GenISARange AllGenISARanges;
   for (SmallVectorImpl<InsnRange>::const_iterator RI = PrunedRanges.begin(),
                                                   RE = PrunedRanges.end();
        RI != RE; ++RI) {
@@ -1648,7 +1653,7 @@ void DwarfDebug::collectVariableInfo(
                                   (pInst->getMetadata("StorageOffset") ||
                                    Loc.HasSurface() || Loc.IsSLM()))) {
           RegVar->setDbgInst(pInst);
-          RegVar->isLocationInlined = true;
+          RegVar->setLocationInlined(true);
           break;
         }
       }
@@ -1662,19 +1667,21 @@ void DwarfDebug::collectVariableInfo(
 
       if (HI + 1 != HE)
         end = HI[1];
-      else {
+      else if (auto lastIATit =
+                   SameIATInsts.find(start->getDebugLoc().getInlinedAt());
+               lastIATit != SameIATInsts.end()) {
         // Find loc of last instruction in current function (same IAT)
-        auto lastIATit = SameIATInsts.find(start->getDebugLoc().getInlinedAt());
-        if (lastIATit != SameIATInsts.end())
-          end = (*lastIATit).second.back();
+        end = (*lastIATit).second.back();
       }
 
-      IGC::InsnRange InsnRange(start, end);
-      auto GenISARange = m_pModule->getGenISARange(*VisaDbgInfo, InsnRange);
+      if (start == end) {
+        continue;
+      }
 
+      auto GenISARange = m_pModule->getGenISARange(*VisaDbgInfo, {start, end});
       for (const auto &range : GenISARange) {
-        DbgValuesWithGenIP[RegVar].push_back(
-            std::make_tuple(range.first, range.second, RegVar, pInst));
+        DbgValuesWithGenIP[RegVar].emplace_back(range.first, range.second,
+                                                RegVar, pInst);
       }
     }
 
@@ -3261,6 +3268,11 @@ void DwarfDebug::writeFDEStackCall(VISAModule *m) {
     }
   };
 
+  auto writeUndefined = [](std::vector<uint8_t> &data, uint32_t srcReg) {
+    write(data, (uint8_t)llvm::dwarf::DW_CFA_undefined);
+    writeULEB128(data, srcReg);
+  };
+
   auto writeSameValue = [](std::vector<uint8_t> &data, uint32_t srcReg) {
     write(data, (uint8_t)llvm::dwarf::DW_CFA_same_value);
     writeULEB128(data, srcReg);
@@ -3391,9 +3403,20 @@ void DwarfDebug::writeFDEStackCall(VISAModule *m) {
   } else {
     if (m->GetType() == VISAModule::ObjectType::KERNEL) {
       // set return location to be undefined in top frame
-      write(cfaOps[0], (uint8_t)llvm::dwarf::DW_CFA_undefined);
-      writeULEB128(cfaOps[0], RegisterNumbering::IP);
+      writeUndefined(cfaOps[0], RegisterNumbering::IP);
     }
+  }
+
+  // write channel enable (currently only in -O0)
+  if (CFI.CEOffsetFromFPOff != 0xffff) {
+    write(cfaOps[CFI.CEStoreIP], (uint8_t)llvm::dwarf::DW_CFA_expression);
+    writeULEB128(cfaOps[CFI.CEStoreIP], RegisterNumbering::EMask);
+    writeCFAExpr(cfaOps[CFI.CEStoreIP], CFI.CEOffsetFromFPOff);
+
+    // set EMask to undefined when epilog starts to prevent
+    // dereferencing invalid CFA
+    writeUndefined(cfaOps[CFI.callerbefp.back().end + MovGenInstSizeInBytes],
+                   RegisterNumbering::EMask);
   }
 
   // write callee save

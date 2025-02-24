@@ -19,6 +19,7 @@ SPDX-License-Identifier: MIT
 #include <llvm/Transforms/Utils/BasicBlockUtils.h>
 #include <llvm/Transforms/Utils/SSAUpdater.h>
 #include "common/LLVMWarningsPop.hpp"
+#include "llvmWrapper/Analysis/InstructionSimplify.h"
 
 using namespace IGC;
 using namespace llvm;
@@ -114,15 +115,24 @@ bool DynamicRayManagementPass::runOnFunction(Function& F)
 
     bool changed = false;
 
+    bool hasDiscard = llvm::any_of(
+        instructions(F),
+        [](auto& I) {
+            return isDiscardInstruction(&I);
+        }
+    );
+
     // Dot not process further if:
     // 1. RayTracing is not supported on this platform.
     // 2. Shader does not use RayQuery at all.
     // 3. There are more than 1 exit block.
     // 4. RayQuery needs splitting due to forced SIMD32
+    // 5. Shader has discards
     if ((m_CGCtx->platform.supportRayTracing() == false) ||
         (!m_CGCtx->hasSyncRTCalls()) ||
         (getNumberOfExitBlocks(F) > 1) ||
-        m_CGCtx->syncRTCallsNeedSplitting())
+        m_CGCtx->syncRTCallsNeedSplitting() ||
+        hasDiscard)
     {
         return false;
     }
@@ -237,7 +247,8 @@ bool DynamicRayManagementPass::requiresSplittingCheckReleaseRegion(Instruction& 
     return
         isa<ContinuationHLIntrinsic>(I) ||
         isBarrierIntrinsic(&I) ||
-        isUserFunctionCall(&I);
+        isUserFunctionCall(&I) ||
+        isDiscardInstruction(&I);
 }
 
 void DynamicRayManagementPass::FindProceedsInOperands(Instruction* I, SetVector<TraceRaySyncProceedHLIntrinsic*>& proceeds, SmallPtrSetImpl<Instruction*>& cache)
@@ -517,11 +528,7 @@ bool DynamicRayManagementPass::TryProceedBasedApproach(Function& F)
         Value* flag = I->getOperand(0);
         if (auto* flagAsBinOp = dyn_cast<BinaryOperator>(flag))
             flag =
-#if LLVM_VERSION_MAJOR >= 15
-            simplifyBinOp(
-#else
-            SimplifyBinOp(
-#endif
+            IGCLLVM::simplifyBinOp(
                 flagAsBinOp->getOpcode(),
                 flagAsBinOp->getOperand(0),
                 flagAsBinOp->getOperand(1),
@@ -985,6 +992,18 @@ void DynamicRayManagementPass::HandleComplexControlFlow(Function& F)
                 // is enabled, remove Check/Release pairs which encapsulates any Barrier.
                 if (IGC_IS_FLAG_ENABLED(DisableRayQueryDynamicRayManagementMechanismForBarriers) &&
                     isBarrierIntrinsic(&I))
+                {
+                    rayQueryReleaseIntrinsic->eraseFromParent();
+                    rayQueryCheckIntrinsic->eraseFromParent();
+
+                    // Remove the pair from the vector in case more Barriers or External
+                    // calls are between them.
+                    m_RayQueryCheckReleasePairs.erase(m_RayQueryCheckReleasePairs.begin() + rayQueryCheckReleasePairIndex);
+
+                    break;
+                }
+
+                if (isDiscardInstruction(&I) && !m_CGCtx->platform.allowDivergentControlFlowRayQueryCheckRelease())
                 {
                     rayQueryReleaseIntrinsic->eraseFromParent();
                     rayQueryCheckIntrinsic->eraseFromParent();

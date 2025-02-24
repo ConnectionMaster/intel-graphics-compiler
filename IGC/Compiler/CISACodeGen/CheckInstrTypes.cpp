@@ -159,6 +159,7 @@ void CheckInstrTypes::print(llvm::raw_ostream& OS) const
     OS << "\nhasGenericAddressSpacePointers: " << g_InstrTypes.hasGenericAddressSpacePointers;
     OS << "\nhasDebugInfo: " << g_InstrTypes.hasDebugInfo;
     OS << "\nhasAtomics: " << g_InstrTypes.hasAtomics;
+    OS << "\nhasLocalAtomics: " << g_InstrTypes.hasLocalAtomics;
     OS << "\nhasDiscard: " << g_InstrTypes.hasDiscard;
     OS << "\nhasTypedRead: " << g_InstrTypes.hasTypedRead;
     OS << "\nhasTypedwrite: " << g_InstrTypes.hasTypedwrite;
@@ -192,7 +193,9 @@ void CheckInstrTypes::print(llvm::raw_ostream& OS) const
     OS << "\nnumUntyped: " << g_InstrTypes.numUntyped;
     OS << "\nnum1DAccesses: " << g_InstrTypes.num1DAccesses;
     OS << "\nnum2DAccesses: " << g_InstrTypes.num2DAccesses;
-    OS << "\nnumSLMAccesses: " << g_InstrTypes.numSLMAccesses << "\n\n";
+    OS << "\nnumSLMAccesses: " << g_InstrTypes.numSLMAccesses;
+    OS << "\nnumSLMStores: " << g_InstrTypes.numSLMStores;
+    OS << "\nnumSLMLoads: " << g_InstrTypes.numSLMLoads << "\n\n";
 }
 
 void CheckInstrTypes::checkGlobalLocal(llvm::Instruction& I)
@@ -309,9 +312,18 @@ void CheckInstrTypes::visitCallInst(CallInst& C)
         case GenISAIntrinsic::GenISA_LSCAtomicFP64:
         case GenISAIntrinsic::GenISA_LSCAtomicFP32:
         case GenISAIntrinsic::GenISA_LSCAtomicInts:
+        {
             g_InstrTypes.hasAtomics = true;
             g_InstrTypes.numAtomics++;
+            Value* bufPtr = GetBufferOperand(CI);
+            if (bufPtr &&
+                bufPtr->getType()->isPointerTy() &&
+                ADDRESS_SPACE_LOCAL == bufPtr->getType()->getPointerAddressSpace())
+            {
+                g_InstrTypes.hasLocalAtomics = true;
+            }
             break;
+        }
         case GenISAIntrinsic::GenISA_discard:
             g_InstrTypes.hasDiscard = true;
             break;
@@ -327,11 +339,13 @@ void CheckInstrTypes::visitCallInst(CallInst& C)
             g_InstrTypes.hasUniformAssumptions = true;
             break;
         case GenISAIntrinsic::GenISA_typedread:
+        case GenISAIntrinsic::GenISA_typedreadMS:
             g_InstrTypes.hasTypedRead = true;
             g_InstrTypes.numTypedReadWrite++;
             g_InstrTypes.num2DAccesses++;
             break;
         case GenISAIntrinsic::GenISA_typedwrite:
+        case GenISAIntrinsic::GenISA_typedwriteMS:
             g_InstrTypes.hasTypedwrite = true;
             g_InstrTypes.numTypedReadWrite++;
             g_InstrTypes.num2DAccesses++;
@@ -340,7 +354,9 @@ void CheckInstrTypes::visitCallInst(CallInst& C)
         case GenISAIntrinsic::GenISA_WaveBallot:
         case GenISAIntrinsic::GenISA_wavebarrier:
         case GenISAIntrinsic::GenISA_WaveInverseBallot:
+        case GenISAIntrinsic::GenISA_WaveClusteredBallot:
         case GenISAIntrinsic::GenISA_WavePrefix:
+        case GenISAIntrinsic::GenISA_WaveClusteredPrefix:
         case GenISAIntrinsic::GenISA_WaveClustered:
         case GenISAIntrinsic::GenISA_WaveInterleave:
         case GenISAIntrinsic::GenISA_WaveClusteredInterleave:
@@ -364,7 +380,9 @@ void CheckInstrTypes::visitCallInst(CallInst& C)
             g_InstrTypes.num1DAccesses++;
             BufferType bufferType = DecodeBufferType(
                 CI->getArgOperand(0)->getType()->getPointerAddressSpace());
-            if (bufferType == UAV || bufferType == BINDLESS)
+            if (bufferType == UAV ||
+                bufferType == BINDLESS ||
+                bufferType == BINDLESS_READONLY)
             {
                 g_InstrTypes.hasStorageBufferLoad = true;
             }
@@ -376,7 +394,9 @@ void CheckInstrTypes::visitCallInst(CallInst& C)
             g_InstrTypes.num1DAccesses++;
             BufferType bufferType = DecodeBufferType(
                 CI->getArgOperand(0)->getType()->getPointerAddressSpace());
-            if (bufferType == UAV || bufferType == BINDLESS)
+            if (bufferType == UAV ||
+                bufferType == BINDLESS ||
+                bufferType == BINDLESS_WRITEONLY)
             {
                 g_InstrTypes.hasStorageBufferStore = true;
             }
@@ -560,6 +580,7 @@ void CheckInstrTypes::visitLoadInst(LoadInst& I)
         g_InstrTypes.num1DAccesses++;
         break;
     case IGC::BINDLESS:
+    case IGC::BINDLESS_READONLY:
     case IGC::SSH_BINDLESS:
         g_InstrTypes.hasStorageBufferLoad = true;
         break;
@@ -574,10 +595,12 @@ void CheckInstrTypes::visitLoadInst(LoadInst& I)
         g_InstrTypes.numUntyped++;
         g_InstrTypes.hasSLM = true;
         g_InstrTypes.numSLMAccesses++;
+        g_InstrTypes.numSLMLoads++;
         break;
     case IGC::CONSTANT_BUFFER:
     case IGC::POINTER:
     case IGC::BINDLESS_CONSTANT_BUFFER:
+    case IGC::BINDLESS_WRITEONLY:
     case IGC::BINDLESS_TEXTURE:
     case IGC::SAMPLER:
     case IGC::BINDLESS_SAMPLER:
@@ -632,6 +655,7 @@ void CheckInstrTypes::visitStoreInst(StoreInst& I)
         g_InstrTypes.num1DAccesses++;
         break;
     case IGC::BINDLESS:
+    case IGC::BINDLESS_WRITEONLY:
     case IGC::SSH_BINDLESS:
         g_InstrTypes.hasStorageBufferStore = true;
         break;
@@ -646,10 +670,12 @@ void CheckInstrTypes::visitStoreInst(StoreInst& I)
         g_InstrTypes.numUntyped++;
         g_InstrTypes.hasSLM = true;
         g_InstrTypes.numSLMAccesses++;
+        g_InstrTypes.numSLMStores++;
         break;
     case IGC::CONSTANT_BUFFER:
     case IGC::POINTER:
     case IGC::BINDLESS_CONSTANT_BUFFER:
+    case IGC::BINDLESS_READONLY:
     case IGC::BINDLESS_TEXTURE:
     case IGC::SAMPLER:
     case IGC::BINDLESS_SAMPLER:

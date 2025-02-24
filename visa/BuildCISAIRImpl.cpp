@@ -168,6 +168,8 @@ static const WA_TABLE *CreateVisaWaTable(TARGET_PLATFORM platform,
 
   if (platform >= Xe_PVC)
     VISA_WA_ENABLE(pWaTable, Wa_13010473643);
+  if (platform >= Xe3)
+    VISA_WA_DISABLE(pWaTable, Wa_13010473643);
 
   switch (platform) {
   case GENX_ICLLP:
@@ -199,6 +201,15 @@ static const WA_TABLE *CreateVisaWaTable(TARGET_PLATFORM platform,
     break;
   case Xe_MTL:
     VISA_WA_ENABLE(pWaTable, Wa_14016880151);
+    break;
+  case Xe2:
+    VISA_WA_ENABLE(pWaTable, Wa_14020375314);
+    VISA_WA_ENABLE(pWaTable, Wa_18027439769);
+    VISA_WA_ENABLE(pWaTable, Wa_22017182272);
+    VISA_WA_ENABLE(pWaTable, Wa_14021891663);
+    break;
+  case Xe3:
+    VISA_WA_ENABLE(pWaTable, Wa_22017182272);
     break;
   default:
     break;
@@ -683,6 +694,8 @@ void CISA_IR_Builder::LinkTimeOptimization(
     redirectMap.insert(std::make_pair(callee->getBuiltinA0(), caller->getBuiltinA0()));
     redirectMap.insert(std::make_pair(callee->getBuiltinA0Dot2(), caller->getBuiltinA0Dot2()));
     redirectMap.insert(std::make_pair(callee->getBuiltinHWTID(), caller->getBuiltinHWTID()));
+    redirectMap.insert(std::make_pair(callee->getBuiltinSR0Dot1(), caller->getBuiltinSR0Dot1()));
+    redirectMap.insert(std::make_pair(callee->getBuiltinS0(), caller->getBuiltinS0()));
     redirectMap.insert(std::make_pair(callee->getBuiltinT252(), caller->getBuiltinT252()));
     redirectMap.insert(std::make_pair(callee->getBuiltinBindlessSampler(), caller->getBuiltinBindlessSampler()));
     redirectMap.insert(std::make_pair(callee->getBuiltinSamplerHeader(), caller->getBuiltinSamplerHeader()));
@@ -1559,6 +1572,7 @@ extern int CISAparse(CISA_IR_Builder *builder);
 extern YY_BUFFER_STATE CISA_scan_string(const char *yy_str);
 extern void CISA_delete_buffer(YY_BUFFER_STATE buf);
 static std::mutex mtx;
+extern void resetGlobalVariables();
 
 int CISA_IR_Builder::ParseVISAText(const std::string &visaText,
                                    const std::string &visaTextFile) {
@@ -1581,6 +1595,7 @@ int CISA_IR_Builder::ParseVISAText(const std::string &visaText,
     }
   }
 
+  resetGlobalVariables();
   YY_BUFFER_STATE visaBuf = CISA_scan_string(visaText.c_str());
   if (CISAparse(this) != 0) {
 #ifndef DLL_MODE
@@ -1622,6 +1637,7 @@ int CISA_IR_Builder::ParseVISAText(const std::string &visaFile) {
     return VISA_FAILURE;
   }
 
+  resetGlobalVariables();
   if (CISAparse(this) != 0) {
     vISA_ASSERT(false, "Parsing visa text failed");
     return VISA_FAILURE;
@@ -4011,6 +4027,30 @@ CISA_IR_Builder::get_input_class(Common_ISA_Var_Class var_class) {
   return INPUT_UNKNOWN;
 }
 void CISA_IR_Builder::CISA_post_file_parse() { return; }
+
+void CISA_IR_Builder::CISA_parse_build_options(const char* argStr) {
+  std::string args(argStr);
+  size_t first_quote = args.find_first_of('"');
+  size_t last_quote = args.find_last_of('"');
+
+  if (first_quote != std::string::npos &&
+      last_quote != std::string::npos &&
+      first_quote < last_quote) {
+    args = args.substr(first_quote + 1, last_quote - first_quote - 1);
+    std::vector<std::string> argvStrings;
+    std::vector<const char*> argv;
+    std::string token;
+    std::istringstream ss(args);
+    while (ss >> token) {
+      argvStrings.push_back(token);
+    }
+    argv.reserve(argvStrings.size());
+    for (const std::string& s : argvStrings) {
+        argv.push_back(s.c_str());
+    }
+    getOptions()->parseOptions(argv.size(), argv.data());
+  }
+}
 
 // place it here so that internal Gen_IR files don't have to include
 // VISAKernel.h

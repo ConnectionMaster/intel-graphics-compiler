@@ -7,7 +7,7 @@
 ;============================ end_copyright_notice =============================
 ;
 ; REQUIRES: regkeys
-; RUN: igc_opt --regkey EnablePrivMemNewSOATranspose=0 --igc-private-mem-resolution --platformpvc -S %s 2>&1 | FileCheck %s
+; RUN: igc_opt --typed-pointers --regkey EnablePrivMemNewSOATranspose=0 --igc-private-mem-resolution --platformpvc -S %s 2>&1 | FileCheck %s
 
 define spir_kernel void @testallocasmall(i8* %privateBase) {
 entry:
@@ -23,8 +23,9 @@ entry:
 ;;
 ;; End of entryBuilder
 ;;
-; CHECK:  [[BufferOffset:%[.A-z0-9]*]] = mul i32 [[simdSize]], 0
-; CHECK:  [[perLaneOffset:%[A-z0-9]*]] = mul i32 [[simdLaneId]], 400
+; CHECK:  [[SectionOffset:%[.A-z0-9]*]] = mul i32 [[simdSize]], 0
+; CHECK:  [[BufferOffset:%[.A-z0-9]*]] = add i32 0, [[SectionOffset]]
+; CHECK:  [[perLaneOffset:%[.A-z0-9]*]] = mul i32 [[simdLaneId]], 400
 ; CHECK:  [[SIMDBufferOffset:%[.A-z0-9]*]] = add i32 [[BufferOffset]], [[perLaneOffset]]
 ; CHECK:  [[TotalOffset:%[.A-z0-9]*]] = add {{.*}} i32 [[perThreadOffset]], [[SIMDBufferOffset]]
 ; CHECK:  [[TotalOffsetExt:%[.A-z0-9]*]] = zext i32 [[TotalOffset]] to i64

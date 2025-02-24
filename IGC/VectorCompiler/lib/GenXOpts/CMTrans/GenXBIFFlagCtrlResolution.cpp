@@ -20,6 +20,7 @@ SPDX-License-Identifier: MIT
 #include <map>
 
 using namespace llvm;
+#define DEBUG_TYPE "GenXBIFFlagCtrlResolution"
 
 #define BIF_FLAG_CONTROL(BIF_FLAG_TYPE, BIF_FLAG_NAME)                            \
   BIF_FLAG_CTRL_N_S(BIF_FLAG_NAME),
@@ -62,6 +63,8 @@ void GenXBIFFlagCtrlResolution::FillFlagCtrl() {
 
   // Need to feed this correctly
   BIF_FLAG_CTRL_SET(PlatformType, 0 /*platform.GetProductFamily()*/);
+  BIF_FLAG_CTRL_SET(RenderFamily, 0 /*platform.eRenderCoreFamily*/);
+
   BIF_FLAG_CTRL_SET(FlushDenormals, true);
   BIF_FLAG_CTRL_SET(DashGSpecified, false);
   BIF_FLAG_CTRL_SET(FastRelaxedMath, false);
@@ -74,6 +77,7 @@ void GenXBIFFlagCtrlResolution::FillFlagCtrl() {
   BIF_FLAG_CTRL_SET(ProfilingTimerResolution, 0.0f);
   BIF_FLAG_CTRL_SET(UseMathWithLUT, false);
   BIF_FLAG_CTRL_SET(UseHighAccuracyMath, false);
+  BIF_FLAG_CTRL_SET(UseAssumeInGetGlobalId, true);
   // FIXME: target specific, but subtarget cannot be reached in middle-end.
   BIF_FLAG_CTRL_SET(HasInt64SLMAtomicCAS, false);
   BIF_FLAG_CTRL_SET(JointMatrixLoadStoreOpt, 3);
@@ -88,6 +92,7 @@ void GenXBIFFlagCtrlResolution::FillFlagCtrl() {
   BIF_FLAG_CTRL_SET(ForceL1Prefetch, false);
   BIF_FLAG_CTRL_SET(UseNativeFP64GlobalAtomicAdd, false);
   BIF_FLAG_CTRL_SET(MaxHWThreadIDPerSubDevice, 1);
+  BIF_FLAG_CTRL_SET(UseOOBChecks, false);
 }
 
 #undef BIF_FLAG_CTRL_SET
@@ -145,7 +150,6 @@ bool GenXBIFFlagCtrlResolution::replace(T Value, GlobalVariable *GV) {
 
 char GenXBIFFlagCtrlResolution::ID = 0;
 
-
 INITIALIZE_PASS_BEGIN(GenXBIFFlagCtrlResolution, "GenXBIFFlagCtrlResolution",
                       "GenXBIFFlagCtrlResolution", false, false)
 
@@ -158,3 +162,15 @@ ModulePass *createGenXBIFFlagCtrlResolutionPass() {
   return new GenXBIFFlagCtrlResolution;
 }
 } // namespace llvm
+
+#if LLVM_VERSION_MAJOR >= 16
+PreservedAnalyses
+GenXBIFFlagCtrlResolutionPass::run(llvm::Module &M,
+                                   llvm::AnalysisManager<llvm::Module> &) {
+  GenXBIFFlagCtrlResolution GenXBiF;
+  if (GenXBiF.runOnModule(M))
+    return PreservedAnalyses::none();
+  return PreservedAnalyses::all();
+}
+// TODO: No lit-tests
+#endif

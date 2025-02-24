@@ -1,6 +1,6 @@
 ;=========================== begin_copyright_notice ============================
 ;
-; Copyright (C) 2023 Intel Corporation
+; Copyright (C) 2023-2025 Intel Corporation
 ;
 ; SPDX-License-Identifier: MIT
 ;
@@ -9,9 +9,10 @@
 ; COM: This test checks hwtid for some platforms.
 ; COM: Currently there are these ways to generate HWTID:
 ; COM:  - Predefined variable (CHECK-PREDEF): all before XeHP
-; COM:  - XeHP-like concatination (CHECK-XeHP): XeHP+ excluding XeHPC
-; COM:  - XeHPC-like concatination (CHECK-XeHPC): XeHPC
-; COM:  - Xe2-like concatination (CHECK-Xe2): Xe2
+; COM:  - XeHP-like concatenation (CHECK-XeHP): XeHP+ excluding XeHPC
+; COM:  - XeHPC-like concatenation (CHECK-XeHPC): XeHPC
+; COM:  - Xe2-like concatenation (CHECK-Xe2): Xe2
+; COM:  - Xe3-like concatenation (CHECK-Xe3): Xe3
 
 ; RUN: %opt %use_old_pass_manager% -GenXLowering -march=genx64 -mcpu=Gen9 -mtriple=spir64-unknown-unknown -S < %s | \
 ; RUN: FileCheck %s --check-prefix=CHECK-PREDEF
@@ -36,6 +37,9 @@
 
 ; RUN: %opt %use_old_pass_manager% -GenXLowering -march=genx64 -mcpu=Xe2 -mtriple=spir64-unknown-unknown -S < %s | \
 ; RUN: FileCheck %s --check-prefix=CHECK-Xe2
+
+; RUN: %opt %use_old_pass_manager% -GenXLowering -march=genx64 -mcpu=Xe3 -mtriple=spir64-unknown-unknown -S < %s | \
+; RUN: FileCheck %s --check-prefix=CHECK-Xe3
 
 
 ; CHECK-PREDEF: [[RES:%[^ ]+]] = call i32 @llvm.genx.read.predef.reg.i32.i32(i32 12, i32 undef)
@@ -76,6 +80,17 @@
 ; CHECK-Xe2: [[RES:%[^ ]+]] = or i32 [[EUTID]], [[SSIDSHIFT]]
 ; CHECK-Xe2: ret i32 [[RES]]
 
+; CHECK-Xe3: [[SR0:%[^ ]+]] = call i32 @llvm.genx.read.predef.reg.i32.i32(i32 13, i32 undef)
+; CHECK-Xe3: [[TID:%[^ ]+]] = and i32 [[SR0]], 15
+; CHECK-Xe3: [[EUID:%[^ ]+]] = and i32 [[SR0]], 112
+; CHECK-Xe3: [[EUSHIFT:%[^ ]+]] = lshr i32 [[EUID]], 4
+; CHECK-Xe3: [[MSG0:%[^ ]+]] = call i32 @llvm.genx.read.predef.reg.i32.i32(i32 20, i32 undef)
+; CHECK-Xe3: [[SSID:%[^ ]+]] = and i32 [[MSG0]], 255
+; CHECK-Xe3: [[SSIDSHIFT:%[^ ]+]] = shl i32 [[SSID]], 3
+; CHECK-Xe3: [[SSEUID:%[^ ]+]] = or i32 [[EUSHIFT]], [[SSIDSHIFT]]
+; CHECK-Xe3: [[MUL:%[^ ]+]] = mul i32 [[SSEUID]], 10
+; CHECK-Xe3: [[RES:%[^ ]+]] = add i32 [[MUL]], [[TID]]
+; CHECK-Xe3: ret i32 [[RES]]
 target datalayout = "e-p:64:64-i64:64-n8:16:32"
 target triple = "genx64-unknown-unknown"
 

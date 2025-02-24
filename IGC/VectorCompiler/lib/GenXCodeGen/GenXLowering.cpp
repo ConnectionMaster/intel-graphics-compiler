@@ -122,6 +122,7 @@ SPDX-License-Identifier: MIT
 
 #include "vc/Support/GenXDiagnostic.h"
 #include "vc/Utils/GenX/GlobalVariable.h"
+#include "vc/Utils/GenX/InternalMetadata.h"
 
 #include "Probe/Assertion.h"
 #include <algorithm>
@@ -2166,6 +2167,10 @@ bool GenXLowering::processInst(Instruction *Inst) {
       return lowerHardwareThreadID(CI);
     case vc::InternalIntrinsic::logical_thread_id:
       return lowerLogicalThreadID(CI);
+    case vc::InternalIntrinsic::optimization_fence:
+      CI->replaceAllUsesWith(CI->getOperand(0));
+      ToErase.push_back(CI);
+      return true;
     case GenXIntrinsic::genx_nbarrier_arrive:
       return lowerNamedBarrierArrive(CI);
     case GenXIntrinsic::genx_dpas:
@@ -4486,11 +4491,20 @@ bool GenXLowering::lowerFMulAdd(CallInst *CI) {
 bool GenXLowering::lowerPowI(CallInst *CI) {
   IGC_ASSERT(CI);
   IRBuilder<> IRB{CI};
-  auto *Decl = Intrinsic::getDeclaration(CI->getModule(), Intrinsic::pow,
-                                         {CI->getType()});
-  auto *Cast =
-      IRB.CreateCast(Instruction::SIToFP, CI->getOperand(1), CI->getType());
-  auto *Pow = IRB.CreateCall(Decl, {CI->getOperand(0), Cast}, CI->getName());
+  auto *CITy = CI->getType();
+  auto *Decl =
+      Intrinsic::getDeclaration(CI->getModule(), Intrinsic::pow, {CITy});
+  auto *Operand = CI->getOperand(1);
+  // For pow @llvm.powi.v*.i*(< x > , i32 ) cases
+  if (auto *CIVTy = dyn_cast<IGCLLVM::FixedVectorType>(CITy);
+      CIVTy && !Operand->getType()->isVectorTy()) {
+    auto *ElTy = CIVTy->getElementType();
+    Operand = IRB.CreateSIToFP(Operand, ElTy);
+    Operand = IRB.CreateVectorSplat(CIVTy->getNumElements(), Operand);
+  } else {
+    Operand = IRB.CreateCast(Instruction::SIToFP, Operand, CITy);
+  }
+  auto *Pow = IRB.CreateCall(Decl, {CI->getOperand(0), Operand}, CI->getName());
   Pow->setHasApproxFunc(true);
   CI->replaceAllUsesWith(Pow);
   ToErase.push_back(CI);
@@ -4794,6 +4808,9 @@ bool GenXLowering::lowerHardwareThreadID(CallInst *CI) {
     Res = IRB.CreateAnd(Res, MaskC);
   }
 
+  CI->getModule()->getOrInsertNamedMetadata(
+      vc::FunctionMD::VCDisableMidThreadPreemption);
+
   CI->replaceAllUsesWith(Res);
   ToErase.push_back(CI);
   return true;
@@ -5009,6 +5026,8 @@ bool GenXLowering::lowerReduction(CallInst *CI, Value *Src, Value *Start,
     IGC_ASSERT_EXIT(TailIndex);
     TailWidth = SrcWidth % TailIndex;
     SrcWidth = TailIndex;
+  } else {
+    TailWidth = 0;
   }
 
   for (SrcWidth /= 2; SrcWidth > 0; SrcWidth /= 2) {

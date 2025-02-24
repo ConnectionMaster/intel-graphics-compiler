@@ -74,6 +74,7 @@ SPDX-License-Identifier: MIT
 #include "Compiler/CISACodeGen/FPRoundingModeCoalescing.hpp"
 
 #include "Compiler/CISACodeGen/SLMConstProp.hpp"
+#include "Compiler/Legalizer/AddRequiredMemoryFences.h"
 #include "Compiler/Optimizer/OpenCLPasses/GenericAddressResolution/GenericAddressDynamicResolution.hpp"
 #include "Compiler/Optimizer/OpenCLPasses/PrivateMemory/PrivateMemoryUsageAnalysis.hpp"
 #include "Compiler/Optimizer/OpenCLPasses/PrivateMemory/PrivateMemoryResolution.hpp"
@@ -101,6 +102,8 @@ SPDX-License-Identifier: MIT
 #include "Compiler/Optimizer/SynchronizationObjectCoalescing.hpp"
 #include "Compiler/Optimizer/BarrierControlFlowOptimization.hpp"
 #include "Compiler/Optimizer/RuntimeValueVectorExtractPass.h"
+#include "Compiler/Optimizer/WaveShuffleIndexSinking.hpp"
+#include "Compiler/Optimizer/WaveAllJointReduction.hpp"
 #include "Compiler/MetaDataApi/PurgeMetaDataUtils.hpp"
 #include "Compiler/HandleLoadStoreInstructions.hpp"
 #include "Compiler/CustomSafeOptPass.hpp"
@@ -310,6 +313,10 @@ void AddAnalysisPasses(CodeGenContext& ctx, IGCPassManager& mpm)
             }
         }
         mpm.add(createPromoteMemoryToRegisterPass());
+        if (IGC_IS_FLAG_DISABLED(DisableMergeAllocasPrivateMemory) && ctx.type == ShaderType::OPENCL_SHADER)
+        {
+            mpm.add(createMergeAllocas());
+        }
         if (ctx.type == ShaderType::OPENCL_SHADER &&
             !isOptDisabled &&
             IGC_IS_FLAG_ENABLED(EnableExplicitCopyForByVal))
@@ -366,6 +373,8 @@ void AddAnalysisPasses(CodeGenContext& ctx, IGCPassManager& mpm)
     //
 
     mpm.add(new DpasScan());
+
+    mpm.add(new MatchCommonKernelPatterns());
 
     // let CleanPHINode be right before Layout
     mpm.add(createCleanPHINodePass());
@@ -507,11 +516,7 @@ void AddLegalizationPasses(CodeGenContext& ctx, IGCPassManager& mpm, PSSignature
         if (IGC_IS_FLAG_ENABLED(allowLICM) && ctx.m_retryManager.AllowLICM())
         {
             mpm.add(createSpecialCasesDisableLICM());
-#if LLVM_VERSION_MAJOR >= 14
             mpm.add(llvm::createLICMPass(100, 500, true));
-#else
-            mpm.add(llvm::createLICMPass());
-#endif
         }
         mpm.add(llvm::createLoopSimplifyPass());
     }
@@ -533,7 +538,7 @@ void AddLegalizationPasses(CodeGenContext& ctx, IGCPassManager& mpm, PSSignature
     theEmuKind |= (hasDPDivSqrtEmu ? EmuKind::EMU_DP_DIV_SQRT : 0);
     theEmuKind |= (ctx.m_hasDPConvEmu ? EmuKind::EMU_DP_CONV : 0);
     theEmuKind |= (ctx.m_DriverInfo.NeedI64BitDivRem() ? EmuKind::EMU_I64DIVREM : 0);
-    theEmuKind |= (ctx.m_DriverInfo.NeedFP64toFP16Conv() ? EmuKind::EMU_FP64_FP16_CONV : 0);
+    theEmuKind |= (ctx.m_DriverInfo.NeedFP64toFP16Conv() && IGC_IS_FLAG_DISABLED(ForceDisableDPToHFConvEmu) ? EmuKind::EMU_FP64_FP16_CONV : 0);
     theEmuKind |=
         ((IGC_IS_FLAG_ENABLED(ForceSPDivEmulation) ||
             (ctx.m_DriverInfo.NeedIEEESPDiv() && !ctx.platform.hasCorrectlyRoundedMacros()))
@@ -652,13 +657,6 @@ void AddLegalizationPasses(CodeGenContext& ctx, IGCPassManager& mpm, PSSignature
             mpm.add(createPromoteMemoryToRegisterPass());
     }
 
-    // There's no particular reason for this exact place, but it should be after LowerGEPForPrivMem
-    if (IGC_IS_FLAG_ENABLED(EnableSplitIndirectEEtoSel))
-    {
-        mpm.add(createSplitIndirectEEtoSelPass());
-    }
-
-
     if (ctx.type == ShaderType::OPENCL_SHADER ||
         ctx.type == ShaderType::COMPUTE_SHADER)
     {
@@ -712,6 +710,10 @@ void AddLegalizationPasses(CodeGenContext& ctx, IGCPassManager& mpm, PSSignature
     if (!(IGC_IS_FLAG_ENABLED(EnableUnmaskedFunctions) &&
           IGC_IS_FLAG_ENABLED(LateInlineUnmaskedFunc)))
     {
+        if (IGC_IS_FLAG_DISABLED(DisableMergeAllocasPrivateMemory) && ctx.type == ShaderType::OPENCL_SHADER)
+        {
+            mpm.add(createMergeAllocas());
+        }
         if (ctx.type == ShaderType::OPENCL_SHADER &&
             !isOptDisabled &&
             IGC_IS_FLAG_ENABLED(EnableExplicitCopyForByVal))
@@ -723,7 +725,6 @@ void AddLegalizationPasses(CodeGenContext& ctx, IGCPassManager& mpm, PSSignature
     }
     // Should help MemOpt pass to merge more loads
     mpm.add(createSinkCommonOffsetFromGEPPass());
-    mpm.add(new MatchCommonKernelPatterns());
 
     // Run MemOpt
     if (!isOptDisabled &&
@@ -779,6 +780,8 @@ void AddLegalizationPasses(CodeGenContext& ctx, IGCPassManager& mpm, PSSignature
 
         mpm.add(createIGCInstructionCombiningPass());
     }
+
+
 
     if (ctx.hasSyncRTCalls())
     {
@@ -900,11 +903,7 @@ void AddLegalizationPasses(CodeGenContext& ctx, IGCPassManager& mpm, PSSignature
         if (!fastCompile && !highAllocaPressure && !isPotentialHPCKernel && IGC_IS_FLAG_ENABLED(allowLICM) && ctx.m_retryManager.AllowLICM())
         {
             mpm.add(createSpecialCasesDisableLICM());
-#if LLVM_VERSION_MAJOR >= 14
             mpm.add(llvm::createLICMPass(100, 500, true));
-#else
-            mpm.add(llvm::createLICMPass());
-#endif
             mpm.add(llvm::createEarlyCSEPass());
         }
         mpm.add(createAggressiveDCEPass());
@@ -926,7 +925,10 @@ void AddLegalizationPasses(CodeGenContext& ctx, IGCPassManager& mpm, PSSignature
         (!ctx.platform.supportFP16() && IGC_IS_FLAG_ENABLED(EnableHalfPromotion)))
     {
         mpm.add(new HalfPromotion());
-        mpm.add(createGVNPass());
+        if (IGC_IS_FLAG_ENABLED(EnableGVN))
+        {
+            mpm.add(createGVNPass());
+        }
         mpm.add(createDeadCodeEliminationPass());
     }
 
@@ -1106,6 +1108,14 @@ void AddLegalizationPasses(CodeGenContext& ctx, IGCPassManager& mpm, PSSignature
     {
         // Legalize RuntimeValue calls for push analysis
         mpm.add(new RuntimeValueLegalizationPass());
+    }
+
+    if ((ctx.m_instrTypes.hasLocalLoadStore || ctx.m_instrTypes.hasLocalAtomics) &&
+        ctx.platform.hasLSC() &&
+        !ctx.platform.NeedsLSCFenceUGMBeforeEOT() && // VISA will add the fence
+        IGC_IS_FLAG_DISABLED(DisableAddRequiredMemoryFencesPass))
+    {
+        mpm.add(createAddRequiredMemoryFencesPass());
     }
 
     mpm.add(createInstSimplifyLegacyPass());
@@ -1423,6 +1433,10 @@ void OptimizeIR(CodeGenContext* const pContext)
         }
 
         mpm.add(createIGCInstructionCombiningPass());
+        if( IGC_IS_FLAG_ENABLED( EnableWaveShuffleIndexSinking ) )
+        {
+            mpm.add( createWaveShuffleIndexSinking() );
+        }
         mpm.add(new FCmpPaternMatch());
         mpm.add(llvm::createDeadCodeEliminationPass()); // this should be done both before/after constant propagation
 
@@ -1509,11 +1523,7 @@ void OptimizeIR(CodeGenContext* const pContext)
                     mpm.add(createSpecialCasesDisableLICM());
                     int licmTh = IGC_GET_FLAG_VALUE(LICMStatThreshold);
                     mpm.add(new InstrStatistic(pContext, LICM_STAT, InstrStatStage::BEGIN, licmTh));
-#if LLVM_VERSION_MAJOR >= 14
                     mpm.add(llvm::createLICMPass(100, 500, true));
-#else
-                    mpm.add(llvm::createLICMPass());
-#endif
                     mpm.add(new InstrStatistic(pContext, LICM_STAT, InstrStatStage::END, licmTh));
                 }
 
@@ -1531,7 +1541,8 @@ void OptimizeIR(CodeGenContext* const pContext)
 
                 mpm.add(createIGCInstructionCombiningPass());
 
-                if (IGC_IS_FLAG_ENABLED(EnableIndVarSimplification))
+                if (IGC_IS_FLAG_ENABLED(EnableIndVarSimplification) &&
+                    pContext->type == ShaderType::OPENCL_SHADER)
                 {
                     mpm.add(llvm::createIndVarSimplifyPass());
                 }
@@ -1580,11 +1591,7 @@ void OptimizeIR(CodeGenContext* const pContext)
                 if (allowLICM)
                 {
                     mpm.add(createSpecialCasesDisableLICM());
-#if LLVM_VERSION_MAJOR >= 14
                     mpm.add(llvm::createLICMPass(100, 500, true));
-#else
-                    mpm.add(llvm::createLICMPass());
-#endif
                 }
 
                 // Second unrolling with the same threshold.
@@ -1841,7 +1848,13 @@ void OptimizeIR(CodeGenContext* const pContext)
             mpm.add(createSROAPass());
         }
 
-        mpm.add(new TrivialLocalMemoryOpsElimination());
+        if (pContext->type == ShaderType::COMPUTE_SHADER &&
+            (IGC_IS_FLAG_ENABLED(RemoveUnusedTGMFence) ||
+                pContext->getModuleMetaData()->enableRemoveUnusedTGMFence))
+        {
+            mpm.add(new TrivialUnnecessaryTGMFenceElimination());
+        }
+
         mpm.add(createGenSimplificationPass());
 
         if (pContext->m_instrTypes.hasLoadStore)
@@ -1852,6 +1865,11 @@ void OptimizeIR(CodeGenContext* const pContext)
         }
 
         mpm.add(llvm::createDeadCodeEliminationPass());
+
+        if( IGC_IS_FLAG_ENABLED(EnableWaveAllJointReduction) )
+        {
+            mpm.add( createWaveAllJointReduction() );
+        }
 
         if (IGC_IS_FLAG_ENABLED(EnableIntDivRemCombine)) {
             // simplify rem if the quotient is availble
@@ -1908,6 +1926,9 @@ void OptimizeIR(CodeGenContext* const pContext)
         if (IGC_IS_FLAG_ENABLED(EnableVectorizer))
         {
             mpm.add(new IGCVectorizer());
+            mpm.add(llvm::createAggressiveDCEPass());
+            if (IGC_IS_FLAG_ENABLED(VectorizerCheckScalarizer))
+                mpm.add(createScalarizerPass(SelectiveScalarizer::Auto));
         }
 
         mpm.run(*pContext->getModule());

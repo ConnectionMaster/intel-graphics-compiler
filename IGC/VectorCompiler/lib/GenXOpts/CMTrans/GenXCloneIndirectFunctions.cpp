@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2022-2023 Intel Corporation
+Copyright (C) 2022-2024 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -65,6 +65,7 @@ SPDX-License-Identifier: MIT
 #include <llvm/Transforms/Utils/Cloning.h>
 
 using namespace llvm;
+#define DEBUG_TYPE "GenXCloneIndirectFunctions"
 
 static cl::opt<bool> EnableCloneIndirectFunctions(
     "vc-enable-clone-indirect-functions",
@@ -77,10 +78,17 @@ class GenXCloneIndirectFunctions
     : public ModulePass,
       public InstVisitor<GenXCloneIndirectFunctions> {
   std::vector<std::pair<Function *, bool>> IndirectFuncs;
-
+#if LLVM_VERSION_MAJOR >= 16
+  GenXBackendConfigPass::Result &BECfg;
+#endif
 public:
   static char ID;
+#if LLVM_VERSION_MAJOR >= 16
+  GenXCloneIndirectFunctions(GenXBackendConfigPass::Result &BC)
+      : BECfg(BC), ModulePass(ID) {
+#else  // LLVM_VERSION_MAJOR >= 16
   GenXCloneIndirectFunctions() : ModulePass(ID) {
+#endif // LLVM_VERSION_MAJOR >= 16
     initializeGenXCloneIndirectFunctionsPass(*PassRegistry::getPassRegistry());
   }
 
@@ -144,7 +152,9 @@ bool GenXCloneIndirectFunctions::runOnModule(Module &M) {
   if (!EnableCloneIndirectFunctions)
     return false;
 
+#if LLVM_VERSION_MAJOR < 16
   auto &&BECfg = getAnalysis<GenXBackendConfig>();
+#endif
   IGC_ASSERT_MESSAGE(
       llvm::none_of(M.functions(),
                     [&](const Function &F) {
@@ -207,6 +217,20 @@ INITIALIZE_PASS_DEPENDENCY(GenXBackendConfig)
 INITIALIZE_PASS_END(GenXCloneIndirectFunctions, "GenXCloneIndirectFunctions",
                     "GenXCloneIndirectFunctions", false, false)
 
-ModulePass *llvm::createGenXCloneIndirectFunctionsPass() {
+#if LLVM_VERSION_MAJOR < 16
+namespace llvm {
+ModulePass *createGenXCloneIndirectFunctionsPass() {
   return new GenXCloneIndirectFunctions();
 }
+} // namespace llvm
+#else
+PreservedAnalyses
+GenXCloneIndirectFunctionsPass::run(llvm::Module &M,
+                                    llvm::AnalysisManager<llvm::Module> &AM) {
+  auto &Res = AM.getResult<GenXBackendConfigPass>(M);
+  GenXCloneIndirectFunctions GenXClone(Res);
+  if (GenXClone.runOnModule(M))
+    return PreservedAnalyses::none();
+  return PreservedAnalyses::all();
+}
+#endif

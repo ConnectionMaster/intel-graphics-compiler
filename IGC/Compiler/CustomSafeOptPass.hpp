@@ -69,13 +69,14 @@ namespace IGC
         void visitLdRawVec(llvm::CallInst* inst);
         void visitLoadInst(llvm::LoadInst& I);
         void dp4WithIdentityMatrix(llvm::ExtractElementInst& I);
-        bool isIdentityMatrix(llvm::ExtractElementInst& I);
+        std::optional<bool> getSignIfIdentityMatrix(llvm::ExtractElementInst& I);
         void visitAnd(llvm::BinaryOperator& I);
         void visitXor(llvm::Instruction& XorInstr);
         void visitLSC2DBlockPrefetch(llvm::CallInst* I);
         void visitShuffleIndex(llvm::CallInst* I);
         void visitSelectInst(llvm::SelectInst& S);
         void mergeDotAddToDp4a(llvm::CallInst* I);
+        void visitTruncInst( llvm::TruncInst& I );
 
         //
         // IEEE Floating point arithmetic is not associative.  Any pattern
@@ -107,17 +108,16 @@ namespace IGC
         llvm::Value* analyzeTreeForTrunc64bto32b(const llvm::Use& OperandUse, llvm::SmallVector<llvm::BinaryOperator*, 8>& OpsToDelete);
     };
 
-    class TrivialLocalMemoryOpsElimination : public llvm::FunctionPass, public llvm::InstVisitor<TrivialLocalMemoryOpsElimination>
+    class TrivialUnnecessaryTGMFenceElimination : public llvm::FunctionPass, public llvm::InstVisitor<TrivialUnnecessaryTGMFenceElimination>
     {
     public:
         static char ID;
 
-        TrivialLocalMemoryOpsElimination();
+        TrivialUnnecessaryTGMFenceElimination();
 
         virtual void getAnalysisUsage(llvm::AnalysisUsage& AU) const override
         {
             AU.addRequired<CodeGenContextWrapper>();
-            AU.addRequired<MetaDataUtilsWrapper>();
             AU.setPreservesCFG();
         }
 
@@ -125,25 +125,9 @@ namespace IGC
 
         virtual llvm::StringRef getPassName() const override
         {
-            return "TrivialLocalMemoryOpsElimination";
+            return "TrivialUnnecessaryTGMFenceElimination";
         }
-
-        void visitLoadInst(llvm::LoadInst& I);
-        void visitStoreInst(llvm::StoreInst& I);
-        void visitCallInst(llvm::CallInst& I);
-        bool isLocalBarrier(llvm::CallInst& I);
-        void findNextThreadGroupBarrierInst(llvm::Instruction& I);
-        void anyCallInstUseLocalMemory(llvm::CallInst& I);
-
-    private:
-        llvm::SmallVector<llvm::LoadInst*, 16> m_LocalLoadsToRemove;
-        llvm::SmallVector<llvm::StoreInst*, 16> m_LocalStoresToRemove;
-        llvm::SmallVector<llvm::CallInst*, 16> m_LocalFencesBariersToRemove;
-
-        bool abortPass = false;
-        const std::vector<bool> m_argumentsOfLocalMemoryBarrier{ true, false, false, false, false, false, true };
     };
-
     class GenSpecificPattern : public llvm::FunctionPass, public llvm::InstVisitor<GenSpecificPattern>
     {
     public:

@@ -119,19 +119,7 @@ inline SIMDMode lanesToSIMDMode(unsigned lanes) {
 
 enum class ShaderType
 {
-    UNKNOWN,
-    VERTEX_SHADER,
-    HULL_SHADER,
-    DOMAIN_SHADER,
-    GEOMETRY_SHADER,
-    TASK_SHADER,
-    MESH_SHADER,
-    PIXEL_SHADER,
-    COMPUTE_SHADER,
-    OPENCL_SHADER,
-    RAYTRACING_SHADER,
-    END,
-    BEGIN = 0
+#include "ShaderTypesIncl.h"
 };
 
 enum class ShaderDispatchMode
@@ -141,6 +129,7 @@ enum class ShaderDispatchMode
     DUAL_PATCH,
     EIGHT_PATCH,
     DUAL_SIMD8,
+    QUAD_SIMD8_DYNAMIC, // 3DTATE_PS_BODY::PolyPackingPolicy::POLY_PACK8_DYNAMIC
     END,
     BEGIN = 0
 };
@@ -334,8 +323,8 @@ inline typename std::enable_if<
     static_assert(std::is_integral<TDst>::value,
         "int_cast<>() should be used only for conversions between integer types.");
 
-    IGC_ASSERT(value.getFixedSize() <= std::numeric_limits<TDst>::max());
-    return static_cast<TDst>(value.getFixedSize());
+    IGC_ASSERT(value.getFixedValue() <= std::numeric_limits<TDst>::max());
+    return static_cast<TDst>(value.getFixedValue());
 }
 
 template <typename TDst>
@@ -346,8 +335,8 @@ inline typename std::enable_if<
     static_assert(std::is_integral<TDst>::value,
         "int_cast<>() should be used only for conversions between integer types.");
 
-    IGC_ASSERT(value.getFixedSize() <= static_cast<typename std::make_unsigned<TDst>::type>(std::numeric_limits<TDst>::max()));
-    return static_cast<TDst>(value.getFixedSize());
+    IGC_ASSERT(value.getFixedValue() <= static_cast<typename std::make_unsigned<TDst>::type>(std::numeric_limits<TDst>::max()));
+    return static_cast<TDst>(value.getFixedValue());
 }
 
 #endif //IGC_COMMON_TYPES_H

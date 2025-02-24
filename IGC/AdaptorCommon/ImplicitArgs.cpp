@@ -62,7 +62,7 @@ static const std::vector<ImplicitArg> IMPLICIT_ARGS = {
     ImplicitArg(ImplicitArg::SAMPLER_ADDRESS, "smpAddress", ImplicitArg::INT, WIAnalysis::UNIFORM_GLOBAL, 1, ImplicitArg::ALIGN_DWORD, true),
     ImplicitArg(ImplicitArg::SAMPLER_NORMALIZED, "smpNormalized", ImplicitArg::INT, WIAnalysis::UNIFORM_GLOBAL, 1, ImplicitArg::ALIGN_DWORD, true),
     ImplicitArg(ImplicitArg::SAMPLER_SNAP_WA, "smpSnapWA", ImplicitArg::INT, WIAnalysis::UNIFORM_GLOBAL, 1, ImplicitArg::ALIGN_DWORD, true),
-    ImplicitArg(ImplicitArg::INLINE_SAMPLER, "inlineSampler", ImplicitArg::INT, WIAnalysis::UNIFORM_GLOBAL, 1, ImplicitArg::ALIGN_DWORD, true),
+    ImplicitArg(ImplicitArg::INLINE_SAMPLER, "inlineSampler", ImplicitArg::LONG, WIAnalysis::UNIFORM_GLOBAL, 1, ImplicitArg::ALIGN_QWORD, true),
     ImplicitArg(ImplicitArg::FLAT_IMAGE_BASEOFFSET, "flatImageBaseoffset", ImplicitArg::LONG, WIAnalysis::UNIFORM_GLOBAL, 1, ImplicitArg::ALIGN_QWORD, true),
     ImplicitArg(ImplicitArg::FLAT_IMAGE_HEIGHT, "flatImageHeight", ImplicitArg::INT, WIAnalysis::UNIFORM_GLOBAL, 1, ImplicitArg::ALIGN_DWORD, true),
     ImplicitArg(ImplicitArg::FLAT_IMAGE_WIDTH, "flatImageWidth", ImplicitArg::INT, WIAnalysis::UNIFORM_GLOBAL, 1, ImplicitArg::ALIGN_DWORD, true),
@@ -104,6 +104,8 @@ static const std::vector<ImplicitArg> IMPLICIT_ARGS = {
 
     // BufferBoundsChecking
     ImplicitArg(ImplicitArg::BUFFER_SIZE, "bufferSize", ImplicitArg::LONG, WIAnalysis::UNIFORM_GLOBAL, 1, ImplicitArg::ALIGN_QWORD, true),
+
+    ImplicitArg(ImplicitArg::PAYLOAD_HEADER_SHORT, "payloadHeader", ImplicitArg::INT, WIAnalysis::UNIFORM_WORKGROUP, 3, ImplicitArg::ALIGN_DWORD, true, GenISAIntrinsic::GenISA_getPayloadHeader),
 };
 
 ImplicitArg::ImplicitArg(

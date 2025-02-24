@@ -15,6 +15,7 @@ SPDX-License-Identifier: MIT
 #include "Compiler/CISACodeGen/helper.h"
 #include "Compiler/CISACodeGen/CISACodeGen.h"
 #include "Compiler/CISACodeGen/CISABuilder.hpp"
+#include "Compiler/CISACodeGen/GenericShaderState.hpp"
 #include "Compiler/CISACodeGen/LiveVars.hpp"
 #include "Compiler/CISACodeGen/WIAnalysis.hpp"
 #include "Compiler/CISACodeGen/CoalescingEngine.hpp"
@@ -94,8 +95,9 @@ public:
         uint16_t hasEM() const { return m_hasEM; }
     };
     bool IsRecompilationRequestForced();
-
-    CShader(llvm::Function*, CShaderProgram* pProgram);
+protected:
+    CShader(llvm::Function *, CShaderProgram *pProgram, GenericShaderState &GState);
+public:
     virtual ~CShader();
     CShader(const CShader&) = delete;
     CShader& operator=(const CShader&) = delete;
@@ -165,6 +167,8 @@ public:
     void        AddPatchPredSetup(CVariable* var);
     void        AddPatchConstantSetup(uint index, CVariable* var);
 
+    unsigned getSetupSize() const { return unsigned(setup.size()); }
+
     // TODO: simplify calls to GetNewVariable to these shorter and more
     // expressive cases where possible.
     //
@@ -210,6 +214,8 @@ public:
     CVariable* GetNewVector(llvm::Value* val, e_alignment preferredAlign = EALIGN_AUTO);
     CVariable* GetNewAlias(CVariable* var, VISA_Type type, uint16_t offset, uint16_t numElements);
     CVariable* GetNewAlias(CVariable* var, VISA_Type type, uint16_t offset, uint16_t numElements, bool uniform);
+    // Create a multi-instance alias of a single-instance variable.
+    CVariable* GetNewAlias(CVariable* var, uint16_t numInstances);
 
     // If BaseVar's type matches V's, return BaseVar; otherwise, create an new
     // alias CVariable to BaseVar. The newly-created alias CVariable's size
@@ -262,6 +268,7 @@ public:
     bool hasFP() const { return m_FP != nullptr; }
 
     void InitializeStackVariables();
+    void InitializeSPFPForVLA();
     void SaveStackState();
     void RestoreStackState();
 
@@ -280,8 +287,10 @@ public:
     CVariable* BitCast(CVariable* var, VISA_Type newType);
     void        CacheArgumentsList();
     virtual void MapPushedInputs();
-    void        CreateGatherMap();
-    void        CreateConstantBufferOutput(SKernelProgram* pKernelProgram);
+    void        CreateGatherMap() { m_State.CreateGatherMap(); }
+    void        CreateConstantBufferOutput(SKernelProgram* pKernelProgram) {
+        m_State.CreateConstantBufferOutput(pKernelProgram);
+    }
     CVariable*  CreateFunctionSymbol(llvm::Function* pFunc);
     CVariable*  CreateGlobalSymbol(llvm::GlobalVariable* pGlobal);
 
@@ -289,7 +298,6 @@ public:
 
     void        CreateImplicitArgs();
     void        CreateAliasVars();
-    uint        GetNumSBlocks() { return m_numBlocks; }
 
     void        SetUniformHelper(WIAnalysis* WI) { m_WI = WI; }
     void        SetDeSSAHelper(DeSSA* deSSA) { m_deSSA = deSSA; }
@@ -341,11 +349,6 @@ public:
     ShaderType  GetShaderType() const { return GetContext()->type; }
     bool        IsPatchablePS();
 
-    bool        GetHasBarrier() const { return m_BarrierNumber > 0; }
-    void        SetHasBarrier() { if (m_BarrierNumber == 0) m_BarrierNumber = 1; }
-    void        SetBarrierNumber(int BarrierNumber) { m_BarrierNumber = BarrierNumber; }
-    int         GetBarrierNumber() const { return m_BarrierNumber; }
-
     void        GetSimdOffsetBase(CVariable*& pVar, bool dup = false);
     /// Returns a simd8 register filled with values [24, 20, 16, 12, 8, 4, 0]
     /// that are used to index subregisters of a GRF when counting offsets in bytes.
@@ -389,20 +392,15 @@ public:
     const CDriverInfo* m_DriverInfo = nullptr;
 
     ModuleMetaData* m_ModuleMetadata = nullptr;
-
-    /// Dispatch size is the number of logical threads running in one hardware thread
-    SIMDMode m_dispatchSize;
     /// SIMD Size is the default size of instructions
-    ShaderDispatchMode m_ShaderDispatchMode;
+    ShaderDispatchMode m_ShaderDispatchMode{};
     /// the default emit size for this shader. This is the default size for variables as well
     /// as the default execution size for each instruction. encoder may override it explicitly
     /// via CEncoder::SetSIMDSize
-    SIMDMode m_SIMDSize;
+    SIMDMode m_SIMDSize{};
     uint8_t m_numberInstance = 0;
     PushInfo pushInfo;
-    EmitPass* m_EmitPass;
-    bool isInputsPulled; //true if any input is pulled, false otherwise
-    bool isMessageTargetDataCacheDataPort;
+    EmitPass* m_EmitPass = nullptr;
     uint m_sendStallCycle = 0;
     uint m_staticCycle = 0;
     uint m_loopNestedStallCycle = 0;
@@ -421,6 +419,7 @@ public:
     CVariable* m_ScratchSurfaceAddress = nullptr;
 
     ShaderStats* m_shaderStats = nullptr;
+    GenericShaderState &m_State;
 
     // Number of binding table entries per cache line.
     static constexpr DWORD cBTEntriesPerCacheLine = 32;
@@ -465,20 +464,14 @@ public:
     /// Evaluate constant expression and return the result immediate value.
     uint64_t GetConstantExpr(llvm::ConstantExpr* C);
 
-
     uint32_t GetMaxUsedBindingTableEntryCount(void) const
     {
-        if (m_BindingTableUsedEntriesBitmap != 0)
-        {
-            // m_BindingTableEntryCount is index; '+ 1' due to calculate total used count.
-            return (m_BindingTableEntryCount + 1);
-        }
-        return 0;
+        return m_State.GetMaxUsedBindingTableEntryCount();
     }
 
     uint32_t GetBindingTableEntryBitmap(void) const
     {
-        return m_BindingTableUsedEntriesBitmap;
+        return m_State.GetBindingTableEntryBitmap();
     }
 
     void SetBindingTableEntryCountAndBitmap(bool directIdx, BufferType bufType, uint32_t typeBti, uint32_t bti)
@@ -487,63 +480,60 @@ public:
         {
             if (directIdx)
             {
-                m_BindingTableEntryCount = (bti <= m_pBtiLayout->GetBindingTableEntryCount()) ? (std::max(bti, m_BindingTableEntryCount)) : m_BindingTableEntryCount;
-                m_BindingTableUsedEntriesBitmap |= BIT(bti / cBTEntriesPerCacheLine);
+                m_State.m_BindingTableEntryCount = (bti <= m_pBtiLayout->GetBindingTableEntryCount()) ? (std::max(bti, m_State.m_BindingTableEntryCount)) : m_State.m_BindingTableEntryCount;
+                m_State.m_BindingTableUsedEntriesBitmap |= BIT(bti / cBTEntriesPerCacheLine);
 
                 if (bufType == RESOURCE)
                 {
-                    m_shaderResourceLoaded[typeBti / 32] |= BIT(typeBti % 32);
+                    m_State.m_shaderResourceLoaded[typeBti / 32] |= BIT(typeBti % 32);
                 }
                 else if (bufType == CONSTANT_BUFFER)
                 {
-                    m_constantBufferLoaded |= BIT(typeBti);
+                    m_State.m_constantBufferLoaded |= BIT(typeBti);
                 }
                 else if (bufType == UAV)
                 {
-                    m_uavLoaded |= QWBIT(typeBti);
+                    m_State.m_uavLoaded |= QWBIT(typeBti);
                 }
                 else if (bufType == RENDER_TARGET)
                 {
-                    m_renderTargetLoaded |= BIT(typeBti);
+                    m_State.m_renderTargetLoaded |= BIT(typeBti);
                 }
             }
             else
             {
                 // Indirect addressing, set the maximum BTI.
-                m_BindingTableEntryCount = m_pBtiLayout->GetBindingTableEntryCount();
-                m_BindingTableUsedEntriesBitmap |= BITMASK_RANGE(0, (m_BindingTableEntryCount / cBTEntriesPerCacheLine));
+                m_State.m_BindingTableEntryCount = m_pBtiLayout->GetBindingTableEntryCount();
+                m_State.m_BindingTableUsedEntriesBitmap |= BITMASK_RANGE(0, (m_State.m_BindingTableEntryCount / cBTEntriesPerCacheLine));
 
                 if (bufType == RESOURCE || bufType == BINDLESS_TEXTURE)
                 {
                     unsigned int MaxArray = m_pBtiLayout->GetTextureIndexSize() / 32;
                     for (unsigned int i = 0; i < MaxArray; i++)
                     {
-                        m_shaderResourceLoaded[i] = 0xffffffff;
+                        m_State.m_shaderResourceLoaded[i] = 0xffffffff;
                     }
 
                     for (unsigned int i = MaxArray * 32; i < m_pBtiLayout->GetTextureIndexSize(); i++)
                     {
-                        m_shaderResourceLoaded[MaxArray] = BIT(i % 32);
+                        m_State.m_shaderResourceLoaded[MaxArray] = BIT(i % 32);
                     }
                 }
                 else if (bufType == CONSTANT_BUFFER || bufType == BINDLESS_CONSTANT_BUFFER)
                 {
-                    m_constantBufferLoaded |= BITMASK_RANGE(0, m_pBtiLayout->GetConstantBufferIndexSize());
+                    m_State.m_constantBufferLoaded |= BITMASK_RANGE(0, m_pBtiLayout->GetConstantBufferIndexSize());
                 }
                 else if (bufType == UAV || bufType == BINDLESS)
                 {
-                    m_uavLoaded |= QWBITMASK_RANGE(0, m_pBtiLayout->GetUavIndexSize());
+                    m_State.m_uavLoaded |= QWBITMASK_RANGE(0, m_pBtiLayout->GetUavIndexSize());
                 }
                 else if (bufType == RENDER_TARGET)
                 {
-                    m_renderTargetLoaded |= BITMASK_RANGE(0, m_pBtiLayout->GetRenderTargetIndexSize());
+                    m_State.m_renderTargetLoaded |= BITMASK_RANGE(0, m_pBtiLayout->GetRenderTargetIndexSize());
                 }
             }
         }
     }
-
-    /// Evaluate the Sampler Count field value.
-    unsigned int GetSamplerCount(unsigned int samplerCount);
 
     static unsigned GetIMEReturnPayloadSize(llvm::GenIntrinsicInst* I);
 
@@ -569,12 +559,7 @@ public:
     bool GetHasConstantStatelessAccess() const { return m_HasConstantStatelessMemoryAccess; }
     void SetHasGlobalAtomics() { m_HasGlobalAtomics = true; }
     bool GetHasGlobalAtomics() const { return m_HasGlobalAtomics; }
-    bool GetHasDPAS() const { return m_HasDPAS; }
-    void SetHasDPAS() { m_HasDPAS = true; }
-    bool GetHasEval() const { return m_HasEval; }
-    void SetHasEval() { m_HasEval = true; }
-    bool GetHasSample() const { return m_HasSample; }
-    void SetHasSample() { m_HasSample = true; }
+    bool GetHasEval() const { return m_State.GetHasEval(); }
     void IncStatelessWritesCount() { ++m_StatelessWritesCount; }
     void IncIndirectStatelessCount() { ++m_IndirectStatelessCount; }
     void IncNumSampleBallotLoops() { ++m_NumSampleBallotLoops; }
@@ -594,7 +579,7 @@ public:
     }
 
     // in DWORDs
-    uint32_t getMinPushConstantBufferAlignmentInBytes() const { return m_Platform->getMinPushConstantBufferAlignment() * sizeof(DWORD); }
+    uint32_t getMinPushConstantBufferAlignmentInBytes() const { return m_State.getMinPushConstantBufferAlignmentInBytes(); }
 
     // Note that for PVC A0 simd16, PVCLSCEnabled() returns true
     // but no LSC is generated!
@@ -641,18 +626,6 @@ public:
         SIMDMode Mode = SIMDMode::UNKNOWN);
     bool shouldGenerateLSC(llvm::Instruction* vectorLdStInst = nullptr, bool isTGM = false);
     bool forceCacheCtrl(llvm::Instruction* vectorLdStInst = nullptr);
-    // Shader has LSC store messages with cache controls specified in `ops`
-    void HasLscStoreCacheControls(const LSC_CACHE_OPTS& opts)
-    {
-        if (opts.l1 != LSC_CACHING_DEFAULT)
-        {
-            m_HasLscStoresWithNonDefaultL1CacheControls = true;
-        }
-    };
-    bool GetHasLscStoresWithNonDefaultL1CacheControls() const
-    {
-        return m_HasLscStoresWithNonDefaultL1CacheControls;
-    };
     uint32_t totalBytesToStoreOrLoad(llvm::Instruction* vectorLdStInst);
 
     void setShaderProgramID(int aID) { m_shaderProgramID = aID; }
@@ -676,20 +649,19 @@ private:
         e_alignment preferredAlign);
 
 protected:
-    CShaderProgram* m_parent;
-    CodeGenContext* m_ctx;
-    WIAnalysis* m_WI;
-    DeSSA* m_deSSA;
-    CoalescingEngine* m_coalescingEngine;
-    CodeGenPatternMatch* m_CG;
-    llvm::DominatorTree* m_DT;
-    const llvm::DataLayout* m_DL;
-    GenXFunctionGroupAnalysis* m_FGA;
-    VariableReuseAnalysis* m_VRA;
-    ResourceLoopAnalysis* m_RLA;
+    CShaderProgram* m_parent = nullptr;
+    CodeGenContext* m_ctx = nullptr;
+    WIAnalysis* m_WI = nullptr;
+    DeSSA* m_deSSA = nullptr;
+    CoalescingEngine* m_coalescingEngine = nullptr;
+    CodeGenPatternMatch* m_CG = nullptr;
+    llvm::DominatorTree* m_DT = nullptr;
+    const llvm::DataLayout* m_DL = nullptr;
+    GenXFunctionGroupAnalysis* m_FGA = nullptr;
+    VariableReuseAnalysis* m_VRA = nullptr;
+    ResourceLoopAnalysis* m_RLA = nullptr;
 
-    uint m_numBlocks;
-    IGC::IGCMD::MetaDataUtils* m_pMdUtils;
+    IGC::IGCMD::MetaDataUtils* m_pMdUtils = nullptr;
 
 #if defined(_DEBUG) || defined(_INTERNAL)
     llvm::SpecificBumpPtrAllocator<CVariable> Allocator;
@@ -725,52 +697,33 @@ protected:
     std::vector<CVariable*> patchConstantSetup;
     std::vector<CVariable*> perPrimitiveSetup;
 
-    uint m_maxBlockId;
+    uint m_maxBlockId = 0;
 
-    CVariable* m_R0;
-    CVariable* m_NULL;
-    CVariable* m_TSC;
-    CVariable* m_SR0;
-    CVariable* m_CR0;
-    CVariable* m_CE0;
-    CVariable* m_MSG0;
-    CVariable* m_DBG;
-    CVariable* m_HW_TID;
-    CVariable* m_SP;
-    CVariable* m_FP;
-    CVariable* m_SavedFP;
-    CVariable* m_ARGV;
+    CVariable* m_R0 = nullptr;
+    CVariable* m_NULL = nullptr;
+    CVariable* m_TSC = nullptr;
+    CVariable* m_SR0 = nullptr;
+    CVariable* m_CR0 = nullptr;
+    CVariable* m_CE0 = nullptr;
+    CVariable* m_MSG0 = nullptr;
+    CVariable* m_DBG = nullptr;
+    CVariable* m_HW_TID = nullptr;
+    CVariable* m_SP = nullptr;
+    CVariable* m_FP = nullptr;
+    CVariable* m_SavedFP = nullptr;
+    CVariable* m_ARGV = nullptr;
     std::array<CVariable*, NUM_ARG_SPACE_RESERVATION_SLOTS> m_ARGVReservedVariables{};
     uint32_t m_ARGVReservedVariablesTotalSize = 0;
-    CVariable* m_RETV;
-    CVariable* m_SavedSRetPtr;
-    CVariable* m_ImplArgBufPtr;
-    CVariable* m_LocalIdBufPtr;
-    CVariable* m_GlobalBufferArg;
-
-    std::vector<USC::SConstantGatherEntry> gatherMap;
-    uint     m_ConstantBufferLength;
-    uint     m_constantBufferMask;
-    uint     m_constantBufferLoaded;
-    uint64_t m_uavLoaded;
-    uint     m_shaderResourceLoaded[4];
-    uint     m_renderTargetLoaded;
-
-    int  m_cbSlot;
-    uint m_statelessCBPushedSize;
-    uint m_NOSBufferSize = 0;
+    CVariable* m_RETV = nullptr;
+    CVariable* m_SavedSRetPtr = nullptr;
+    CVariable* m_ImplArgBufPtr = nullptr;
+    CVariable* m_LocalIdBufPtr = nullptr;
+    CVariable* m_GlobalBufferArg = nullptr;
 
     /// holds max number of inputs that can be pushed for this shader unit
     static const uint32_t m_pMaxNumOfPushedInputs;
 
-    int m_BarrierNumber;
     SProgramOutput m_simdProgram;
-
-    // Holds max used binding table entry index.
-    uint32_t m_BindingTableEntryCount;
-
-    // Holds binding table entries bitmap.
-    uint32_t m_BindingTableUsedEntriesBitmap;
 
     // for each vector BCI whose uses are all extractElt with imm offset,
     // we store the CVariables for each index
@@ -779,14 +732,13 @@ protected:
     // Those two are for stateful token setup. It is a quick
     // special case checking. Once a generic approach is added,
     // this two fields shall be retired.
-    bool m_HasGlobalStatelessMemoryAccess;
-    bool m_HasConstantStatelessMemoryAccess;
+    //
+    // [OCL] preAnalysis()/ParseShaderSpecificOpcode() must
+    // set this to true if there is any stateless access.
+    bool m_HasGlobalStatelessMemoryAccess = false;
+    bool m_HasConstantStatelessMemoryAccess = false;
 
     bool m_HasGlobalAtomics = false;
-
-    bool m_HasDPAS = false;
-    bool m_HasEval = false;
-    bool m_passNOSInlinedata = false;
 
     uint32_t m_StatelessWritesCount = 0;
     uint32_t m_IndirectStatelessCount = 0;
@@ -794,10 +746,6 @@ protected:
     uint32_t m_NumSampleBallotLoops = 0;
 
     DebugInfoData diData;
-
-    // Shader has LSC store messages with non-default L1 cache control
-    bool m_HasLscStoresWithNonDefaultL1CacheControls = false;
-    bool m_HasSample = false;
 
     // Program function attributes
     bool m_HasStackCall = false;

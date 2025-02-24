@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2021-2023 Intel Corporation
+Copyright (C) 2021-2025 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -18,11 +18,16 @@ namespace vc {
 namespace FunctionMD {
 inline constexpr const char GenXKernelInternal[] = "genx.kernel.internal";
 inline constexpr const char VCBuiltinFunction[] = "VC.Builtin";
+inline constexpr const char VCDisableMidThreadPreemption[] =
+    "vc.disable.mid.thread.preemption";
 
 // amount of stack calculated for kernel
 // no attribute means that GenXStackUsage pass failed (recursion, etc)
 // attribute created by GenXStackUsage and used to create patch token
 inline constexpr const char VCStackAmount[] = "VC.Stack.Amount";
+
+inline constexpr const char VCSimdCFArg[] = "VC.SimdCFArg";
+inline constexpr const char VCSimdCFRet[] = "VC.SimdCFRet";
 } // namespace FunctionMD
 
 namespace InstMD {
@@ -48,7 +53,9 @@ enum {
                 // in the case of linearization
   LinearizationArgs,
   BTIndices,
-  Last
+  Last,                 // Last mandatory operand
+  IndirectCount = Last, // Indirect stateless access count
+  LastOptional,
 };
 }
 namespace ArgLinearizationMDOp {

@@ -84,9 +84,7 @@ SPDX-License-Identifier: MIT
 ///
 //===----------------------------------------------------------------------===//
 
-#define DEBUG_TYPE "cmkernelargoffset"
-
-#include <llvmWrapper/IR/Type.h>
+#include "llvmWrapper/IR/Type.h"
 #include "llvmWrapper/Support/Alignment.h"
 
 #include "vc/GenXOpts/GenXOpts.h"
@@ -101,11 +99,14 @@ SPDX-License-Identifier: MIT
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/PassManager.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 
 #include "Probe/Assertion.h"
+
+#define DEBUG_TYPE "CMKernelArgOffset"
 
 using namespace llvm;
 
@@ -175,15 +176,28 @@ private:
 
 char CMKernelArgOffset::ID = 0;
 
-INITIALIZE_PASS_BEGIN(CMKernelArgOffset, "cmkernelargoffset",
+INITIALIZE_PASS_BEGIN(CMKernelArgOffset, "CMKernelArgOffset",
                       "CM kernel arg offset determination", false, false)
-INITIALIZE_PASS_END(CMKernelArgOffset, "cmkernelargoffset",
+INITIALIZE_PASS_END(CMKernelArgOffset, "CMKernelArgOffset",
                     "CM kernel arg offset determination", false, false)
 
-Pass *llvm::createCMKernelArgOffsetPass(unsigned GrfByteSize,
-                                        bool UseBindlessImages) {
+namespace llvm {
+Pass *createCMKernelArgOffsetPass(unsigned GrfByteSize,
+                                  bool UseBindlessImages) {
   return new CMKernelArgOffset(GrfByteSize, UseBindlessImages);
 }
+} // namespace llvm
+
+#if LLVM_VERSION_MAJOR >= 16
+PreservedAnalyses
+CMKernelArgOffsetPass::run(llvm::Module &M,
+                           llvm::AnalysisManager<llvm::Module> &) {
+  CMKernelArgOffset CMKern(GrfByteSize, UseBindlessImages);
+  if (CMKern.runOnModule(M))
+    return PreservedAnalyses::none();
+  return PreservedAnalyses::all();
+}
+#endif
 
 // Check whether there is an input/output argument attribute.
 static bool canReorderArguments(const vc::KernelMetadata &KM) {
@@ -382,10 +396,10 @@ void CMKernelArgOffset::processKernelOnOCLRT(Function *F) {
       } else if (auto *VTy = dyn_cast<IGCLLVM::FixedVectorType>(Ty)) {
         auto *ETy = VTy->getElementType();
         Bytes = DL.getTypeSizeInBits(Ty) / 8;
-        Alignment = IGCLLVM::getAlignmentValue(DL.getABITypeAlignment(ETy));
+        Alignment = IGCLLVM::getAlignmentValue(DL.getABITypeAlign(ETy));
       } else {
         Bytes = DL.getTypeSizeInBits(Ty) / 8;
-        Alignment = IGCLLVM::getAlignmentValue(DL.getABITypeAlignment(Ty));
+        Alignment = IGCLLVM::getAlignmentValue(DL.getABITypeAlign(Ty));
       }
       placeArg(&Arg, Bytes, Alignment);
     }

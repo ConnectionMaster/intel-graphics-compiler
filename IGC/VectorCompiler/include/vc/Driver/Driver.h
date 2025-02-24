@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2020-2024 Intel Corporation
+Copyright (C) 2020-2025 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -8,6 +8,7 @@ SPDX-License-Identifier: MIT
 
 #pragma once
 
+#include "llvmWrapper/ADT/Optional.h"
 #include "vc/GenXCodeGen/GenXOCLRuntimeInfo.h"
 #include "vc/Support/BackendConfig.h"
 #include "vc/Support/ShaderDump.h"
@@ -92,8 +93,8 @@ struct CompileOptions {
   OptimizerLevel IROptLevel = OptimizerLevel::Full;
   OptimizerLevel CodegenOptLevel = OptimizerLevel::Full;
 
-  llvm::Optional<unsigned> StackMemSize;
-  llvm::Optional<unsigned> GRFSize;
+  IGCLLVM::optional<unsigned> StackMemSize;
+  IGCLLVM::optional<unsigned> GRFSize;
 
   bool EnableAutoLargeGRF = false;
 
@@ -164,6 +165,9 @@ struct CompileOptions {
 
   bool EnableOpaquePointers = false;
   bool CollectCostInfo = false;
+
+  unsigned DepressurizerGRFThreshold = 2560;
+  unsigned DepressurizerFlagGRFTolerance = 3840;
 };
 
 struct ExternalData {

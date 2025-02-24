@@ -831,6 +831,21 @@ void LSCFuncsResolution::verifyBlock2DAddressPayload() {
     }
 }
 
+static StringRef consume_number(StringRef name, const std::string& prefix, uint32_t* number) {
+    if (!number) {
+        IGC_ASSERT_MESSAGE(0, "Expected a valid pointer to number");
+        return name;
+    }
+
+    *number = 0;
+    size_t pos = 0;
+    if (name.consume_front(prefix) && name.size() > 0 && isdigit(name[0])) {
+        *number = std::stoi(name.str(), &pos);
+        return name.drop_front(pos);
+    }
+    return name;
+}
+
 Instruction* LSCFuncsResolution::CreateSubGroup2DBlockOperation(llvm::CallInst& CI, llvm::StringRef funcName, bool isRead)
 {
     IGC::IGCMD::MetaDataUtils* pMdUtils = getAnalysis<MetaDataUtilsWrapper>().getMetaDataUtils();
@@ -890,31 +905,8 @@ Instruction* LSCFuncsResolution::CreateSubGroup2DBlockOperation(llvm::CallInst& 
         // __builtin_IB_subgroup_block_read_flat_u16_m2k16v2
         // __builtin_IB_subgroup_block_read_flat_u16_m4k16v2
         // __builtin_IB_subgroup_block_read_flat_u16_m8k16v2
-        if (funcName.consume_front("_m32"))
-        {
-            tileHeight = 32;
-        }
-        else if (funcName.consume_front("_m16"))
-        {
-            tileHeight = 16;
-        }
-        else if (funcName.consume_front("_m8"))
-        {
-            tileHeight = 8;
-        }
-        else if (funcName.consume_front("_m4"))
-        {
-            tileHeight = 4;
-        }
-        else if (funcName.consume_front("_m2"))
-        {
-            tileHeight = 2;
-        }
-        else if (funcName.consume_front("_m1"))
-        {
-            tileHeight = 1;
-        }
-        else
+        funcName = consume_number(funcName, "_m", &tileHeight);
+        if (tileHeight < 1 || tileHeight > 32)
         {
             IGC_ASSERT_MESSAGE(0, "Unrecognized m element in __builtin_IB_subgroup_block_read/write.");
             return nullptr;
@@ -935,6 +927,10 @@ Instruction* LSCFuncsResolution::CreateSubGroup2DBlockOperation(llvm::CallInst& 
         else if (funcName.consume_front("k8"))
         {
             tileWidth = 8;
+        }
+        else if (funcName.consume_front("k4"))
+        {
+            tileWidth = 4;
         }
         else
         {
@@ -989,25 +985,18 @@ Instruction* LSCFuncsResolution::CreateSubGroup2DBlockOperation(llvm::CallInst& 
                 // each SIMD lane gets two rows in SIMD16
                 tileHeight = 32;
             }
+            else if (funcName.consume_front("_m16"))
+            {
+                tileHeight = 16;
+            }
+
             tileWidth = 8;
-
             funcName.consume_front("_");
-
-            if (funcName.consume_front("k8"))
+            funcName = consume_number(funcName, "k", &tileWidth);
+            if (tileWidth < 1 || (tileWidth > 8
+            ))
             {
-                tileWidth = 8;
-            }
-            else if (funcName.consume_front("k4"))
-            {
-                tileWidth = 4;
-            }
-            else if (funcName.consume_front("k2"))
-            {
-                tileWidth = 2;
-            }
-            else
-            {
-                IGC_ASSERT_MESSAGE(0, "Transpose with 32 bit element size only supports width 8.");
+                IGC_ASSERT_MESSAGE(0, "Transpose with 32 bit element size only supports width: 1 - 8.");
                 return nullptr;
             }
         }
@@ -1020,11 +1009,19 @@ Instruction* LSCFuncsResolution::CreateSubGroup2DBlockOperation(llvm::CallInst& 
     else if (isVnniTransform && !isTranspose)
     {
         numBlocksV = 1;
+        tileWidth = subGrpSize;
 
         if (elemSize == 8)
         {
             bool is32Height = funcName.consume_front("_k32");
             IGC_ASSERT_MESSAGE(is32Height, "Only k32 is supported for 8 bit element size, at the moment.");
+
+            // If sub-group size is 32, we still may want to use width = 16
+            // __builtin_IB_subgroup_block_read_flat_cacheopts_transform_u8_wi8_k32n16
+            if (funcName.consume_front("n16"))
+            {
+                tileWidth = 16;
+            }
 
             // __builtin_IB_subgroup_block_read_flat_transform_u8_k32v2
             if (funcName.consume_front("v2"))
@@ -1058,6 +1055,13 @@ Instruction* LSCFuncsResolution::CreateSubGroup2DBlockOperation(llvm::CallInst& 
                 return nullptr;
             }
 
+            // If sub-group size is 32, we still may want to use width = 16
+            // __builtin_IB_subgroup_block_read_flat_transform_u16_k16n16
+            if (funcName.consume_front("n16"))
+            {
+                tileWidth = 16;
+            }
+
             // __builtin_IB_subgroup_block_read_flat_transform_u16_k16v2
             // __builtin_IB_subgroup_block_read_flat_transform_u16_k32v2
             if (funcName.consume_front("v2"))
@@ -1065,8 +1069,6 @@ Instruction* LSCFuncsResolution::CreateSubGroup2DBlockOperation(llvm::CallInst& 
                 numBlocksV = 2;
             }
         }
-
-        tileWidth = subGrpSize;
     }
     else
     {
@@ -1383,7 +1385,7 @@ Instruction* LSCFuncsResolution::CreateLSCFenceIntrinsicCallInst() {
     }
 
     Function *lscFunc = GenISAIntrinsic::getDeclaration(
-        m_pCurrInstFunc->getParent(), GenISAIntrinsic::GenISA_LSCFence, None);
+        m_pCurrInstFunc->getParent(), GenISAIntrinsic::GenISA_LSCFence, {});
     Instruction* lscCall = CallInst::Create(lscFunc, args, "", m_pCurrInst);
     return lscCall;
 }
@@ -1410,7 +1412,7 @@ Instruction* LSCFuncsResolution::CreateLSCFenceEvictToMemory()
     };
 
     Function* lscFunc = GenISAIntrinsic::getDeclaration(
-        m_pCurrInstFunc->getParent(), GenISAIntrinsic::GenISA_LSCFence, None);
+        m_pCurrInstFunc->getParent(), GenISAIntrinsic::GenISA_LSCFence, {});
     Instruction* lscCall = CallInst::Create(lscFunc, args, "", m_pCurrInst);
 
     if (context->platform.getPlatformInfo().eRenderCoreFamily == IGFX_XE_HPG_CORE)

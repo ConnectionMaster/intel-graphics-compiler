@@ -195,6 +195,7 @@ int IR_Builder::translateVISASampleInfoInst(VISA_Exec_Size executionSize,
   bool preEmption = forceSamplerHeader();
   bool forceSplitSend = shouldForceSplitSend(surface);
   bool useHeader = true;
+  bool forceHeader = false;
   // SAMPLEINFO has 0 parameters so its only header
 
   unsigned int numRows = 1;
@@ -202,11 +203,12 @@ int IR_Builder::translateVISASampleInfoInst(VISA_Exec_Size executionSize,
   G4_Declare *msg = NULL;
   G4_SrcRegRegion *m0 = NULL;
 
-  if (!useFakeHeader || forceSplitSend || preEmption) {
+  if (!useFakeHeader || forceSplitSend || preEmption || forceHeader) {
     msg = getSamplerHeader(false /*isBindlessSampler*/,
                            false /*samperIndexGE16*/);
 
     unsigned int secondDword = chMask.getHWEncoding() << 12;
+
 
     G4_Imm *immOpndSecondDword = createImm(secondDword, Type_UD);
 
@@ -320,6 +322,7 @@ int IR_Builder::translateVISAResInfoInst(
   if (useHeader) {
     unsigned int secondDword = 0;
     secondDword |= (chMask.getHWEncoding() << 12);
+
 
     G4_Imm *immOpndSecondDword = createImm(secondDword, Type_UD);
 
@@ -1263,9 +1266,11 @@ IR_Builder::constructSrcPayloadDualRenderTarget(vISA_RT_CONTROLS cntrls,
   auto payloadUD = createSendPayloadDcl(numElts, Type_UD);
   auto payloadUW = createSendPayloadDcl(numElts, Type_UW);
   auto payloadF = createSendPayloadDcl(numElts, Type_F);
+  auto payloadUB = createSendPayloadDcl(numElts, Type_UB);
 
   payloadUW->setAliasDeclare(payloadUD, 0);
   payloadF->setAliasDeclare(payloadUD, 0);
+  payloadUB->setAliasDeclare(payloadUD, 0);
 
   // Check whether coalescing is possible
   // coalesc payload by checking whether the source is already prepared in a
@@ -1395,7 +1400,7 @@ IR_Builder::constructSrcPayloadDualRenderTarget(vISA_RT_CONTROLS cntrls,
     }
 
     if (cntrls.isStencil) {
-      Copy_SrcRegRegion_To_Payload(payloadUW, regOff, S, execSize, instOpt);
+      Copy_SrcRegRegion_To_Payload(payloadUB, regOff, S, execSize, instOpt);
     }
 
     srcToUse = createSrcRegRegion(payloadUD, getRegionStride1());
@@ -1414,6 +1419,7 @@ IR_Builder::constructSrcPayloadDualRenderTarget(vISA_RT_CONTROLS cntrls,
       ((!(s0G->isNullReg() && s1G->isNullReg()) ? 0x1 : 0) << 0x1) |
       ((!(s0B->isNullReg() && s1B->isNullReg()) ? 0x1 : 0) << 0x2) |
       (((!(s0A->isNullReg() && s1A->isNullReg()) || cntrls.s0aPresent) ? 0x1 : 0) << 0x3);
+
 
   return std::make_tuple(srcToUse, numRows, chMask);
 }
@@ -1635,7 +1641,8 @@ IR_Builder::constructSrcPayloadRenderTarget(vISA_RT_CONTROLS cntrls,
   uint32_t chMask = (R && !R->isNullReg() ? 0x1 : 0) |
                     ((G && !G->isNullReg() ? 0x1 : 0) << 0x1) |
                     ((B && !B->isNullReg() ? 0x1 : 0) << 0x2) |
-                    (((A && !A->isNullReg() || cntrls.s0aPresent) ? 0x1 : 0) << 0x3);
+                    ((A && !A->isNullReg() ? 0x1 : 0) << 0x3);
+
 
   return std::make_tuple(srcToUse, numRows, chMask);
 }
@@ -1762,17 +1769,21 @@ static G4_Operand *createSampleHeader(IR_Builder *builder, G4_Declare *header,
   unsigned int secondDword = createSampleHeader0Dot2(
       actualop, pixelNullMask, aoffimmiVal, srcChannel, builder);
 
+
   G4_Imm *immOpndSecondDword = builder->createImm(secondDword, Type_UD);
   G4_DstRegRegion *payloadDstRgn =
       builder->createDst(header->getRegVar(), 0, 2, 1, Type_UD);
+  G4_INST *headerInst = nullptr;
   if (aoffimmi->isImm()) {
     // mov (1) payload(0,2) immOpndSecondDword
-    builder->createMov(g4::SIMD1, payloadDstRgn, immOpndSecondDword,
-                       InstOpt_WriteEnable, true);
+    headerInst =
+        builder->createMov(g4::SIMD1, payloadDstRgn, immOpndSecondDword,
+                           InstOpt_WriteEnable, true);
   } else {
     // or (1) payload(0,2) aoffimmi<0;1,0>:uw immOpndSeconDword
-    builder->createBinOp(G4_or, g4::SIMD1, payloadDstRgn, aoffimmi,
-                         immOpndSecondDword, InstOpt_WriteEnable, true);
+    headerInst =
+        builder->createBinOp(G4_or, g4::SIMD1, payloadDstRgn, aoffimmi,
+                             immOpndSecondDword, InstOpt_WriteEnable, true);
   }
 
   if (sampler != nullptr) {
@@ -2148,7 +2159,7 @@ int IR_Builder::splitSampleInst(
         createMov(execSize, dst, tmpSrcPnt, MovInstOpt, true);
       } else {
         Copy_SrcRegRegion_To_Payload(originalDstDcl, regOff, tmpSrcPnt,
-                                     execSize, MovInstOpt);
+                                     execSize, MovInstOpt, pred);
       }
     }
   }
@@ -2188,7 +2199,7 @@ int IR_Builder::splitSampleInst(
         createMov(execSize, dst, tmpSrcPnt, MovInstOpt, true);
       } else {
         Copy_SrcRegRegion_To_Payload(originalDstDcl, regOff, tmpSrcPnt,
-                                     execSize, MovInstOpt);
+                                     execSize, MovInstOpt, pred);
       }
     }
   }
@@ -2363,10 +2374,10 @@ int IR_Builder::translateVISASampler3DInst(
   bool nonZeroAoffImmi =
       !(aoffimmi->isImm() && aoffimmi->asImm()->getInt() == 0);
   bool simd16HFReturn = FP16Return && execSize == 16;
-  if (needSamplerHeader(this, pixelNullMask, nonZeroAoffImmi,
+  if (useHeader ||
+      needSamplerHeader(this, pixelNullMask, nonZeroAoffImmi,
                         needHeaderForChannels, isBindlessSampler(sampler),
-                        !pairedSurface->isNullReg(),
-                        simd16HFReturn) ||
+                        !pairedSurface->isNullReg(), simd16HFReturn) ||
       samplerHeaderPreemptionWA()) {
     useHeader = true;
     ++numRows;
@@ -2502,10 +2513,10 @@ int IR_Builder::translateVISALoad3DInst(
   bool nonZeroAoffImmi =
       !(aoffimmi->isImm() && aoffimmi->asImm()->getInt() == 0);
   bool simd16HFReturn = halfReturn && execSize == 16;
-  if (needSamplerHeader(this, pixelNullMask, nonZeroAoffImmi,
+  if (useHeader ||
+      needSamplerHeader(this, pixelNullMask, nonZeroAoffImmi,
                         needHeaderForChannels, false,
-                        !pairedSurface->isNullReg(),
-                        simd16HFReturn)) {
+                        !pairedSurface->isNullReg(), simd16HFReturn)) {
     useHeader = true;
     ++numRows;
   }
@@ -2611,7 +2622,8 @@ int IR_Builder::translateVISAGather3dInst(
       channelMask.getSingleChannel() != VISA_3D_GATHER4_CHANNEL_R;
   bool simd16HFReturn = FP16Return && execSize == 16;
 
-  if (needSamplerHeader(this, pixelNullMask, nonZeroAoffImmi,
+  if (useHeader ||
+      needSamplerHeader(this, pixelNullMask, nonZeroAoffImmi,
                         needHeaderForChannels, isBindlessSampler(sampler),
                         !pairedSurface->isNullReg(), simd16HFReturn) ||
       samplerHeaderPreemptionWA()) {

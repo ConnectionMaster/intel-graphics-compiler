@@ -100,8 +100,6 @@ SPDX-License-Identifier: MIT
 ///
 //===----------------------------------------------------------------------===//
 
-#define DEBUG_TYPE "cmimpparam"
-
 #include "vc/GenXOpts/GenXOpts.h"
 #include "vc/Utils/GenX/KernelInfo.h"
 
@@ -139,20 +137,21 @@ SPDX-License-Identifier: MIT
 #include <iterator>
 #include <map>
 #include <numeric>
+#include <optional>
 #include <set>
 #include <stack>
-#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 #include "Probe/Assertion.h"
 #include "llvmWrapper/Analysis/CallGraph.h"
-#include "llvmWrapper/IR/Attributes.h"
 #include "llvmWrapper/IR/DerivedTypes.h"
 #include "llvmWrapper/IR/Function.h"
 #include "llvmWrapper/Support/Alignment.h"
 #include <llvmWrapper/ADT/Optional.h>
+
+#define DEBUG_TYPE "CMImpParam"
 
 using namespace llvm;
 
@@ -211,6 +210,18 @@ struct CMImpParam : public ModulePass {
   bool HasPayloadInMemory = false;
   const DataLayout *DL = nullptr;
 
+#if LLVM_VERSION_MAJOR >= 16
+  CallGraph &CG;
+  CMImpParam(CallGraph &CG, bool HasPayloadInMemoryIn)
+      : ModulePass{ID}, HasPayloadInMemory{HasPayloadInMemoryIn}, CG(CG) {
+    initializeCMImpParamPass(*PassRegistry::getPassRegistry());
+  }
+
+  CMImpParam(CallGraph &CG)
+      : ModulePass{ID}, HasPayloadInMemory{PayloadInMemoryOpt}, CG(CG) {
+    initializeCMImpParamPass(*PassRegistry::getPassRegistry());
+  }
+#else  // LLVM_VERSION_MAJOR
   CMImpParam(bool HasPayloadInMemoryIn)
       : ModulePass{ID}, HasPayloadInMemory{HasPayloadInMemoryIn} {
     initializeCMImpParamPass(*PassRegistry::getPassRegistry());
@@ -219,6 +230,7 @@ struct CMImpParam : public ModulePass {
   CMImpParam() : ModulePass{ID}, HasPayloadInMemory{PayloadInMemoryOpt} {
     initializeCMImpParamPass(*PassRegistry::getPassRegistry());
   }
+#endif // LLVM_VERSION_MAJOR
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.addRequired<CallGraphWrapperPass>();
@@ -557,7 +569,9 @@ bool CMImpParam::runOnModule(Module &M) {
 void CMImpParam::processKernels(
     const std::vector<FunctionRef> &Kernels, const IntrIDMap &UsedIntrInfo,
     const std::unordered_set<Function *> &RequireImplArgsBuffer) {
+#if LLVM_VERSION_MAJOR < 16
   CallGraph &CG = getAnalysis<CallGraphWrapperPass>().getCallGraph();
+#endif
 
   for (Function &Kernel : Kernels) {
     // Traverse the call graph to determine what the total implicit uses are for
@@ -611,14 +625,16 @@ CMImpParam::analyzeFixedSignatureFunctions(Module &M,
                                            const IntrIDMap &UsedIntrInfo) {
   IntrIDMap FixedSignFuncInfo;
   std::unordered_set<Function *> RequireImplArgsBuffer;
+#if LLVM_VERSION_MAJOR < 16
   CallGraph &CG = getAnalysis<CallGraphWrapperPass>().getCallGraph();
-
+#endif
   auto FixedSignatureDefinitions = make_filter_range(
       M, [](const Function &F) { return vc::isFixedSignatureDefinition(F); });
 
   for (Function &F : FixedSignatureDefinitions) {
     auto [RequiredImplArgs, CalledFixedSignFuncs] =
         CallGraphTraverser{CG, UsedIntrInfo}.collectIndirectlyUsedImplArgs(F);
+
     // Function should be marked if it uses implicit args or it calls some
     // function that may use it via implicit args buffer.
     if (!RequiredImplArgs.empty() || !CalledFixedSignFuncs.has_value() ||
@@ -1014,6 +1030,9 @@ template <bool IsEntry> void CallGraphTraverser::visitFunction(Function &F) {
     // Skipping inline asm.
     if (isa<CallInst>(CI) && cast<CallInst>(CI)->isInlineAsm())
       continue;
+    if (!isa<CallInst>(CI) || (GenXIntrinsic::getAnyIntrinsicID(CI) !=
+                               GenXIntrinsic::not_any_intrinsic))
+      continue;
     // Returns nullptr in case of indirect call or inline asm which was already
     // considered.
     auto *Child = CallEdge.second->getFunction();
@@ -1068,11 +1087,8 @@ CMImpParam::processKernelParameters(Function *F,
   for (Function::arg_iterator I = F->arg_begin(), E = F->arg_end(); I != E;
        ++I, ++ArgIndex) {
     ArgTys.push_back(I->getType());
-    AttributeSet attrs = IGCLLVM::getParamAttrs(PAL, ArgIndex);
-    if (attrs.hasAttributes()) {
-      auto B = IGCLLVM::makeAttrBuilder(Context, attrs);
-      AttrVec = AttrVec.addParamAttributes(Context, ArgIndex, B);
-    }
+    AttrBuilder ArgAttrB(Context, PAL.getParamAttrs(ArgIndex));
+    AttrVec = AttrVec.addParamAttributes(Context, ArgIndex, ArgAttrB);
   }
 
   // Now add all the implicit arguments
@@ -1092,11 +1108,8 @@ CMImpParam::processKernelParameters(Function *F,
     "type out of sync, expect bool arguments)");
 
   // Add any function attributes
-  AttributeSet FnAttrs = IGCLLVM::getFnAttrs(PAL);
-  if (FnAttrs.hasAttributes()) {
-    auto B = IGCLLVM::makeAttrBuilder(Context, FnAttrs);
-    AttrVec = IGCLLVM::addAttributesAtIndex(AttrVec, Context, AttributeList::FunctionIndex, B);
-  }
+  AttrBuilder B(Context, PAL.getFnAttrs());
+  AttrVec = AttrVec.addFnAttributes(Context, B);
 
   // Create new function body and insert into the module
   Function *NF = Function::Create(NFTy, F->getLinkage(), F->getName());
@@ -1167,7 +1180,9 @@ CMImpParam::processKernelParameters(Function *F,
     }
   }
 
+#if LLVM_VERSION_MAJOR < 16
   CallGraph &CG = getAnalysis<CallGraphWrapperPass>().getCallGraph();
+#endif
   CallGraphNode *NF_CGN = CG.getOrInsertFunction(NF);
 
   if (F->hasDLLExportStorageClass())
@@ -1205,14 +1220,29 @@ CMImpParam::processKernelParameters(Function *F,
 }
 
 char CMImpParam::ID = 0;
-INITIALIZE_PASS_BEGIN(CMImpParam, "cmimpparam",
+INITIALIZE_PASS_BEGIN(CMImpParam, "CMImpParam",
                       "Transformations required to support implicit arguments",
                       false, false)
 INITIALIZE_PASS_DEPENDENCY(CallGraphWrapperPass)
-INITIALIZE_PASS_END(CMImpParam, "cmimpparam",
+INITIALIZE_PASS_END(CMImpParam, "CMImpParam",
                     "Transformations required to support implicit arguments",
                     false, false)
 
-Pass *llvm::createCMImpParamPass(bool HasPayloadInMemory) {
+#if LLVM_VERSION_MAJOR < 16
+namespace llvm {
+Pass *createCMImpParamPass(bool HasPayloadInMemory) {
   return new CMImpParam{HasPayloadInMemory};
 }
+} // namespace llvm
+
+#else // LLVM_VERSION_MAJOR < 16
+PreservedAnalyses CMImpParamPass::run(llvm::Module &M,
+                                      llvm::AnalysisManager<llvm::Module> &AM) {
+  auto &CG = AM.getResult<CallGraphAnalysis>(M);
+  CMImpParam CMIP(CG, HasPayloadInMemory);
+  if (CMIP.runOnModule(M))
+    return PreservedAnalyses::none();
+  return PreservedAnalyses::all();
+}
+CMImpParamPass::CMImpParamPass() : HasPayloadInMemory{PayloadInMemoryOpt} {};
+#endif // LLVM_VERSION_MAJOR < 16

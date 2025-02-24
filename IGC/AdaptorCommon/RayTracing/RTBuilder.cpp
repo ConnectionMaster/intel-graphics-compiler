@@ -27,9 +27,9 @@ SPDX-License-Identifier: MIT
 #include "common/LLVMWarningsPush.hpp"
 #include <llvmWrapper/ADT/Optional.h>
 #include "llvmWrapper/IR/Argument.h"
-#include "llvmWrapper/IR/Attributes.h"
 #include "llvmWrapper/IR/DerivedTypes.h"
 #include "llvmWrapper/Support/Alignment.h"
+#include "llvm/ADT/None.h"
 #include "common/LLVMWarningsPop.hpp"
 
 #include <optional>
@@ -38,6 +38,7 @@ SPDX-License-Identifier: MIT
 using namespace llvm;
 using namespace RTStackFormat;
 using namespace IGC;
+
 
 namespace {
     class VAdapt
@@ -88,6 +89,15 @@ void RTBuilder::setInvariantLoad(LoadInst* LI)
 
 Value* RTBuilder::getRtMemBasePtr(void)
 {
+#define STYLE(X) {                                                      \
+    using T = std::conditional_t<                                       \
+        std::is_same_v<RTStackFormat::X, RTStackFormat::Xe>,            \
+        RayDispatchGlobalData::RT::Xe, RayDispatchGlobalData::RT::Xe3>; \
+    static_assert(                                                      \
+        offsetof(RayDispatchGlobalData::RT::Xe, rtMemBasePtr) ==        \
+        offsetof(T, rtMemBasePtr)); }
+#include "RayTracingMemoryStyle.h"
+#undef STYLE
     return _get_rtMemBasePtr_Xe(VALUE_NAME("rtMemBasePtr"));
 }
 
@@ -111,6 +121,8 @@ Value* RTBuilder::getMaxBVHLevels(void)
     {
     case RTMemoryStyle::Xe:
         return _get_maxBVHLevels_Xe(VALUE_NAME("maxBVHLevels"));
+    case RTMemoryStyle::Xe3:
+        return _get_maxBVHLevels_Xe3(VALUE_NAME("maxBVHLevels"));
     }
     IGC_ASSERT(0);
     return {};
@@ -495,7 +507,7 @@ std::pair<BasicBlock*, PHINode*> RTBuilder::validateInstanceLeafPtr(
 //      % "&ShadowMemory.RayQueryObjects".first = alloca[5 x % "struct.RTStackFormat::RTStack2"]
 //  % "&ShadowMemory.RayQueryObjects".second = alloca[5 x int8]
 //
-std::pair<Value*, Value*> RTBuilder::createAllocaRayQueryObjects(unsigned int size, bool bShrinkSMStack, const llvm::Twine& Name)
+std::pair<AllocaInst*, AllocaInst*> RTBuilder::createAllocaRayQueryObjects(unsigned int size, bool bShrinkSMStack, const llvm::Twine& Name)
 {
     //FIXME: Temp solution: to shrink ShadowMemory, if ShrinkShadowMemoryIfNoSpillfill is true (we know no spillfill), then,
     //we alloca SMStack instead of RTStack to reduce the size. Also, here, we simply cast SMStack pointer to RTStack which is risky
@@ -503,7 +515,7 @@ std::pair<Value*, Value*> RTBuilder::createAllocaRayQueryObjects(unsigned int si
     //But don't shrink data in the middle of RTStack which will lead to holes.
     auto* RTStackTy = bShrinkSMStack ? getSMStack2Ty() : getRTStack2Ty();
 
-    Value* rtStacks = this->CreateAlloca(
+    AllocaInst* rtStacks = this->CreateAlloca(
         ArrayType::get(RTStackTy, size),
         nullptr,
         Name);
@@ -514,7 +526,7 @@ std::pair<Value*, Value*> RTBuilder::createAllocaRayQueryObjects(unsigned int si
     //to WA this, let's temporily use DW, but sure, this won't solve all other issues.
     //  %0 = alloca <3 x float>
     //  store <3 x float> zeroinitializer, <3 x float>* %0
-    Value* rtCtrls = this->CreateAlloca(
+    AllocaInst* rtCtrls = this->CreateAlloca(
         ArrayType::get(this->getInt32Ty(), size),
         nullptr,
         Name);
@@ -869,11 +881,11 @@ Value* RTBuilder::getPrimitiveIndex(
     }
 }
 
-PHINode* RTBuilder::getPrimitiveIndex(
+Value* RTBuilder::getPrimitiveIndex(
     RTBuilder::StackPointerVal* perLaneStackPtr, Value* leafType, bool Committed)
 {
-    switch (getMemoryStyle())
-    {
+        switch (getMemoryStyle())
+        {
 #define STYLE(X)                        \
     case RTMemoryStyle::X:              \
         return _getPrimitiveIndex_##X(  \
@@ -883,10 +895,11 @@ PHINode* RTBuilder::getPrimitiveIndex(
             VALUE_NAME("primitiveIndex"));
 #include "RayTracingMemoryStyle.h"
 #undef STYLE
-    }
-    IGC_ASSERT(0);
-    return {};
+        }
+        IGC_ASSERT(0);
+        return nullptr;
 }
+
 
 Value* RTBuilder::getGeometryIndex(
     RTBuilder::StackPointerVal* perLaneStackPtr,
@@ -902,37 +915,36 @@ Value* RTBuilder::getGeometryIndex(
         auto [ValidBB, PN] =
             validateInstanceLeafPtr(perLaneStackPtr, I, (ShaderTy == CallableShaderTypeMD::ClosestHit));
         this->SetInsertPoint(ValidBB->getTerminator());
-        Value* validGeomIndex = getGeometryIndex(perLaneStackPtr, &*BB->rbegin(), leafType, ShaderTy);
+        Value* validGeomIndex = getGeometryIndex(perLaneStackPtr, leafType, ShaderTy == CallableShaderTypeMD::ClosestHit);
         PN->addIncoming(validGeomIndex, getUnsetPhiBlock(PN));
         this->SetInsertPoint(I);
         return PN;
     }
     else
     {
-        return getGeometryIndex(perLaneStackPtr, I, leafType, ShaderTy);
+        return getGeometryIndex(perLaneStackPtr, leafType, ShaderTy == CallableShaderTypeMD::ClosestHit);
     }
 }
 
 Value* RTBuilder::getGeometryIndex(
     RTBuilder::StackPointerVal* perLaneStackPtr,
-    Instruction* I,
     Value* leafType,
-    IGC::CallableShaderTypeMD ShaderTy)
+    bool committed)
 {
-    switch (getMemoryStyle())
-    {
+        switch (getMemoryStyle())
+        {
 #define STYLE(X)                                     \
     case RTMemoryStyle::X:                           \
         return _getGeometryIndex_##X(                \
             perLaneStackPtr,                         \
             leafType,                                \
-            VAdapt{ *this, ShaderTy == ClosestHit }, \
+            VAdapt{ *this, committed }, \
             VALUE_NAME("geometryIndex"));
 #include "RayTracingMemoryStyle.h"
 #undef STYLE
-    }
-    IGC_ASSERT(0);
-    return {};
+        }
+        IGC_ASSERT(0);
+        return nullptr;
 }
 
 Value* RTBuilder::getInstanceContributionToHitGroupIndex(
@@ -1122,9 +1134,8 @@ GenIntrinsicInst* RTBuilder::getSr0_0()
     Module* module = this->GetInsertBlock()->getModule();
 
     auto* sr0_0 = this->CreateCall(
-        GenISAIntrinsic::getDeclaration(
-            module, GenISAIntrinsic::GenISA_getSR0_0),
-        None,
+        GenISAIntrinsic::getDeclaration(module, GenISAIntrinsic::GenISA_getSR0_0),
+        {},
         VALUE_NAME("sr0.0"));
     return cast<GenIntrinsicInst>(sr0_0);
 }
@@ -1168,6 +1179,10 @@ std::pair<uint32_t, uint32_t> RTBuilder::getSliceIDBitsInSR0() const {
     {
         return {11, 15};
     }
+    else if (Ctx.platform.GetPlatformFamily() == IGFX_XE3_CORE)
+    {
+        return {14, 17};
+    }
     else
     {
         return {12, 14};
@@ -1183,6 +1198,10 @@ std::pair<uint32_t, uint32_t> RTBuilder::getSubsliceIDBitsInSR0() const {
     else if (Ctx.platform.GetPlatformFamily() == IGFX_XE2_HPG_CORE)
     {
         return {8, 9};
+    }
+    else if (Ctx.platform.GetPlatformFamily() == IGFX_XE3_CORE)
+    {
+        return {8, 11};
     }
     else
     {
@@ -1215,14 +1234,14 @@ std::pair<uint32_t, uint32_t> RTBuilder::getDualSubsliceIDBitsInSR0() const {
 // globalDSSID is the combined value of sliceID and dssID on slice.
 Value* RTBuilder::getGlobalDSSID()
 {
-    if (isChildOfXe2)
+    if (Ctx.platform.isCoreChildOf(IGFX_XE2_HPG_CORE))
     {
         if (Ctx.platform.supportsWMTPForShaderType(Ctx.type))
         {
             Module* module = GetInsertBlock()->getModule();
             return CreateCall(
                 GenISAIntrinsic::getDeclaration(module, GenISAIntrinsic::GenISA_logical_subslice_id),
-                None,
+                {},
                 VALUE_NAME("logical_subslice_id"));
         }
         else
@@ -1233,6 +1252,13 @@ Value* RTBuilder::getGlobalDSSID()
             if (dssIDBits.first < sliceIDBits.first && sliceIDBits.first == dssIDBits.second + 1)
             {
                 return emitStateRegID(dssIDBits.first, sliceIDBits.second);
+            }
+            else if (Ctx.platform.isCoreChildOf(IGFX_XE3_CORE))
+            {
+                Value* sliceID = emitStateRegID(sliceIDBits.first, sliceIDBits.second);
+                Value* dssID = emitStateRegID(dssIDBits.first, dssIDBits.second);
+                Value* globalDSSID = CreateMul(sliceID, getInt32(NumDSSPerSlice));
+                return CreateAdd(globalDSSID, dssID);
             }
             else
             {
@@ -1387,15 +1413,14 @@ void RTBuilder::setHitValid(StackPointerVal* StackPointer, bool CommittedHit)
     }
 }
 
-Value* RTBuilder::getSyncTraceRayControl(Value* ptrCtrl)
+LoadInst* RTBuilder::getSyncTraceRayControl(GetElementPtrInst* ptrCtrl)
 {
-    return this->CreateLoad(ptrCtrl, VALUE_NAME("rayQueryObject.traceRayControl"));
+    return this->CreateLoad(ptrCtrl->getResultElementType(), ptrCtrl, VALUE_NAME("rayQueryObject.traceRayControl"));
 }
 
-void RTBuilder::setSyncTraceRayControl(Value* ptrCtrl, RTStackFormat::TraceRayCtrl ctrl)
+void RTBuilder::setSyncTraceRayControl(GetElementPtrInst* ptrCtrl, RTStackFormat::TraceRayCtrl ctrl)
 {
-    Type* eleType = IGCLLVM::getNonOpaquePtrEltTy(ptrCtrl->getType());
-    this->CreateStore(llvm::ConstantInt::get(eleType, (uint32_t)ctrl), ptrCtrl);
+    this->CreateStore(llvm::ConstantInt::get(ptrCtrl->getResultElementType(), (uint32_t)ctrl), ptrCtrl);
 }
 
 Value* RTBuilder::getHitBaryCentric(
@@ -1439,6 +1464,21 @@ Value* RTBuilder::getLeafType(
 
 
 
+Value* RTBuilder::getLeafNodeSubType(StackPointerVal* StackPointer, bool CommittedHit)
+{
+    switch (getMemoryStyle())
+    {
+    case RTMemoryStyle::Xe:
+        return this->getInt32(0);
+
+    case RTMemoryStyle::Xe3:
+        return _getLeafNodeSubType_Xe3(StackPointer, getInt1(CommittedHit),
+            VALUE_NAME("MemHit.LeafNodeSubType"));
+
+    }
+    IGC_ASSERT(0);
+    return nullptr;
+}
 
 
 CallInst* RTBuilder::CreateLSCFence(
@@ -1479,6 +1519,9 @@ Value* RTBuilder::canonizePointer(Value* Ptr)
     case RTMemoryStyle::Xe:
         VA_MSB = 48 - 1;
         break;
+    case RTMemoryStyle::Xe3:
+        VA_MSB = 57 - 1;
+        break;
     }
     constexpr uint32_t MSB = 63;
     uint32_t ShiftAmt = MSB - VA_MSB;
@@ -1494,24 +1537,16 @@ Value* RTBuilder::canonizePointer(Value* Ptr)
 
 void RTBuilder::setReturnAlignment(CallInst* CI, uint32_t AlignVal)
 {
-    auto Attrs = CI->getAttributes();
-    auto AB =
-        IGCLLVM::makeAttrBuilder(CI->getContext(), Attrs.getAttributes(AttributeList::ReturnIndex));
-    AB.addAlignmentAttr(AlignVal);
-    auto AL =
-        IGCLLVM::addAttributesAtIndex(Attrs, CI->getContext(), AttributeList::ReturnIndex, AB);
-    CI->setAttributes(AL);
+    Align Alt(AlignVal);
+    CI->addRetAttr(Attribute::getWithAlignment(CI->getContext(), Alt));
 }
 
 void RTBuilder::setDereferenceable(CallInst* CI, uint32_t Size)
 {
-    auto Attrs = CI->getAttributes();
-    auto AB =
-        IGCLLVM::makeAttrBuilder(CI->getContext(), Attrs.getAttributes(AttributeList::ReturnIndex));
-    AB.addDereferenceableAttr(Size);
-    auto AL =
-        IGCLLVM::addAttributesAtIndex(Attrs, CI->getContext(), AttributeList::ReturnIndex, AB);
-    CI->setAttributes(AL);
+    if (Size)
+    {
+        CI->addRetAttr(Attribute::getWithDereferenceableBytes(CI->getContext(), Size));
+    }
 }
 
 Value* RTBuilder::getGlobalBufferPtr(IGC::ADDRESS_SPACE Addrspace)
@@ -1533,7 +1568,7 @@ Value* RTBuilder::getGlobalBufferPtr(IGC::ADDRESS_SPACE Addrspace)
         GenISAIntrinsic::GenISA_GlobalBufferPointer,
         PtrTy);
 
-    CallInst *CI = this->CreateCall(Func, None, VALUE_NAME("globalPtr"));
+    CallInst *CI = this->CreateCall(Func, {}, VALUE_NAME("globalPtr"));
 
     if (IGC_IS_FLAG_DISABLED(DisableRaytracingIntrinsicAttributes))
         this->setReturnAlignment(CI, RTGlobalsAlign);
@@ -1560,6 +1595,10 @@ Value* RTBuilder::getSyncStackID()
              PlatformInfo.eProductFamily == IGFX_LUNARLAKE)
     {
         return _getSyncStackID_Xe2(VALUE_NAME("SyncStackID"));
+    }
+    else if (PlatformInfo.eRenderCoreFamily == IGFX_XE3_CORE)
+    {
+        return _getSyncStackID_Xe3(VALUE_NAME("SyncStackID"));
     }
     else
     {
@@ -1604,10 +1643,12 @@ static const char* RaytracingTypesMDName = "igc.magic.raytracing.types";
 // and add create a getter function below to retrieve it.
 enum class RaytracingType
 {
-    RTStack2Stateless     = 0,
-    RTStack2Stateful      = 1,
-    RayDispatchGlobalData = 2,
-    SWHotZone             = 3,
+    AsyncRTStack2Stateless     = 0,
+    AsyncRTStack2Stateful      = 1,
+    RayDispatchGlobalData      = 2,
+    SWHotZone                  = 3,
+    SyncRTStack2Stateless      = 4,
+    SyncRTStack2Stateful       = 5,
     NUM_TYPES
 };
 
@@ -1717,8 +1758,18 @@ Type* RTBuilder::getRTStack2PtrTy(
             AddrSpace);
     };
 
-    auto RTType = (Mode == RTBuilder::STATELESS) ?
-        RaytracingType::RTStack2Stateless : RaytracingType::RTStack2Stateful;
+    auto RTType = RaytracingType::NUM_TYPES;
+
+    if (async)
+    {
+        RTType = (Mode == RTBuilder::STATELESS) ?
+            RaytracingType::AsyncRTStack2Stateless : RaytracingType::AsyncRTStack2Stateful;
+    }
+    else
+    {
+        RTType = (Mode == RTBuilder::STATELESS) ?
+            RaytracingType::SyncRTStack2Stateless : RaytracingType::SyncRTStack2Stateful;
+    }
 
     return lazyGetRTType(*Ctx.getModule(), RTType, addTy);
 }
@@ -1838,6 +1889,10 @@ ConstantInt* RTBuilder::supportStochasticLod()
     return getInt1(Ctx.platform.supportStochasticLod());
 }
 
+ConstantInt* RTBuilder::isRayQueryReturnOptimizationEnabled()
+{
+    return getInt1(Ctx.platform.isRayQueryReturnOptimizationEnabled());
+}
 
 
 GenIntrinsicInst* RTBuilder::createDummyInstID(Value* pSrcVal)
@@ -1899,6 +1954,16 @@ void RTBuilder::createTraceRayInlinePrologue(
             ComparisonValue,
             TMax);
         break;
+    case RTMemoryStyle::Xe3:
+        _createTraceRayInlinePrologue_Xe3(
+            StackPtr,
+            RayInfo,
+            RootNodePtr,
+            RayFlags,
+            InstanceInclusionMask,
+            ComparisonValue,
+            TMax);
+        break;
     }
 }
 
@@ -1915,38 +1980,33 @@ void RTBuilder::emitSingleRQMemRayWrite(
             SMStackPtr,
             VAdapt{ *this, singleRQProceed });
         break;
+    case RTMemoryStyle::Xe3:
+        _emitSingleRQMemRayWrite_Xe3(
+            HWStackPtr,
+            SMStackPtr);
+        break;
     }
 }
 
 void RTBuilder::copyMemHitInProceed(
     SyncStackPointerVal* HWStackPtr,
     SyncStackPointerVal* SMStackPtr,
-    bool singleRQProceed,
-    bool useDeprecated)
+    bool singleRQProceed)
 {
-    if (useDeprecated)
+    switch (getMemoryStyle())
     {
-        switch (getMemoryStyle())
-        {
-        case RTMemoryStyle::Xe:
-            _copyMemHitInProceed_deprecated_Xe(
-                HWStackPtr,
-                SMStackPtr,
-                VAdapt{ *this, singleRQProceed });
-            break;
-        }
-    }
-    else
-    {
-        switch (getMemoryStyle())
-        {
-        case RTMemoryStyle::Xe:
-            _copyMemHitInProceed_Xe(
-                HWStackPtr,
-                SMStackPtr,
-                VAdapt{ *this, singleRQProceed });
-            break;
-        }
+    case RTMemoryStyle::Xe:
+        _copyMemHitInProceed_Xe(
+            HWStackPtr,
+            SMStackPtr,
+            VAdapt{ *this, singleRQProceed });
+        break;
+    case RTMemoryStyle::Xe3:
+        _copyMemHitInProceed_Xe3(
+            HWStackPtr,
+            SMStackPtr,
+            VAdapt{ *this, singleRQProceed });
+        break;
     }
 }
 
@@ -1956,6 +2016,7 @@ Value* RTBuilder::syncStackToShadowMemory(
     Value* ProceedReturnVal,
     Value* ShadowMemRTCtrlPtr)
 {
+
     switch (getMemoryStyle())
     {
 #define STYLE(X)                             \

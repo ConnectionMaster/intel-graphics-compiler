@@ -20,6 +20,8 @@ SPDX-License-Identifier: MIT
 #include "common/LLVMWarningsPush.hpp"
 #include "llvmWrapper/IR/DerivedTypes.h"
 #include "llvmWrapper/Support/Alignment.h"
+#include "llvm/Analysis/ValueTracking.h"
+#include "llvm/Support/KnownBits.h"
 #include "common/LLVMWarningsPop.hpp"
 #include "Probe/Assertion.h"
 
@@ -598,13 +600,6 @@ void ConstantCoalescing::ProcessBlock(
     } // loop over inst in block
 }
 
-// sort the CB loads with index order
-bool sortFunction(BufChunk* buf1, BufChunk* buf2)
-{
-    return (buf1->addrSpace < buf2->addrSpace ||
-        (buf1->addrSpace == buf2->addrSpace && buf1->chunkStart < buf2->chunkStart));
-}
-
 bool ConstantCoalescing::profitableChunkSize(
     uint32_t ub, uint32_t lb, uint32_t eltSizeInBytes)
 {
@@ -615,6 +610,10 @@ bool ConstantCoalescing::profitableChunkSize(
 bool ConstantCoalescing::profitableChunkSize(
     uint32_t chunkSize, uint32_t eltSizeInBytes)
 {
+    // limit the size to one GRF due to scalar-RA limitation
+    if (IGC_GET_FLAG_VALUE(EnableScalarPipe))
+        return chunkSize * eltSizeInBytes <= 64 &&
+            chunkSize <= MAX_VECTOR_NUM_ELEMENTS;
     return chunkSize * eltSizeInBytes <= MAX_OWLOAD_SIZE &&
            chunkSize <= MAX_VECTOR_NUM_ELEMENTS;
 }
@@ -639,6 +638,31 @@ bool ConstantCoalescing::CompareBufferBase(
     return false;
 }
 
+bool ConstantCoalescing::IsDwordAligned(Value* val) const
+{
+    KnownBits knownBits = computeKnownBits(val, *dataLayout);
+    return knownBits.countMinTrailingZeros() >= 2;
+}
+
+// VectorProcess pass requires that:
+// - if a vector load size is greater than 4 bytes, then the size of the loaded
+//   vector must be a multiple of DWORD.
+// - if a vector load size is smaller than 4 bytes, then the size of the loaded
+//   vector must be 1 or 2
+inline uint RoundChunkSize(uint numElements, uint elementSizeInBytes)
+{
+    uint32_t vectorSizeInBytes = numElements * elementSizeInBytes;
+    if (vectorSizeInBytes > 4 && (vectorSizeInBytes % 4) != 0)
+    {
+        return iSTD::RoundNonPow2(vectorSizeInBytes, 4) / elementSizeInBytes;
+    }
+    else if (vectorSizeInBytes < 4 && numElements == 3)
+    {
+        return 4;
+    }
+    return numElements;
+}
+
 void ConstantCoalescing::MergeScatterLoad(Instruction* load,
     Value* bufIdxV, uint addrSpace,
     Value* eltIdxV, uint offsetInBytes,
@@ -655,7 +679,8 @@ void ConstantCoalescing::MergeScatterLoad(Instruction* load,
     // Current assumption is that a chunk start needs to be DWORD aligned. In
     // the future we can consider adding support for merging 4 bytes or
     // 2 i16s/halfs into a single non-aligned DWORD.
-    const bool isDwordAligned = ((offsetInBytes % 4) == 0 && (eltIdxV == nullptr || alignment >= 4));
+    const bool isDwordAligned = ((offsetInBytes % 4) == 0 &&
+        (alignment >= 4 || eltIdxV == nullptr || IsDwordAligned(eltIdxV)));
 
     BufChunk* cov_chunk = nullptr;
     for (std::vector<BufChunk*>::reverse_iterator rit = chunk_vec.rbegin(),
@@ -708,7 +733,7 @@ void ConstantCoalescing::MergeScatterLoad(Instruction* load,
             cov_chunk->baseIdxV = eltIdxV;
             cov_chunk->elementSize = scalarSizeInBytes;
             cov_chunk->chunkStart = eltid;
-            cov_chunk->chunkSize = maxEltPlus;
+            cov_chunk->chunkSize = RoundChunkSize(maxEltPlus, scalarSizeInBytes);
             const alignment_t chunkAlignment = std::max<alignment_t>(alignment, 4);
             cov_chunk->chunkIO = CreateChunkLoad(load, cov_chunk, eltid, chunkAlignment, Extension);
 
@@ -733,7 +758,7 @@ void ConstantCoalescing::MergeScatterLoad(Instruction* load,
         uint lb = std::min(eltid, cov_chunk->chunkStart);
         uint ub = std::max(eltid + maxEltPlus, cov_chunk->chunkStart + cov_chunk->chunkSize);
         uint start_adj = cov_chunk->chunkStart - lb;
-        uint size_adj = ub - lb - cov_chunk->chunkSize;
+        uint size_adj = RoundChunkSize(ub - lb, cov_chunk->elementSize) - cov_chunk->chunkSize;
         if (start_adj == 0)
         {
             if (size_adj)
@@ -755,11 +780,11 @@ void ConstantCoalescing::MergeScatterLoad(Instruction* load,
         if (eltid < cov_chunk->chunkStart)
         {
             start_adj = cov_chunk->chunkStart - eltid;
-            size_adj = start_adj;
+            size_adj = RoundChunkSize(start_adj, cov_chunk->elementSize);
         }
         else if (eltid >= cov_chunk->chunkStart + cov_chunk->chunkSize)
         {
-            size_adj = eltid - cov_chunk->chunkStart - cov_chunk->chunkSize + 1;
+            size_adj = RoundChunkSize(eltid - cov_chunk->chunkStart + 1, cov_chunk->elementSize) - cov_chunk->chunkSize;
         }
 
         if (start_adj == 0 && size_adj == 0)
@@ -848,7 +873,7 @@ void ConstantCoalescing::CombineTwoLoads(
     uint lb = std::min(eltid0, eltid);
     uint ub = std::max(eltid0, eltid + numelt - 1);
     cov_chunk->chunkStart = lb;
-    cov_chunk->chunkSize = ub - lb + 1;
+    cov_chunk->chunkSize = RoundChunkSize(ub - lb + 1, cov_chunk->elementSize);
     Instruction* load0 = cov_chunk->chunkIO;
     // remove redundant load
     if (cov_chunk->chunkSize <= 1)
@@ -1028,9 +1053,10 @@ void ConstantCoalescing::MergeUniformLoad(Instruction* load,
     const ExtensionKind &Extension,
     std::vector<BufChunk*>& chunk_vec)
 {
+    // Only natural alignment is supported
     const alignment_t alignment = GetAlignment(load);
 
-    if (alignment == 0)
+    if (!isPowerOf2_64(alignment))
     {
         return;
     }
@@ -1052,17 +1078,18 @@ void ConstantCoalescing::MergeUniformLoad(Instruction* load,
     }
     const uint scalarSizeInBytes = (const uint)(loadEltTy->getPrimitiveSizeInBits() / 8);
 
-    IGC_ASSERT(isPowerOf2_64(alignment));
-    IGC_ASSERT(0 != scalarSizeInBytes);
-    IGC_ASSERT((offsetInBytes % scalarSizeInBytes) == 0);
+    if (0 == scalarSizeInBytes || (offsetInBytes % scalarSizeInBytes) != 0)
+    {
+        return;
+    }
 
     const uint eltid = offsetInBytes / scalarSizeInBytes;
 
     // Current assumption is that a chunk start needs to be DWORD aligned. In
     // the future we can consider adding support for merging 4 bytes or
     // 2 i16s/halfs into a single non-aligned DWORD.
-    const bool isDwordAligned =
-        ((offsetInBytes % 4) == 0 && (eltIdxV == nullptr || alignment >= 4));
+    const bool isDwordAligned = ((offsetInBytes % 4) == 0 &&
+        (alignment >= 4 || eltIdxV == nullptr || IsDwordAligned(eltIdxV)));
 
     auto shouldMerge = [&](const BufChunk* cur_chunk)
     {
@@ -1668,14 +1695,19 @@ Instruction* ConstantCoalescing::CreateChunkLoad(
         Value* eac = irBuilder->getInt32(chunk->chunkStart * chunk->elementSize);
         if (chunk->baseIdxV)
         {
+            Value* baseIdxV = chunk->baseIdxV;
+            if (baseIdxV->getType()->getIntegerBitWidth() < 32)
+            {
+                baseIdxV = irBuilder->CreateZExt(baseIdxV, eac->getType());
+            }
             if (chunk->chunkStart)
             {
-                eac = irBuilder->CreateAdd(chunk->baseIdxV, eac);
+                eac = irBuilder->CreateAdd(baseIdxV, eac);
                 wiAns->incUpdateDepend(eac, wiAns->whichDepend(chunk->baseIdxV));
             }
             else
             {
-                eac = chunk->baseIdxV;
+                eac = baseIdxV;
             }
         }
         Type* vty =IGCLLVM::FixedVectorType::get(ldRaw->getType()->getScalarType(), chunk->chunkSize);
@@ -2082,6 +2114,7 @@ bool ConstantCoalescing::IsSamplerAlignedAddress(Value* addr) const
         (inst->getOpcode() == Instruction::Shl ||
             inst->getOpcode() == Instruction::Mul ||
             inst->getOpcode() == Instruction::And ||
+            inst->getOpcode() == Instruction::Or ||
             inst->getOpcode() == Instruction::Add))
     {
         ConstantInt* src1ConstVal = dyn_cast<ConstantInt>(inst->getOperand(1));
@@ -2544,6 +2577,13 @@ bool ConstantCoalescing::CheckForAliasingWrites(
         {
             return true;
         }
+        // Treat all calls to user functions that can write to memory as if they
+        // could change results of subsequent loads.
+        if (isUserFunctionCall(inst) && inst->mayWriteToMemory())
+        {
+            return true;
+        }
+
         if (!inst->mayWriteToMemory())
         {
             return false;
@@ -2558,6 +2598,7 @@ bool ConstantCoalescing::CheckForAliasingWrites(
         if (writeAccessType != STATELESS &&
             writeAccessType != UAV &&
             writeAccessType != BINDLESS &&
+            writeAccessType != BINDLESS_WRITEONLY &&
             writeAccessType != SSH_BINDLESS)
         {
             return false;

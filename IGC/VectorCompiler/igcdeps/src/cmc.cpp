@@ -380,6 +380,7 @@ void CMKernel::createPointerGlobalAnnotation(const KernelArgInfo &ArgInfo,
   const auto BTI = ArgInfo.getBTI();
   const auto Size = ArgInfo.getSizeInBytes();
   const auto SourceOffset = ArgInfo.getOffsetInArg();
+  const bool IsLinearization = SourceOffset != 0 || ArgInfo.getArgNo() != Index;
 
   auto PtrAnnotation = std::make_unique<PointerArgumentAnnotation>();
 
@@ -398,24 +399,24 @@ void CMKernel::createPointerGlobalAnnotation(const KernelArgInfo &ArgInfo,
 
   PreDefinedAttrGetter::ArgAddrMode ZeAddrMode;
   if (AddrMode == ArgAddressMode::Bindless) {
-    IGC_ASSERT(SourceOffset == 0);
+    IGC_ASSERT(!IsLinearization);
     ZeAddrMode = PreDefinedAttrGetter::ArgAddrMode::bindless;
   } else if (AddrMode == ArgAddressMode::Stateful) {
-    IGC_ASSERT(SourceOffset == 0);
+    IGC_ASSERT(!IsLinearization);
     ZeAddrMode = PreDefinedAttrGetter::ArgAddrMode::stateful;
   } else {
     IGC_ASSERT(AddrMode == ArgAddressMode::Stateless);
     ZeAddrMode = PreDefinedAttrGetter::ArgAddrMode::stateless;
   }
 
-  if (SourceOffset == 0) {
-    ZEInfoBuilder::addPayloadArgumentByPointer(
-        m_kernelInfo.m_zePayloadArgs, Offset, Size, Index, ZeAddrMode,
-        PreDefinedAttrGetter::ArgAddrSpace::global, getZEArgAccessType(Access));
-  } else { // Pass the argument as by_value with is_ptr = true
+  if (IsLinearization) { // Pass the argument as by_value with is_ptr = true
     IGC_ASSERT(AddrMode == ArgAddressMode::Stateless);
     ZEInfoBuilder::addPayloadArgumentByValue(
         m_kernelInfo.m_zePayloadArgs, Offset, Size, Index, SourceOffset, true);
+  } else {
+    ZEInfoBuilder::addPayloadArgumentByPointer(
+        m_kernelInfo.m_zePayloadArgs, Offset, Size, Index, ZeAddrMode,
+        PreDefinedAttrGetter::ArgAddrSpace::global, getZEArgAccessType(Access));
   }
 
   if (AddrMode == ArgAddressMode::Stateful)
@@ -826,11 +827,13 @@ static void setExecutionInfo(const GenXOCLRuntimeInfo::KernelInfo &BackendInfo,
   ExecEnv.HasBarriers = BackendInfo.getNumBarriers();
   ExecEnv.HasSample = BackendInfo.usesSample();
   ExecEnv.HasDPAS = BackendInfo.usesDPAS();
+  ExecEnv.DisableMidThreadPreemption = BackendInfo.disableMidThreadPreemption();
   ExecEnv.numThreads = BackendInfo.getNumThreads();
   ExecEnv.HasReadWriteImages = BackendInfo.usesReadWriteImages();
   ExecEnv.SubgroupIndependentForwardProgressRequired = true;
   ExecEnv.NumGRFRequired = JitterInfo.stats.numGRFTotal;
   ExecEnv.RequireDisableEUFusion = BackendInfo.requireDisableEUFusion();
+  ExecEnv.IndirectStatelessCount = BackendInfo.getIndirectCount();
 
   // Allocate spill-fill buffer
   if (JitterInfo.hasStackcalls) {
@@ -997,7 +1000,8 @@ getDataAnnotation(const GenXOCLRuntimeInfo::DataInfo &Data) {
 static void
 fillOCLProgramInfo(IGC::SOpenCLProgramInfo &ProgramInfo,
                    const GenXOCLRuntimeInfo::ModuleInfoT &ModuleInfo,
-                   bool HasCrossThreadOffsetRelocations) {
+                   bool HasCrossThreadOffsetRelocations,
+                   bool HasPerThreadOffsetRelocations) {
   auto ConstantAnnotation = getDataAnnotation<iOpenCL::InitConstantAnnotation>(
       ModuleInfo.Constant.Data);
   if (ConstantAnnotation)
@@ -1033,6 +1037,7 @@ fillOCLProgramInfo(IGC::SOpenCLProgramInfo &ProgramInfo,
       ModuleInfo.ConstString.Relocations.empty(),
       "relocations inside constant string section are not supported");
   ProgramInfo.m_hasCrossThreadOffsetRelocations = HasCrossThreadOffsetRelocations;
+  ProgramInfo.m_hasPerThreadOffsetRelocations  = HasPerThreadOffsetRelocations;
 };
 
 void vc::createBinary(
@@ -1045,5 +1050,6 @@ void vc::createBinary(
     CMProgram.m_kernels.push_back(std::move(K));
   }
   fillOCLProgramInfo(*CMProgram.m_programInfo, CompiledModule.ModuleInfo,
-      CMProgram.HasCrossThreadOffsetRelocations());
+      CMProgram.HasCrossThreadOffsetRelocations(),
+      CMProgram.HasPerThreadOffsetRelocations());
 }

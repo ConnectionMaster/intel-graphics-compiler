@@ -27,32 +27,32 @@ set(CODEGEN_SOURCES
   GenXAlignmentInfo.cpp
   GenXAnalysisDumper.cpp
   GenXArgIndirection.cpp
+  GenXBFloatLowering.cpp
   GenXBaling.cpp
   GenXBiFPrepare.cpp
-  GenXBFloatLowering.cpp
   GenXBuiltinFunctions.cpp
   GenXCFSimplification.cpp
   GenXCategory.cpp
   GenXCisaBuilder.cpp
   GenXCoalescing.cpp
   GenXConstants.cpp
+  GenXCountIndirectStateless.cpp
   GenXDeadVectorRemoval.cpp
   GenXDebugInfo.cpp
   GenXDebugLegalization.cpp
   GenXDepressurizer.cpp
+  GenXDetectPointerArg.cpp
   GenXEmulate.cpp
   GenXExtractVectorizer.cpp
   GenXFixInvalidFuncName.cpp
   GenXFloatControl.cpp
-  GenXLegalizeGVLoadUses.cpp
   GenXGASCastAnalyzer.cpp
   GenXGASDynamicResolution.cpp
   GenXGEPLowering.cpp
+  GenXGVClobberChecker.cpp
+  GenXGlobalUniform.cpp
   GenXGlobalValueLowering.cpp
   GenXGotoJoin.cpp
-  GenXGVClobberChecker.cpp
-  GenXVerify.cpp
-  GenXVerify_Regioning.cpp
   GenXIMadPostLegalization.cpp
   GenXInitBiFConstants.cpp
   GenXInlineAsmLowering.cpp
@@ -87,9 +87,9 @@ set(CODEGEN_SOURCES
   GenXRegionCollapsing.cpp
   GenXRegionUtils.cpp
   GenXRematerialization.cpp
+  GenXSLMResolution.cpp
   GenXSimdCFConformance.cpp
   GenXSimdCFRegion.cpp
-  GenXSLMResolution.cpp
   GenXStackUsage.cpp
   GenXStructSplitter.cpp
   GenXSubtarget.cpp
@@ -99,11 +99,11 @@ set(CODEGEN_SOURCES
   GenXUtil.cpp
   GenXVectorCombiner.cpp
   GenXVectorDecomposer.cpp
+  GenXVerify.cpp
+  GenXVerify_Regioning.cpp
   GenXVisa.cpp
   GenXVisaRegAlloc.cpp
   OCLRuntimeInfoPrinter.cpp
-  GenXGlobalUniform.cpp
-  GenXDetectPointerArg.cpp
 )
 
 add_library(VCCodeGen STATIC ${CODEGEN_SOURCES})

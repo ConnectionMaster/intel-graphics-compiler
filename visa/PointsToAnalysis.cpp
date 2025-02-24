@@ -18,7 +18,8 @@ PointsToAnalysis::PointsToAnalysis(const DECLARE_LIST &declares,
   for (auto decl : declares) {
     if ((decl->getRegFile() == G4_ADDRESS || decl->getRegFile() == G4_SCALAR) &&
         !decl->getAliasDeclare()) {
-      regVars.emplace(decl->getRegVar(), regVars.size());
+      auto regVarsSize = (unsigned)regVars.size();
+      regVars.emplace(decl->getRegVar(), regVarsSize);
     }
   }
 
@@ -286,6 +287,14 @@ void PointsToAnalysis::doPointsToAnalysis(FlowGraph &fg) {
           // It excludes the case where dst address register uses Type_UD as
           // that indicates msg descriptor initialization.
           if (inst->isMov() || inst->isPseudoAddrMovIntrinsic()) {
+            // PseudoAddrMoveIntrinsic may appear in G4 IR as:
+            // intrinsic.pseudo_addr_mov (1)  s0.0<1>:uq  &CCTuple+0 &CCTuple+64
+            // &M2+128  &M2+192  &M2+256  &M2+320  &CCTuple+0  &CCTuple+64
+            //
+            // Address of several general variables is taken and written to s0.0
+            // for use in sendi.
+            //
+            // We need to mark s0.0 -> [CCTuple, M2] in points-to set.
             for (int i = 0; i < inst->getNumSrc(); i++) {
               G4_Operand *src = inst->getSrc(i);
               if (!src || src->isNullReg()) {
@@ -626,13 +635,14 @@ void PointsToAnalysis::doPointsToAnalysis(FlowGraph &fg) {
 void PointsToAnalysis::insertAndMergeFilledAddr(const G4_RegVar *addr1,
                                               G4_RegVar *a2) {
   G4_RegVar *addr2 = getRootRegVar(a2);
+  auto regVarsSize = (unsigned)regVars.size();
   vISA_ASSERT(
-      regVars.size() == numAddrs,
+      regVarsSize == numAddrs,
       "Inconsistency found between size of regvars and number of addr vars");
 
   resizePointsToSet(numAddrs + 1);
   // add2 is the new one
-  regVars.emplace(addr2, regVars.size());
+  regVars.emplace(addr2, regVarsSize);
 
   mergePointsToSet(addr1, addr2);
 }

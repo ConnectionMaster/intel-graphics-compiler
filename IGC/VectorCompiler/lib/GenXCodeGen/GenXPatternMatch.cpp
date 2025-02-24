@@ -1,6 +1,6 @@
 /*========================== begin_copyright_notice ============================
 
-Copyright (C) 2017-2024 Intel Corporation
+Copyright (C) 2017-2025 Intel Corporation
 
 SPDX-License-Identifier: MIT
 
@@ -90,6 +90,7 @@ SPDX-License-Identifier: MIT
 #include "IGC/common/StringMacros.hpp"
 #include "IGC/common/debug/DebugMacros.hpp"
 
+#include <cmath>
 #include <functional>
 #include <limits>
 #include <optional>
@@ -1432,14 +1433,7 @@ bool GenXPatternMatch::foldBoolAnd(Instruction *Inst) {
     return false; // too small
   if (!Inst->hasOneUse())
     return false; // more than one use
-  auto user = cast<Instruction>(Inst->use_begin()->getUser());
-  if (user && user->getOperand(1)) {
-    auto *Ty = user->getOperand(1)->getType();
-    auto *DTy = dyn_cast<IGCLLVM::FixedVectorType>(Ty);
-    if (!DTy || (DTy->getNumElements() == 1))
-      return false;
-  } else
-    return false;
+  auto *user = cast<Instruction>(Inst->use_begin()->getUser());
 
   if (auto Sel = dyn_cast<SelectInst>(user)) {
     // Fold and into sel.
@@ -4167,6 +4161,17 @@ bool GenXPatternMatch::placeConstants(Function *F) {
           continue;
         if (opMustBeConstant(Inst, i))
           continue;
+
+        // Match `addrspacecast (Ty1 null to Ty2)` pattern to `null`
+        if (auto *Const = dyn_cast<ConstantExpr>(C); Const && Const->isCast()) {
+          auto *NullVal = dyn_cast<Constant>(Const->getOperand(0));
+          if (NullVal && NullVal->isNullValue()) {
+            auto *Ty = cast<PointerType>(Const->getType());
+            auto *NewConst = llvm::ConstantPointerNull::get(Ty);
+            Inst->setOperand(i, NewConst);
+            Changed = true;
+          }
+        }
         auto Ty = C->getType();
         if (!Ty->isVectorTy() || C->getSplatValue())
           continue;

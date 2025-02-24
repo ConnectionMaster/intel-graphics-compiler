@@ -386,7 +386,7 @@ namespace IGC
         VISA_PredOpnd* predOpnd = GetFlagOperand(m_encoderState.m_flag);
         // control flow instructions cannot be broken down into lower SIMD
         VISA_EMask_Ctrl emask = m_encoderState.m_noMask ? vISA_EMASK_M1_NM : vISA_EMASK_M1;
-        VISA_Exec_Size execSize = visaExecSize(m_program->m_dispatchSize);
+        VISA_Exec_Size execSize = visaExecSize(m_program->m_State.m_dispatchSize);
         if (F->hasFnAttribute("KMPLOCK"))
         {
             emask = vISA_EMASK_M1_NM;
@@ -402,7 +402,7 @@ namespace IGC
         VISA_PredOpnd* predOpnd = GetFlagOperand(m_encoderState.m_flag);
         // control flow instructions cannot be broken down into lower SIMD
         VISA_EMask_Ctrl emask = m_encoderState.m_noMask ? vISA_EMASK_M1_NM : vISA_EMASK_M1;
-        VISA_Exec_Size execSize = visaExecSize(m_program->m_dispatchSize);
+        VISA_Exec_Size execSize = visaExecSize(m_program->m_State.m_dispatchSize);
         V(vKernel->AppendVISACFFunctionCallInst(predOpnd, emask, execSize, F->getName().data(), argSize, retSize));
     }
 
@@ -412,7 +412,7 @@ namespace IGC
         VISA_PredOpnd* predOpnd = GetFlagOperand(m_encoderState.m_flag);
         // control flow instructions cannot be broken down into lower SIMD
         VISA_EMask_Ctrl emask = m_encoderState.m_noMask ? vISA_EMASK_M1_NM : vISA_EMASK_M1;
-        VISA_Exec_Size execSize = visaExecSize(m_program->m_dispatchSize);
+        VISA_Exec_Size execSize = visaExecSize(m_program->m_State.m_dispatchSize);
         VISA_VectorOpnd* funcAddrOpnd = GetSourceOperandNoModifier(funcPtr);
         V(vKernel->AppendVISACFIndirectFuncCallInst(
             predOpnd, emask, execSize,
@@ -426,7 +426,7 @@ namespace IGC
         VISA_PredOpnd* predOpnd = GetFlagOperand(m_encoderState.m_flag);
         // control flow instructions cannot be broken down into lower SIMD
         VISA_EMask_Ctrl emask = m_encoderState.m_noMask ? vISA_EMASK_M1_NM : vISA_EMASK_M1;
-        VISA_Exec_Size execSize = visaExecSize(m_program->m_dispatchSize);
+        VISA_Exec_Size execSize = visaExecSize(m_program->m_State.m_dispatchSize);
         if (F->hasFnAttribute("KMPLOCK"))
         {
             emask = vISA_EMASK_M1_NM;
@@ -441,7 +441,7 @@ namespace IGC
         VISA_PredOpnd* predOpnd = GetFlagOperand(m_encoderState.m_flag);
         // control flow instructions cannot be broken down into lower SIMD
         VISA_EMask_Ctrl emask = m_encoderState.m_noMask ? vISA_EMASK_M1_NM : vISA_EMASK_M1;
-        VISA_Exec_Size execSize = visaExecSize(m_program->m_dispatchSize);
+        VISA_Exec_Size execSize = visaExecSize(m_program->m_State.m_dispatchSize);
         V(vKernel->AppendVISACFFunctionRetInst(predOpnd, emask, execSize));
     }
 
@@ -452,7 +452,7 @@ namespace IGC
         VISA_PredOpnd* predOpnd = GetFlagOperand(m_encoderState.m_flag);
         // control flow instructions cannot be broken down into lower SIMD
         VISA_EMask_Ctrl emask = m_encoderState.m_noMask ? vISA_EMASK_M1_NM : vISA_EMASK_M1;
-        VISA_Exec_Size execSize = visaExecSize(m_program->m_dispatchSize);
+        VISA_Exec_Size execSize = visaExecSize(m_program->m_State.m_dispatchSize);
 
         // visa and igc agreement.
         //    goto (1) is used to tell visa the goto is uniform.
@@ -1573,7 +1573,7 @@ namespace IGC
             IGC_ASSERT(dst->GetVarType() == EVARTYPE_PREDICATE);
             V(vKernel->AppendVISASetP(
                 GetAluEMask(dst),
-                IsSecondHalf() ? GetAluExecSize(dst) : visaExecSize(m_program->m_dispatchSize),
+                IsSecondHalf() ? GetAluExecSize(dst) : visaExecSize(m_program->m_State.m_dispatchSize),
                 dst->visaPredVariable,
                 GetSourceOperand(src, m_encoderState.m_srcOperand[0])));
         }
@@ -3219,6 +3219,9 @@ namespace IGC
         case IGFX_XE2_HPG_CORE:
             return Xe2;
             // fall-through
+        case IGFX_XE3_CORE:
+            return Xe3;
+            // fall-through
         default:
             IGC_ASSERT_MESSAGE(0, "unsupported platform");
             break;
@@ -4141,19 +4144,19 @@ namespace IGC
                 // ToDo: tune the threshold
                 if (m_program->m_Platform->getGRFSize() >= 64)
                 {
-                    if (m_program->m_dispatchSize == SIMDMode::SIMD16)
-                         SaveOption(vISA_AbortOnSpillThreshold, GetSpillThreshold(m_program->m_dispatchSize) * 4);
-                    else if (m_program->m_dispatchSize == SIMDMode::SIMD32)
-                        SaveOption(vISA_AbortOnSpillThreshold, GetSpillThreshold(m_program->m_dispatchSize) * 4);
+                    if (m_program->m_State.m_dispatchSize == SIMDMode::SIMD16)
+                         SaveOption(vISA_AbortOnSpillThreshold, GetSpillThreshold(m_program->m_State.m_dispatchSize) * 4);
+                    else if (m_program->m_State.m_dispatchSize == SIMDMode::SIMD32)
+                        SaveOption(vISA_AbortOnSpillThreshold, GetSpillThreshold(m_program->m_State.m_dispatchSize) * 4);
                 }
                 else
                 {
-                    if (m_program->m_dispatchSize == SIMDMode::SIMD8)
-                        SaveOption(vISA_AbortOnSpillThreshold, GetSpillThreshold(m_program->m_dispatchSize) * 2);
-                    else if (m_program->m_dispatchSize == SIMDMode::SIMD16)
-                        SaveOption(vISA_AbortOnSpillThreshold, GetSpillThreshold(m_program->m_dispatchSize) * 2);
+                    if (m_program->m_State.m_dispatchSize == SIMDMode::SIMD8)
+                        SaveOption(vISA_AbortOnSpillThreshold, GetSpillThreshold(m_program->m_State.m_dispatchSize) * 2);
+                    else if (m_program->m_State.m_dispatchSize == SIMDMode::SIMD16)
+                        SaveOption(vISA_AbortOnSpillThreshold, GetSpillThreshold(m_program->m_State.m_dispatchSize) * 2);
                     else
-                        SaveOption(vISA_AbortOnSpillThreshold, GetSpillThreshold(m_program->m_dispatchSize) * 2);
+                        SaveOption(vISA_AbortOnSpillThreshold, GetSpillThreshold(m_program->m_State.m_dispatchSize) * 2);
                 }
             }
             break;
@@ -4164,25 +4167,25 @@ namespace IGC
                 if (m_program->m_Platform->getGRFSize() >= 64)
                 {
                     // increase the threshold for small shaders
-                    if (m_program->m_dispatchSize == SIMDMode::SIMD32 &&
+                    if (m_program->m_State.m_dispatchSize == SIMDMode::SIMD32 &&
                         context->m_instrTypes.numAllInsts < IGC_GET_FLAG_VALUE(CSSIMD32_HighThresholdInstCount))
                     {
-                        SaveOption(vISA_AbortOnSpillThreshold, GetSpillThreshold(m_program->m_dispatchSize) * 6);
+                        SaveOption(vISA_AbortOnSpillThreshold, GetSpillThreshold(m_program->m_State.m_dispatchSize) * 6);
                     }
                     else
                     {
-                        if (m_program->m_dispatchSize == SIMDMode::SIMD16)
-                            SaveOption(vISA_AbortOnSpillThreshold, GetSpillThreshold(m_program->m_dispatchSize) * 4);
-                        else if (m_program->m_dispatchSize == SIMDMode::SIMD32)
-                            SaveOption(vISA_AbortOnSpillThreshold, GetSpillThreshold(m_program->m_dispatchSize) * 4);
+                        if (m_program->m_State.m_dispatchSize == SIMDMode::SIMD16)
+                            SaveOption(vISA_AbortOnSpillThreshold, GetSpillThreshold(m_program->m_State.m_dispatchSize) * 4);
+                        else if (m_program->m_State.m_dispatchSize == SIMDMode::SIMD32)
+                            SaveOption(vISA_AbortOnSpillThreshold, GetSpillThreshold(m_program->m_State.m_dispatchSize) * 4);
                     }
                 }
                 else
                 {
-                    if (m_program->m_dispatchSize == SIMDMode::SIMD16)
-                        SaveOption(vISA_AbortOnSpillThreshold, GetSpillThreshold(m_program->m_dispatchSize) * 2);
-                    else if (m_program->m_dispatchSize == SIMDMode::SIMD32)
-                        SaveOption(vISA_AbortOnSpillThreshold, GetSpillThreshold(m_program->m_dispatchSize) * 2);
+                    if (m_program->m_State.m_dispatchSize == SIMDMode::SIMD16)
+                        SaveOption(vISA_AbortOnSpillThreshold, GetSpillThreshold(m_program->m_State.m_dispatchSize) * 2);
+                    else if (m_program->m_State.m_dispatchSize == SIMDMode::SIMD32)
+                        SaveOption(vISA_AbortOnSpillThreshold, GetSpillThreshold(m_program->m_State.m_dispatchSize) * 2);
                 }
             }
             break;
@@ -4194,17 +4197,17 @@ namespace IGC
             {
                 if (m_program->m_Platform->getGRFSize() >= 64)
                 {
-                    if (m_program->m_dispatchSize == SIMDMode::SIMD8)
-                        SaveOption(vISA_AbortOnSpillThreshold, GetSpillThreshold(m_program->m_dispatchSize) * 2);
-                    else if (m_program->m_dispatchSize == SIMDMode::SIMD16)
-                        SaveOption(vISA_AbortOnSpillThreshold, GetSpillThreshold(m_program->m_dispatchSize) * 4);
-                    else if (m_program->m_dispatchSize == SIMDMode::SIMD32)
-                        SaveOption(vISA_AbortOnSpillThreshold, GetSpillThreshold(m_program->m_dispatchSize) * 4);
+                    if (m_program->m_State.m_dispatchSize == SIMDMode::SIMD8)
+                        SaveOption(vISA_AbortOnSpillThreshold, GetSpillThreshold(m_program->m_State.m_dispatchSize) * 2);
+                    else if (m_program->m_State.m_dispatchSize == SIMDMode::SIMD16)
+                        SaveOption(vISA_AbortOnSpillThreshold, GetSpillThreshold(m_program->m_State.m_dispatchSize) * 4);
+                    else if (m_program->m_State.m_dispatchSize == SIMDMode::SIMD32)
+                        SaveOption(vISA_AbortOnSpillThreshold, GetSpillThreshold(m_program->m_State.m_dispatchSize) * 4);
                 }
                 else
                 {
-                    if (m_program->m_dispatchSize == SIMDMode::SIMD8)
-                        SaveOption(vISA_AbortOnSpillThreshold, GetSpillThreshold(m_program->m_dispatchSize) * 2);
+                    if (m_program->m_State.m_dispatchSize == SIMDMode::SIMD8)
+                        SaveOption(vISA_AbortOnSpillThreshold, GetSpillThreshold(m_program->m_State.m_dispatchSize) * 2);
                 }
             }
             break;
@@ -4344,11 +4347,10 @@ namespace IGC
 
         CodeGenContext* pCtx = m_program->GetContext();
         bool needsDenormRetainForMathInstructions =
-            (context->type != ShaderType::OPENCL_SHADER) &&
-            ((pCtx->m_floatDenormMode16 == FLOAT_DENORM_FLUSH_TO_ZERO) ||
+             (pCtx->m_floatDenormMode16 == FLOAT_DENORM_FLUSH_TO_ZERO) ||
              (pCtx->m_floatDenormMode32 == FLOAT_DENORM_FLUSH_TO_ZERO) ||
              (pCtx->m_floatDenormMode64 == FLOAT_DENORM_FLUSH_TO_ZERO) ||
-             (pCtx->m_floatDenormModeBFTF == FLOAT_DENORM_FLUSH_TO_ZERO));
+             (m_program->m_Platform->hasBFTFDenormMode() && pCtx->m_floatDenormModeBFTF == FLOAT_DENORM_FLUSH_TO_ZERO);
 
         if (m_program->m_Platform->hasCorrectlyRoundedMacros() && needsDenormRetainForMathInstructions)
         {
@@ -4424,12 +4426,15 @@ namespace IGC
                 return true;
 
             // API check.
-            bool enableForRetey = m_program->m_DriverInfo->enableVISAPreRASchedulerForRetry() ||
+            bool enableForRetry = m_program->m_DriverInfo->enableVISAPreRASchedulerForRetry() ||
                 context->m_retryManager.AllowVISAPreRAScheduler();
+            // PreRA scheduler runs always when VRT is enabled
+            enableForRetry |= m_program->m_Platform->supportsVRT() && m_program->m_DriverInfo->supportsVRT() &&
+                (context->getModuleMetaData()->compOpt.EnableVRT || IGC_IS_FLAG_ENABLED(EnableVRT));
 
             if (IGC_IS_FLAG_ENABLED(EnableVISAPreSched) &&
                 m_program->m_DriverInfo->enableVISAPreRAScheduler() &&
-                enableForRetey)
+                enableForRetry)
                 return true;
 
             return false;
@@ -4445,7 +4450,7 @@ namespace IGC
             else
             {
                 uint32_t V = m_program->m_DriverInfo->getVISAPreRASchedulerCtrl();
-                if (context->type == ShaderType::TASK_SHADER || m_program->GetHasDPAS())
+                if (context->type == ShaderType::TASK_SHADER || m_program->m_State.GetHasDPAS())
                 {
                     V = 4; // register pressure only
                 }
@@ -4547,6 +4552,14 @@ namespace IGC
             SaveOption(vISA_ActiveThreadsOnlyBarrier, true);
         }
 
+        if (m_program->m_Platform->isCoreChildOf(IGFX_XE3_CORE))
+        {
+            if (uint Val = IGC_GET_FLAG_VALUE(VISASpillAllowed))
+            {
+                context->m_spillAllowed = Val;
+                SaveOption(vISA_SpillAllowed, Val);
+            }
+        }
         bool r0Reserved = false;
         if ((context->type == ShaderType::OPENCL_SHADER || context->type == ShaderType::COMPUTE_SHADER
             || context->type == ShaderType::RAYTRACING_SHADER) &&
@@ -4654,7 +4667,7 @@ namespace IGC
             }
         }
 
-        if (m_program->m_Platform->hasFusedEU() && IGC_IS_FLAG_ENABLED(EnableCallWA))
+        if (m_program->m_Platform->hasFusedEU() && !pCtx->getModuleMetaData()->compOpt.DisableEUFusion && IGC_IS_FLAG_ENABLED(EnableCallWA))
         {
             bool forceNoWA = false;
             if (context->type == ShaderType::OPENCL_SHADER) {
@@ -4880,13 +4893,18 @@ namespace IGC
                 }
             }
         } else { // Other shader types
-            if (IGC_GET_FLAG_VALUE(ForceHWThreadNumberPerEU) != 0) {
+            if (IGC_GET_FLAG_VALUE(ForceHWThreadNumberPerEU) != 0)
+            {
                 SaveOption(vISA_HWThreadNumberPerEU,
                            IGC_GET_FLAG_VALUE(ForceHWThreadNumberPerEU));
-            } else if (m_program->m_Platform->supportsAutoGRFSelection() &&
-                       context->m_DriverInfo.supportsAutoGRFSelection() &&
-                       IGC_IS_FLAG_ENABLED(ForceSupportsAutoGRFSelection)
-                ) {
+            }
+            else if ((m_program->m_Platform->supportsAutoGRFSelection() &&
+                      context->m_DriverInfo.supportsAutoGRFSelection() &&
+                      IGC_IS_FLAG_ENABLED(ForceSupportsAutoGRFSelection)) ||
+                     (m_program->m_Platform->supportsVRT() &&
+                      m_program->m_DriverInfo->supportsVRT() &&
+                      IGC_IS_FLAG_ENABLED(EnableVRT)))
+            {
                 // When user hasn't specified number of threads, we can rely on
                 // compiler heuristics
                 SaveOption(vISA_AutoGRFSelection, true);
@@ -5093,6 +5111,18 @@ namespace IGC
             SaveOption(vISA_Compaction, false);
         }
 
+        if (IGC_IS_FLAG_ENABLED(EnableGatherWithImmPreRA))
+        {
+            SaveOption(vISA_EnableGatherWithImmPreRA,
+                     IGC_GET_FLAG_VALUE(EnableGatherWithImmPreRA));
+        }
+
+        if (IGC_IS_FLAG_ENABLED(EnableIndirectInstStart)) {
+          SaveOption(vISA_IndirectInstStart,
+                     IGC_GET_FLAG_VALUE(EnableIndirectInstStart));
+          SaveOption(vISA_IndirectInstEnd,
+                     IGC_GET_FLAG_VALUE(EnableIndirectInstEnd));
+        }
 
         if (IGC_IS_FLAG_ENABLED(EnableGroupScheduleForBC))
         {
@@ -5247,7 +5277,7 @@ namespace IGC
         //  more investigation needs to be done on whether simply replacing sr0.2 with sr0.3 is enough.
         if (IGC_IS_FLAG_ENABLED(EnableSendFusion) &&
             m_program->GetContext()->platform.supportSplitSend() &&
-            m_program->m_dispatchSize == SIMDMode::SIMD8 &&
+            m_program->m_State.m_dispatchSize == SIMDMode::SIMD8 &&
             (IGC_GET_FLAG_VALUE(EnableSendFusion) == FLAG_LEVEL_2 ||   // 2: force send fusion
                 context->m_DriverInfo.AllowSendFusion()))
         {
@@ -5360,6 +5390,10 @@ namespace IGC
             SaveOption(vISA_EnableProgrammableOffsetsMessageBitInHeader, true);
         }
 
+        if (uint32_t Val = IGC_GET_FLAG_VALUE(EnableScalarPipe))
+        {
+            SaveOption(vISA_ScalarPipe, Val);
+        }
         if (IGC_IS_FLAG_ENABLED(NewSpillCostFunction) ||
             context->getCompilerOption().NewSpillCostFunction ||
             ( context->type == ShaderType::COMPUTE_SHADER &&
@@ -5642,7 +5676,7 @@ namespace IGC
     void CEncoder::SetDispatchSimdSize()
     {
         IGC_ASSERT(nullptr != vKernel);
-        uint8_t dispatchSIMD = (uint8_t)numLanes(m_program->m_dispatchSize);
+        uint8_t dispatchSIMD = (uint8_t)numLanes(m_program->m_State.m_dispatchSize);
         V(vKernel->AddKernelAttribute("SimdSize", sizeof(dispatchSIMD), &dispatchSIMD));
     }
 
@@ -5870,6 +5904,30 @@ namespace IGC
                 }
             }
         }
+        else if (var->GetSingleInstanceAlias() != NULL)
+        {
+            CVariable* singleInstanceVar = var->GetSingleInstanceAlias();
+            IGC_ASSERT(singleInstanceVar->GetNumberInstance() == 1);
+            IGC_ASSERT((singleInstanceVar->GetNumberElement() % var->GetNumberInstance()) == 0);
+            IGC_ASSERT(singleInstanceVar->GetNumberElement() == var->GetNumberElement() * var->GetNumberInstance());
+            for (uint i = 0; i < var->GetNumberInstance(); i++)
+            {
+                // Multi-instance aliases use VISA offset mechanism for the
+                // second instance.
+                int instanceOffset =
+                    i * var->GetNumberElement() *
+                    CEncoder::GetCISADataTypeSize(var->GetType());
+
+                V(vKernel->CreateVISAGenVar(
+                    var->visaGenVariable[i],
+                    var->getVisaCString(),
+                    var->GetNumberElement(),
+                    var->GetType(),
+                    GetVISAAlign(singleInstanceVar), // Use parent's align as we create an alias of the parent.
+                    singleInstanceVar->visaGenVariable[0],
+                    instanceOffset));
+            }
+        }
         else
         {
             uint num_elts = var->GetNumberElement();
@@ -5908,8 +5966,11 @@ namespace IGC
     void CEncoder::DeclareInput(CVariable* var, uint offset, uint instance)
     {
         // Avoid declaring more inputs/outputs than available registers
-        if (offset + var->GetSize() >= vKernel->getNumRegTotal() * getGRFSize())
+        if (offset + var->GetSize() >= m_program->m_Platform->getMaxNumGRF(m_program->GetShaderType()) * getGRFSize())
+        {
+            IGC_ASSERT(0);
             return;
+        }
         V(vKernel->CreateVISAInputVar(
             var->visaGenVariable[instance],
             int_cast<unsigned short>(offset),
@@ -5919,8 +5980,11 @@ namespace IGC
     void CEncoder::DeclarePred(CVariable * var, uint offset)
     {
         // Avoid declaring more inputs/outputs than available registers
-        if (offset + var->GetSize() >= vKernel->getNumRegTotal() * getGRFSize())
+        if (offset + var->GetSize() >= m_program->m_Platform->getMaxNumGRF(m_program->GetShaderType()) * getGRFSize())
+        {
+            IGC_ASSERT(0);
             return;
+        }
         V(vKernel->CreateVISAPredVar(
             var->visaPredVariable,
             "",
@@ -5981,7 +6045,7 @@ namespace IGC
                 auto [symStr, fName, vecLen] = IGC::ParseVectorVariantFunctionString(F.getName());
 
                 Function* VFDef = pModule->getFunction(fName);
-                if (VFDef && numLanes(m_program->m_dispatchSize) == vecLen)
+                if (VFDef && numLanes(m_program->m_State.m_dispatchSize) == vecLen)
                 {
                     auto Iter = stackFuncMap.find(VFDef);
                     IGC_ASSERT_MESSAGE(Iter != stackFuncMap.end(), "vISA function not found");
@@ -6155,9 +6219,6 @@ namespace IGC
                 else {
                     if (modMD->stringConstants.count(G))
                     {
-                        ConstantDataSequential* cds = dyn_cast<ConstantDataSequential>(G->getInitializer());
-                        IGC_ASSERT(cds && (cds->isCString() || cds->isString()));
-                        (void) cds;
                         programSyms.globalStringConst.emplace_back((vISA::GenSymType)symbolEntry.s_type, symbolEntry.s_offset, symbolEntry.s_size, G->getName().str());
                     }
                     else
@@ -6379,6 +6440,7 @@ namespace IGC
         bool vISAAsmParseError = false;
         // Parse the generated VISA text
         if (visaAsmOverride) {
+            vAsmTextBuilder->SetOption(vISA_ParseBuildOptions, true);
             for (const std::string &tmpVisaFile : visaOverrideFiles) {
                 llvm::SmallVector<char, 1024> visaAsmNameVector;
                 std::string visaAsmName = GetDumpFileName("");
@@ -6400,6 +6462,7 @@ namespace IGC
                     break;
                 }
             }
+            vAsmTextBuilder->SetOption(vISA_ParseBuildOptions, false);
         } else {
             int result = 0;
             if (m_hasInlineAsm) {
@@ -6501,15 +6564,15 @@ namespace IGC
             emitVisaOnly = cl_context->m_InternalOptions.EmitVisaOnly;
         }
 
-        if (m_program->m_dispatchSize == SIMDMode::SIMD8)
+        if (m_program->m_State.m_dispatchSize == SIMDMode::SIMD8)
         {
             MEM_SNAPSHOT(IGC::SMS_AFTER_CISACreateDestroy_SIMD8);
         }
-        else if (m_program->m_dispatchSize == SIMDMode::SIMD16)
+        else if (m_program->m_State.m_dispatchSize == SIMDMode::SIMD16)
         {
             MEM_SNAPSHOT(IGC::SMS_AFTER_CISACreateDestroy_SIMD16);
         }
-        else if (m_program->m_dispatchSize == SIMDMode::SIMD32)
+        else if (m_program->m_State.m_dispatchSize == SIMDMode::SIMD32)
         {
             MEM_SNAPSHOT(IGC::SMS_AFTER_CISACreateDestroy_SIMD32);
         }
@@ -6573,11 +6636,11 @@ namespace IGC
             if (context->getModuleMetaData()->NBarrierCnt > 0 ||
                 additionalVISAAsmToLink)
             {
-                m_program->SetBarrierNumber(NamedBarriersResolution::AlignNBCnt2BarrierNumber(jitInfo->numBarriers));
+                m_program->m_State.SetBarrierNumber(NamedBarriersResolution::AlignNBCnt2BarrierNumber(jitInfo->numBarriers));
             }
             else
             {
-                m_program->SetHasBarrier();
+                m_program->m_State.SetHasBarrier();
             }
         }
 
@@ -6600,37 +6663,37 @@ namespace IGC
         else if (m_vIsaCompileStatus == VISA_SPILL) // CM early terminates on spill
         {
 #if (GET_SHADER_STATS)
-            if (m_program->m_dispatchSize == SIMDMode::SIMD8)
+            if (m_program->m_State.m_dispatchSize == SIMDMode::SIMD8)
             {
                 COMPILER_SHADER_STATS_SET(m_program->m_shaderStats, STATS_ISA_EARLYEXIT8, 1);
             }
-            else if (m_program->m_dispatchSize == SIMDMode::SIMD16)
+            else if (m_program->m_State.m_dispatchSize == SIMDMode::SIMD16)
             {
                 COMPILER_SHADER_STATS_SET(m_program->m_shaderStats, STATS_ISA_EARLYEXIT16, 1);
             }
-            else if (m_program->m_dispatchSize == SIMDMode::SIMD32)
+            else if (m_program->m_State.m_dispatchSize == SIMDMode::SIMD32)
             {
                 COMPILER_SHADER_STATS_SET(m_program->m_shaderStats, STATS_ISA_EARLYEXIT32, 1);
             }
 #endif
-            context->SetSIMDInfo(SIMD_SKIP_SPILL, m_program->m_dispatchSize, m_program->m_ShaderDispatchMode);
+            context->SetSIMDInfo(SIMD_SKIP_SPILL, m_program->m_State.m_dispatchSize, m_program->m_ShaderDispatchMode);
             // Set spill size despite VISA terminates with VISA_SPILL error code.
             // This member is checked later for OOB scratch.
             m_program->ProgramOutput()->m_scratchSpaceUsedBySpills = jitInfo->stats.spillMemUsed;
             return;
         }
 
-        if (m_program->m_dispatchSize == SIMDMode::SIMD8)
+        if (m_program->m_State.m_dispatchSize == SIMDMode::SIMD8)
         {
             MEM_SNAPSHOT(IGC::SMS_AFTER_vISACompile_SIMD8);
             SimdSize8++;
         }
-        else if (m_program->m_dispatchSize == SIMDMode::SIMD16)
+        else if (m_program->m_State.m_dispatchSize == SIMDMode::SIMD16)
         {
             MEM_SNAPSHOT(IGC::SMS_AFTER_vISACompile_SIMD16);
             SimdSize16++;
         }
-        else if (m_program->m_dispatchSize == SIMDMode::SIMD32)
+        else if (m_program->m_State.m_dispatchSize == SIMDMode::SIMD32)
         {
             MEM_SNAPSHOT(IGC::SMS_AFTER_vISACompile_SIMD32);
             SimdSize32++;
@@ -6645,7 +6708,7 @@ namespace IGC
 
 #if (GET_SHADER_STATS && !PRINT_DETAIL_SHADER_STATS)
         COMPILER_SHADER_STATS_SET(m_program->m_shaderStats, STATS_SAMPLE_BALLOT_LOOPS, m_program->GetNumSampleBallotLoops());
-        if (m_program->m_dispatchSize == SIMDMode::SIMD8)
+        if (m_program->m_State.m_dispatchSize == SIMDMode::SIMD8)
         {
             COMPILER_SHADER_STATS_SET(m_program->m_shaderStats, STATS_ISA_INST_COUNT, jitInfo->stats.numAsmCountUnweighted);
             COMPILER_SHADER_STATS_SET(m_program->m_shaderStats, STATS_ISA_SPILL8, jitInfo->stats.numGRFSpillFillWeighted ? 1 : 0);
@@ -6654,7 +6717,7 @@ namespace IGC
             COMPILER_SHADER_STATS_SET(m_program->m_shaderStats, STATS_GRF_USED_SIMD8, jitInfo->stats.numGRFTotal);
             COMPILER_SHADER_STATS_SET(m_program->m_shaderStats, STATS_GRF_PRESSURE_SIMD8, jitInfo->stats.maxGRFPressure);
         }
-        else if (m_program->m_dispatchSize == SIMDMode::SIMD16)
+        else if (m_program->m_State.m_dispatchSize == SIMDMode::SIMD16)
         {
             COMPILER_SHADER_STATS_SET(m_program->m_shaderStats, STATS_ISA_INST_COUNT_SIMD16, jitInfo->stats.numAsmCountUnweighted);
             COMPILER_SHADER_STATS_SET(m_program->m_shaderStats, STATS_ISA_SPILL16, jitInfo->stats.numGRFSpillFillWeighted ? 1 : 0);
@@ -6663,7 +6726,7 @@ namespace IGC
             COMPILER_SHADER_STATS_SET(m_program->m_shaderStats, STATS_GRF_USED_SIMD16, jitInfo->stats.numGRFTotal);
             COMPILER_SHADER_STATS_SET(m_program->m_shaderStats, STATS_GRF_PRESSURE_SIMD16, jitInfo->stats.maxGRFPressure);
         }
-        else if (m_program->m_dispatchSize == SIMDMode::SIMD32)
+        else if (m_program->m_State.m_dispatchSize == SIMDMode::SIMD32)
         {
             COMPILER_SHADER_STATS_SET(m_program->m_shaderStats, STATS_ISA_INST_COUNT_SIMD32, jitInfo->stats.numAsmCountUnweighted);
             COMPILER_SHADER_STATS_SET(m_program->m_shaderStats, STATS_ISA_SPILL32, jitInfo->stats.numGRFSpillFillWeighted ? 1 : 0);
@@ -6697,12 +6760,46 @@ namespace IGC
             std::string binFileName = name.overridePath();
 
             overrideShaderIGA(context->platform.getPlatformInfo(), genxbin, binSize, binFileName, binOverride);
-
+            if (binOverride && m_enableVISAdump)
+            {
+                // Dump overriden .asm
+                std::ifstream src(binFileName, std::ios::binary | std::ios::in);
+                std::ofstream dst(name.str(), std::ios::binary | std::ios::out);
+                if (src.is_open() && dst.is_open())
+                {
+                    dst << src.rdbuf();
+                    IGC_ASSERT_MESSAGE(dst.good() && src.good(), "Failed dumping overriden .asm");
+                    src.close();
+                    dst.close();
+                }
+                // Dump created binary
+                Debug::DumpName datName = IGC::Debug::GetDumpNameObj(m_program, "dat");
+                dst.open(datName.str(), std::ios::binary | std::ios::out);
+                if (dst.is_open())
+                {
+                    dst.write(reinterpret_cast<const char*>(genxbin), binSize);
+                    IGC_ASSERT_MESSAGE(dst.good(), "Failed dumping .dat generated from override");
+                    dst.close();
+                }
+            }
             if (!binOverride)
             {
                 name = IGC::Debug::GetDumpNameObj(m_program, "dat");
                 binFileName = name.overridePath();
                 overrideShaderBinary(genxbin, binSize, binFileName, binOverride);
+                if (binOverride && m_enableVISAdump)
+                {
+                    // Dump overriden .dat
+                    std::ifstream src(binFileName, std::ios::binary | std::ios::in);
+                    std::ofstream dst(name.str(), std::ios::binary | std::ios::out);
+                    if (src.is_open() && dst.is_open())
+                    {
+                        dst << src.rdbuf();
+                        IGC_ASSERT_MESSAGE(dst.good() && src.good(), "Failed dumping overriden .dat");
+                        src.close();
+                        dst.close();
+                    }
+                }
             }
 
         }
@@ -6750,12 +6847,15 @@ namespace IGC
                 if (dbgSize > 0)
                 {
                     // dump dbg file only if it not empty
-                    std::string debugFileNameStr = IGC::Debug::GetDumpName(m_program, "dbg");
-                    FILE* const dbgFile = fopen(debugFileNameStr.c_str(), "wb+");
-                    if (nullptr != dbgFile)
+                    auto debugFileNameObj = IGC::Debug::GetDumpNameObj(m_program, "dbg");
+                    if (debugFileNameObj.allow())
                     {
-                        fwrite(genxdbgInfo, dbgSize, 1, dbgFile);
-                        fclose(dbgFile);
+                        FILE* const dbgFile = fopen(debugFileNameObj.str().c_str(), "wb+");
+                        if (nullptr != dbgFile)
+                        {
+                            fwrite(genxdbgInfo, dbgSize, 1, dbgFile);
+                            fclose(dbgFile);
+                        }
                     }
                 }
             }
@@ -6866,7 +6966,11 @@ namespace IGC
                     IGC_ASSERT(context->type == ShaderType::OPENCL_SHADER);
                     auto cl_context = static_cast<OpenCLProgramContext*>(context);
                     cl_context->m_programInfo.m_hasCrossThreadOffsetRelocations = true;
-                    break;
+                }
+                else if (reloc.r_symbol == vISA::PER_THREAD_OFF_RELOCATION_NAME) {
+                    IGC_ASSERT(context->type == ShaderType::OPENCL_SHADER);
+                    auto cl_context = static_cast<OpenCLProgramContext*>(context);
+                    cl_context->m_programInfo.m_hasPerThreadOffsetRelocations = true;
                 }
             }
         }
@@ -7017,15 +7121,14 @@ namespace IGC
         {
             auto funcInfoMD = context->getMetaDataUtils()->getFunctionsInfoItem(m_program->entry);
             int subGrpSize = funcInfoMD->getSubGroupSize()->getSIMDSize();
-            bool noRetry = ((subGrpSize > 0 || jitInfo->stats.spillMemUsed < 1000) &&
-                context->m_instrTypes.mayHaveIndirectOperands) &&
-                !context->HasFuncExpensiveLoop(m_program->entry);
+            bool noRetry = (subGrpSize > 0 || jitInfo->stats.spillMemUsed < 1000) &&
+                context->m_instrTypes.mayHaveIndirectOperands;
 
             if (context->type == ShaderType::OPENCL_SHADER)
             {
                 // Check for threshold needed to retry
                 auto oclCtx = static_cast<OpenCLProgramContext*>(context);
-                float threshold = oclCtx->GetSpillThreshold(m_program->m_dispatchSize);
+                float threshold = oclCtx->GetSpillThreshold(m_program->m_State.m_dispatchSize);
                 noRetry = noRetry || (m_program->m_spillCost <= threshold);
 
                 if (jitInfo->stats.spillMemUsed > 0 && oclCtx->m_InternalOptions.NoSpill)
@@ -7048,12 +7151,11 @@ namespace IGC
             std::stringstream ss;
             ss << endl << "Stack Function Spill Info:" << endl;
             ss << "KERNEL: " << m_program->entry->getName().str() << endl;
-            if (m_program->m_spillCost > threshold || context->HasFuncExpensiveLoop(m_program->entry))
+            if (m_program->m_spillCost > threshold)
             {
                 // First check the kernel
                 noRetryForStack = false;
                 context->m_retryManager.PerFuncRetrySet.insert(m_program->entry->getName().str());
-                ss << "  HasFuncExpensiveLoop = " << context->HasFuncExpensiveLoop(m_program->entry) << std::endl;
                 ss << "  numGRFSpill = " << jitInfo->stats.numGRFSpillFillWeighted << std::endl;
                 ss << "  TotalInsts = " << jitInfo->stats.numAsmCountUnweighted << std::endl;
             }
@@ -7062,14 +7164,13 @@ namespace IGC
                 vISA::FINALIZER_INFO* f_jitInfo = nullptr;
                 func.second->GetJitInfo(f_jitInfo);
                 //float spillCost = float(f_jitInfo->stats.numGRFSpillFillWeighted) / f_jitInfo->stats.numAsmCountUnweighted;
-                if (f_jitInfo->stats.numGRFSpillFillWeighted > 0 || context->HasFuncExpensiveLoop(func.first))
+                if (f_jitInfo->stats.numGRFSpillFillWeighted > 0)
                 {
                     // Check each stackcall function
                     noRetryForStack = false;
                     string FName = StripCloneName(func.first->getName().str());
                     context->m_retryManager.PerFuncRetrySet.insert(FName);
                     ss << "  STACK_FUNC Retry: " << FName << std::endl;
-                    ss << "    HasFuncExpensiveLoop = " << context->HasFuncExpensiveLoop(func.first) << std::endl;
                     ss << "    numGRFSpill = " << f_jitInfo->stats.numGRFSpillFillWeighted << std::endl;
                     ss << "    TotalInsts = " << f_jitInfo->stats.numAsmCountUnweighted << std::endl;
                 }
@@ -7140,8 +7241,8 @@ namespace IGC
             }
 
             ss << " compiled SIMD" <<
-                (m_program->m_dispatchSize == SIMDMode::SIMD32 ? 32 :
-                    m_program->m_dispatchSize == SIMDMode::SIMD16 ? 16 : 8);
+                (m_program->m_State.m_dispatchSize == SIMDMode::SIMD32 ? 32 :
+                    m_program->m_State.m_dispatchSize == SIMDMode::SIMD16 ? 16 : 8);
             ss << " allocated " << jitInfo->stats.numGRFTotal << " regs";
             auto spilledRegs = std::max<unsigned>(1,
                 (jitInfo->stats.spillMemUsed + getGRFSize() - 1) / getGRFSize());
@@ -8398,7 +8499,7 @@ namespace IGC
 
     std::string CEncoder::GetDumpFileName(std::string extension)
     {
-        std::string filename = IGC::Debug::GetDumpName(m_program, extension.c_str());
+        std::string filename = IGC::Debug::GetDumpNameObj(m_program, extension.c_str()).str();
         return filename;
     }
 
@@ -9076,7 +9177,7 @@ namespace IGC
             predOpnd,
             visaExecSize(offset->IsUniform() ?
                 lanesToSIMDMode(offset->GetNumberElement()) : m_encoderState.m_simdSize),
-            ConvertMaskToVisaType(m_encoderState.m_mask, m_encoderState.m_noMask),
+            ConvertMaskToVisaType(m_encoderState.m_mask, m_encoderState.m_noMask || offset->IsUniform()),
             cacheOpts,
             addr,
             dataShape,
@@ -9365,7 +9466,7 @@ namespace IGC
         CVariable* pU,
         CVariable* pV,
         CVariable* pR,
-        CVariable* pLOD,
+        CVariable* pLODorSampleIdx,
         CVariable* pSrcDst,
         unsigned elemSize, // in bits
         unsigned numElems,
@@ -9378,7 +9479,7 @@ namespace IGC
         VISA_RawOpnd* pSrc = nullptr;
         VISA_RawOpnd* pDst = nullptr;
 
-        if (subOp == LSC_STORE_QUAD)
+        if (subOp == LSC_STORE_QUAD || subOp == LSC_STORE_QUAD_MSRT)
         {
             pSrc = GetRawSource(pSrcDst, 0);
         }
@@ -9392,7 +9493,7 @@ namespace IGC
         VISA_RawOpnd* pROffset = GetRawSource(pR, m_encoderState.m_srcOperand[2].subVar * getGRFSize());
 
         // LoD or whatever indexing is being used
-        VISA_RawOpnd* pIndex = GetRawSource(pLOD, m_encoderState.m_srcOperand[3].subVar * getGRFSize());
+        VISA_RawOpnd* pIndex = GetRawSource(pLODorSampleIdx, m_encoderState.m_srcOperand[3].subVar * getGRFSize());
 
         VISA_PredOpnd* predOpnd = GetFlagOperand(m_encoderState.m_flag);
         IGC_ASSERT(m_encoderState.m_dstOperand.subVar == 0);

@@ -123,14 +123,26 @@ int CisaInst::createCisaInstruction(ISA_Opcode opcode, unsigned char exec_size,
   return VISA_SUCCESS;
 }
 
-bool allowDump(const Options &options, const std::string &fileName) {
+bool allowDump(const Options &options, const std::string &fullPath) {
   const char *regex = options.getOptionCstr(vISA_ShaderDumpFilter);
   if (!regex || *regex == '\0')
     return true;
 
   std::regex fileRegex(regex);
 
-  return std::regex_search(fileName, fileRegex);
+  const auto fileNameIdx = fullPath.find_last_of("/\\");
+  if (std::string::npos != fileNameIdx)
+  {
+      const auto fileNamePos = 1 + fileNameIdx;
+      const auto fileName = fullPath.substr(fileNamePos, fullPath.size() - fileNamePos);
+
+      return std::regex_search(fileName, fileRegex);
+  }
+  else
+  {
+      // Do NOT dump if there's no prefix path.
+      return false;
+  }
 }
 
 } // namespace CisaFramework
@@ -178,8 +190,8 @@ int CISA_IR_Builder::isaDump(const char *combinedIsaasmName) const {
 #else
   const bool isaasmToConsole = m_options.getOption(vISA_ISAASMToConsole);
   const bool genIsaasm = m_options.getOption(vISA_GenerateISAASM);
-  const bool allowIsaasmDump = CisaFramework::allowDump(m_options,
-    combinedIsaasmName ? combinedIsaasmName : std::string());
+  const bool allowIsaasmDump = combinedIsaasmName && combinedIsaasmName[0] != '\0' &&
+      CisaFramework::allowDump(m_options, combinedIsaasmName);
   const bool genCombinedIsaasm =
     m_options.getOption(vISA_GenerateCombinedISAASM) &&
     (isaasmToConsole || allowIsaasmDump);
@@ -231,7 +243,6 @@ int CISA_IR_Builder::isaDump(const char *combinedIsaasmName) const {
       } else {
         std::ofstream out(asmFileName);
         out << isaDump(kTemp, repKernel);
-        vISA_ASSERT(!out.fail(), "Failed to write CISA ASM to file");
       }
     }
   }
@@ -243,7 +254,6 @@ int CISA_IR_Builder::isaDump(const char *combinedIsaasmName) const {
       vASSERT(combinedIsaasmName);
       std::ofstream out(combinedIsaasmName);
       out << ss.rdbuf();
-      vISA_ASSERT(!out.fail(), "Failed to write combined CISA ASM to file");
     }
   }
   // Return early exit if emitting isaasm to console.

@@ -281,8 +281,10 @@ static void dumpZEInfo(const IGC::CodeGenContext &Ctx,
         .Hash(Ctx.hash)
         .Type(ShaderType::OPENCL_SHADER)
         .Extension("zeinfo");
-
-    ZEBuilder.printZEInfo(filename.str());
+    if (filename.allow())
+    {
+        ZEBuilder.printZEInfo(filename.str());
+    }
 }
 
 void dumpOCLKernelBinary(
@@ -306,10 +308,13 @@ void dumpOCLKernelBinary(
     const auto &KernBin = data.kernelBinary;
     IGC_ASSERT(KernBin);
 
-    std::error_code EC;
-    llvm::raw_fd_ostream f(name.str(), EC);
-    if (!EC)
-        f.write(KernBin->GetLinearPointer(), (size_t)KernBin->Size());
+    if (name.allow())
+    {
+        std::error_code EC;
+        llvm::raw_fd_ostream f(name.str(), EC);
+        if (!EC)
+            f.write(KernBin->GetLinearPointer(), (size_t)KernBin->Size());
+    }
 }
 
 void overrideOCLKernelBinary(
@@ -369,7 +374,7 @@ void dumpOCLCos(const IGC::COpenCLKernel *Kernel, const std::string &stateDebugM
     dumpName = dumpName.PostFix(kernelName);
 
     dumpName = dumpName.DispatchMode(Kernel->m_ShaderDispatchMode);
-    dumpName = dumpName.SIMDSize(Kernel->m_dispatchSize).Retry(context->m_retryManager.GetRetryId()).Extension("cos");
+    dumpName = dumpName.SIMDSize(Kernel->m_State.m_dispatchSize).Retry(context->m_retryManager.GetRetryId()).Extension("cos");
 
     auto dump = IGC::Debug::Dump(dumpName, IGC::Debug::DumpType::COS_TEXT);
 
@@ -686,7 +691,7 @@ bool CGen8OpenCLProgram::GetZEBinary(
                 //elfVecNames.push_back(elfLinkerOpt1);
                 //elfVecPtrs.push_back((char*)(elfVecNames.at(elfVecNames.size() - 1).c_str()));
 
-                auto elfArrRef = makeArrayRef(elfVecPtrs);
+                ArrayRef<const char*> elfArrRef(elfVecPtrs);
                 std::string linkErrStr = "";
                 llvm::raw_string_ostream linkErr(linkErrStr);
 

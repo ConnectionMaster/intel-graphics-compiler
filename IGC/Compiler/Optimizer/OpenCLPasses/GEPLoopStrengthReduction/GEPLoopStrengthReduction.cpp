@@ -118,7 +118,7 @@ enum ReductionType
 // Score used by heuristic for deciding what type of reduction to apply.
 struct Score
 {
-    Score() : ReducesInstructions(false), RegisterPressure(0) {}
+    Score() : ReducesInstructions(false), RegisterPressure(0), ContainsMuli64(false) {}
 
     // True if reduction to preheader would lower number of instructions in
     // loop. False otherwise.
@@ -126,6 +126,9 @@ struct Score
 
     // Estimated increase in register pressure when reducing to loop's preheader.
     unsigned RegisterPressure;
+
+    // Flag to show presence of i64 mul instructions in the address calculation.
+    bool ContainsMuli64;
 };
 
 
@@ -266,7 +269,7 @@ private:
     void scoreReducedInstructions(ReductionCandidateGroup &Candidate);
     void scoreRegisterPressure(ReductionCandidateGroup &Candidate);
 
-    int estimateIndexInstructions(const Loop &L, GetElementPtrInst *GEP);
+    int estimateIndexInstructions(const Loop &L, GetElementPtrInst *GEP, bool &ContainsMuli64);
     int estimatePointerAddition(ReductionCandidateGroup &Candidate);
 
     const DataLayout &DL;
@@ -286,10 +289,30 @@ public:
     void analyze(SmallVectorImpl<ReductionCandidateGroup> &Result);
 
 private:
+
+    // Represents deconstructed SCEV expression { start, +, step }.
+    // Start SCEV will be used to calculate base pointer, and Step SCEV
+    // will increase new induction variable on each iteration.
+    struct DeconstructedSCEV
+    {
+        DeconstructedSCEV() : Start(nullptr), Step(nullptr), ConvertedMulExpr(false) {}
+
+        bool isValid();
+
+        const SCEV* Start;
+        const SCEV* Step;
+
+        // True if input SCEV:
+        //   x * { start, +, step }
+        // Was converted into:
+        //   { x * start, +, x * step }
+        bool ConvertedMulExpr;
+    };
+
     void analyzeGEP(GetElementPtrInst *GEP);
     bool doInitialValidation(GetElementPtrInst *GEP);
 
-    bool deconstructSCEV(const SCEV *S, const SCEV *&Start, const SCEV *&Step);
+    bool deconstructSCEV(const SCEV *S, DeconstructedSCEV &Result);
 
     DominatorTree &DT;
     Loop &L;
@@ -316,7 +339,7 @@ public:
 private:
 
     unsigned MaxAllowedPressure;
-    unsigned ExternalPressure;
+    unsigned FunctionExternalPressure;
 
     IGCLivenessAnalysis &RPE;
     WIAnalysisRunner &WI;
@@ -764,15 +787,13 @@ void Scorer::scoreReducedInstructions(ReductionCandidateGroup &Candidate)
 
     // Score "+ base_ptr"
     score += estimatePointerAddition(Candidate);
+    bool ContainsMuli64 = false;
 
-    // Only need to deduce if reduction is net positive, no need to continue if already confirmed.
-    if (score < 1)
-    {
-        // Score "index"
-        score += estimateIndexInstructions(*Candidate.getLoop(), Cheapest.GEP);
-    }
+    // Score "index"
+    score += estimateIndexInstructions(*Candidate.getLoop(), Cheapest.GEP, ContainsMuli64);
 
     Candidate.Score.ReducesInstructions = score > 0;
+    Candidate.Score.ContainsMuli64 = ContainsMuli64;
 }
 
 
@@ -805,7 +826,8 @@ int Scorer::estimatePointerAddition(ReductionCandidateGroup &Candidate)
 // Estimates how many instructions required to calculate index would be reduced to preheader.
 // This differs from checking SCEV expression size, which it might represent simplified index
 // calculation.
-int Scorer::estimateIndexInstructions(const Loop &L, GetElementPtrInst *GEP)
+// Sets ContainsMuli64 flag to show if i64 multiplication is present in the gep index calculation.
+int Scorer::estimateIndexInstructions(const Loop &L, GetElementPtrInst *GEP, bool &ContainsMuli64)
 {
     Instruction *Index = dyn_cast<Instruction>(*(GEP->operands().end() - 1));
     if (!Index)
@@ -836,6 +858,9 @@ int Scorer::estimateIndexInstructions(const Loop &L, GetElementPtrInst *GEP)
         default:
             instructions += 1;
         }
+
+        if (I->getOpcode() == Instruction::Mul && I->getType()->isIntegerTy(64))
+            ContainsMuli64 = true;
 
         for (auto *It = I->operands().begin(); It != I->operands().end(); ++It)
         {
@@ -955,14 +980,15 @@ void Analyzer::analyzeGEP(GetElementPtrInst *GEP)
     if (!SCEVHelper::isValid(S))
         return;
 
-    const SCEV *Start = nullptr;
-    const SCEV *Step = nullptr;
-
-    if (!deconstructSCEV(S, Start, Step))
+    Analyzer::DeconstructedSCEV Result;
+    if (!deconstructSCEV(S, Result))
         return;
 
-    if (Step->getSCEVType() != scConstant && IGC_IS_FLAG_DISABLED(EnableGEPLSRUnknownConstantStep) && IGC_IS_FLAG_DISABLED(EnableGEPLSRMulExpr))
+    if (!Result.isValid())
         return;
+
+    const SCEV* Start = Result.Start;
+    const SCEV* Step = Result.Step;
 
     if (S->getType() != Start->getType())
         Start = isa<SCEVSignExtendExpr>(S) ? SE.getSignExtendExpr(Start, S->getType()) : SE.getZeroExtendExpr(Start, S->getType());
@@ -1057,7 +1083,7 @@ bool Analyzer::doInitialValidation(GetElementPtrInst *GEP)
 // Takes SCEV expression returned by ScalarEvolution and deconstructs it into
 // expected format { start, +, step }. Returns false if expressions can't be
 // parsed and reduced.
-bool Analyzer::deconstructSCEV(const SCEV *S, const SCEV *&Start, const SCEV *&Step)
+bool Analyzer::deconstructSCEV(const SCEV *S, Analyzer::DeconstructedSCEV &Result)
 {
     // Drop ext instructions to analyze nested content.
     S = SCEVHelper::dropExt(S);
@@ -1069,8 +1095,8 @@ bool Analyzer::deconstructSCEV(const SCEV *S, const SCEV *&Start, const SCEV *&S
     // induction variable.
     if (SE.isLoopInvariant(S, &L))
     {
-        Start = S;
-        Step = SE.getConstant(Type::getInt64Ty(L.getHeader()->getContext()), 0);
+        Result.Start = S;
+        Result.Step = SE.getConstant(Type::getInt64Ty(L.getHeader()->getContext()), 0);
         return true;
     }
 
@@ -1079,6 +1105,19 @@ bool Analyzer::deconstructSCEV(const SCEV *S, const SCEV *&Start, const SCEV *&S
     // where step is constant
     if (auto *Add = dyn_cast<SCEVAddRecExpr>(S))
     {
+        // Consider the following SCEV as a mul pattern:
+        // {(%val * %multiplier),+,%multiplier}
+        auto *Op0 = Add->getOperand(0);
+        auto *Op1 = Add->getOperand(1);
+        bool Conv = false;
+        if (auto *Mul = dyn_cast<SCEVMulExpr>(Op0)) {
+            auto *MulOp0 = Mul->getOperand(0);
+            auto *MulOp1 = Mul->getOperand(1);
+            if (MulOp0 == Op1 || MulOp1 == Op1) {
+                Conv = true;
+            }
+        }
+
         if (!Add->isAffine())
             return false;
 
@@ -1091,10 +1130,11 @@ bool Analyzer::deconstructSCEV(const SCEV *S, const SCEV *&Start, const SCEV *&S
         if (!SE.isLoopInvariant(OpStep, &L))
             return false;
 
-        Start = Add->getStart();
-        Step = OpStep;
+        Result.Start = Add->getStart();
+        Result.Step = OpStep;
+        Result.ConvertedMulExpr = Conv;
 
-        return IGCLLVM::isSafeToExpandAt(Start, &L.getLoopPreheader()->back(), &SE, &E);
+        return IGCLLVM::isSafeToExpandAt(Result.Start, &L.getLoopPreheader()->back(), &SE, &E);
     }
 
     // If expression is:
@@ -1108,30 +1148,30 @@ bool Analyzer::deconstructSCEV(const SCEV *S, const SCEV *&Start, const SCEV *&S
     if (auto *Add = dyn_cast<SCEVAddExpr>(S))
     {
         // There can be only one expression with step != 0.
-        Step = SE.getConstant(Type::getInt64Ty(L.getHeader()->getContext()), 0);
+        Result.Step = SE.getConstant(Type::getInt64Ty(L.getHeader()->getContext()), 0);
 
-        const SCEV *OpSCEV = nullptr;
-        const SCEV *OpStep = nullptr;
         SCEVHelper::SCEVAddBuilder Builder(SE);
 
         for (auto *Op : Add->operands())
         {
-            if (!deconstructSCEV(Op, OpSCEV, OpStep))
+            Analyzer::DeconstructedSCEV OpResult;
+
+            if (!deconstructSCEV(Op, OpResult))
                 return false;
 
-            if (!OpStep->isZero())
+            if (!OpResult.Step->isZero())
             {
-                if (!Step->isZero())
+                if (!Result.Step->isZero())
                     return false; // unsupported expression with multiple steps
-                Step = OpStep;
+                Result.Step = OpResult.Step;
             }
 
-            Builder.add(OpSCEV);
+            Builder.add(OpResult.Start);
         }
 
-        Start = Builder.build();
+        Result.Start = Builder.build();
 
-        return IGCLLVM::isSafeToExpandAt(Start, &L.getLoopPreheader()->back(), &SE, &E);
+        return IGCLLVM::isSafeToExpandAt(Result.Start, &L.getLoopPreheader()->back(), &SE, &E);
     }
 
     // If expression is:
@@ -1142,24 +1182,20 @@ bool Analyzer::deconstructSCEV(const SCEV *S, const SCEV *&Start, const SCEV *&S
     // Warning: GEP's new index will not be a constant integer, but a new SCEV expression.
     if (auto *Mul = dyn_cast<SCEVMulExpr>(S))
     {
-        if (IGC_IS_FLAG_DISABLED(EnableGEPLSRMulExpr))
-            return false;
-
         // SCEVAddRecExpr will be SCEV with step != 0. Any other SCEV is a multiplier.
         bool FoundAddRec = false;
         SCEVHelper::SCEVMulBuilder StartBuilder(SE), StepBuilder(SE);
 
         for (auto *Op : Mul->operands())
         {
-            const SCEV *OpSCEV = nullptr;
-            const SCEV *OpStep = nullptr;
-            if (!deconstructSCEV(Op, OpSCEV, OpStep))
+            Analyzer::DeconstructedSCEV OpResult;
+            if (!deconstructSCEV(Op, OpResult))
                 return false;
 
-            if (OpStep->isZero())
+            if (OpResult.Step->isZero())
             {
-                StartBuilder.add(OpSCEV);
-                StepBuilder.add(OpSCEV);
+                StartBuilder.add(OpResult.Start);
+                StepBuilder.add(OpResult.Start);
             }
             else
             {
@@ -1167,24 +1203,44 @@ bool Analyzer::deconstructSCEV(const SCEV *S, const SCEV *&Start, const SCEV *&S
                     return false; // unsupported expression with multiple SCEVAddRecExpr
                 FoundAddRec = true;
 
-                StartBuilder.add(OpSCEV);
-                StepBuilder.add(OpStep);
+                StartBuilder.add(OpResult.Start);
+                StepBuilder.add(OpResult.Step);
             }
         }
 
         if (!FoundAddRec)
             return false;
 
-        Start = StartBuilder.build();
-        Step = StepBuilder.build();
+        Result.Start = StartBuilder.build();
+        Result.Step = StepBuilder.build();
+        Result.ConvertedMulExpr = true;
 
-        if (!SE.isLoopInvariant(Step, &L))
+        if (!SE.isLoopInvariant(Result.Step, &L))
             return false;
 
-        return IGCLLVM::isSafeToExpandAt(Start, &L.getLoopPreheader()->back(), &SE, &E);
+        return IGCLLVM::isSafeToExpandAt(Result.Start, &L.getLoopPreheader()->back(), &SE, &E);
     }
 
     return false;
+}
+
+
+bool Analyzer::DeconstructedSCEV::isValid()
+{
+    if (!Start || !Step)
+        return false;
+
+    // Validate step.
+    auto Ty = SCEVHelper::dropExt(Step)->getSCEVType();
+
+    if (Ty == scConstant)
+        return true;
+
+    bool IsMul = Ty == scMulExpr || ConvertedMulExpr;
+    if (IsMul && IGC_IS_FLAG_ENABLED(EnableGEPLSRMulExpr))
+        return true;
+
+    return IGC_IS_FLAG_ENABLED(EnableGEPLSRUnknownConstantStep);
 }
 
 
@@ -1193,7 +1249,7 @@ RegisterPressureTracker::RegisterPressureTracker(Function &F, CodeGenContext &CG
 {
     MaxAllowedPressure = static_cast<unsigned>(CGC.getNumGRFPerThread() * IGC_GET_FLAG_VALUE(GEPLSRThresholdRatio) / 100.0f);
 
-    ExternalPressure = FRPE.getExternalPressureForFunction(&F);
+    FunctionExternalPressure = FRPE.getExternalPressureForFunction(&F);
 }
 
 
@@ -1218,14 +1274,31 @@ void RegisterPressureTracker::trackDeletedInstruction(Value *V)
 
 bool RegisterPressureTracker::fitsPressureThreshold(ReductionCandidateGroup &C)
 {
-    auto *F = C.getLoop()->getLoopPreheader()->getParent();
+    BasicBlock *Preheader = C.getLoop()->getLoopPreheader();
+    auto *F = Preheader->getParent();
     uint SIMD = numLanes(RPE.bestGuessSIMDSize(F));
 
-    unsigned InitialPressure = ExternalPressure + RPE.getMaxRegCountForLoop(*C.getLoop(), SIMD, &WI);
-    unsigned EstimatedPressure = InitialPressure + C.getScore().RegisterPressure;
+    unsigned MaxLoopPressure = RPE.getMaxRegCountForLoop(*C.getLoop(), SIMD, &WI);
+    unsigned AdditionalPressure = C.getScore().RegisterPressure;
 
+    InsideBlockPressureMap BBListing;
+    RPE.collectPressureForBB(*Preheader, BBListing, SIMD, &WI);
+    unsigned LoopExternalPressureInBytes = BBListing[cast<Value>(Preheader->getTerminator())];
+    unsigned LoopExternalPressure = RPE.bytesToRegisters(LoopExternalPressureInBytes);
+
+    unsigned InitialPressure = FunctionExternalPressure + MaxLoopPressure;
+    unsigned EstimatedPressure = InitialPressure + AdditionalPressure;
+
+    // Try not to increase register pressure above threshold.
     if (EstimatedPressure >= MaxAllowedPressure)
     {
+        // Even if the optimization icnreases register pressure, apply it in case we can move mul i64 to preheader.
+        // This heuristic is based on the fact that mul i64 is expensive instruction and potential spills are generated out of the loop.
+        unsigned NewInternalLoopPressure = LoopExternalPressure - MaxLoopPressure + AdditionalPressure;
+        if (C.getScore().ContainsMuli64 && NewInternalLoopPressure < MaxAllowedPressure) {
+            return true;
+        }
+
         LLVM_DEBUG(
             dbgs() << "  Estimated register pressure " << EstimatedPressure << " above threshold " << MaxAllowedPressure << "; can't fully reduce ";
             C.print(dbgs());
@@ -1438,7 +1511,8 @@ bool SCEVHelper::isValid(const SCEV *S)
         if (!Ty->isIntegerTy())
             return false;
 
-        switch (Ty->getScalarSizeInBits())
+        auto bits = Ty->getScalarSizeInBits();
+        switch (bits)
         {
         case 8:
         case 16:
@@ -1446,7 +1520,7 @@ bool SCEVHelper::isValid(const SCEV *S)
         case 64:
             return false;
         default:
-            return true;
+            return bits > 8;
         }
     };
 
@@ -1579,7 +1653,6 @@ void GEPLoopStrengthReduction::getAnalysisUsage(llvm::AnalysisUsage &AU) const
     AU.addRequired<IGCLivenessAnalysis>();
     AU.addRequired<llvm::LoopInfoWrapperPass>();
     AU.addRequired<MetaDataUtilsWrapper>();
-    AU.addRequired<PostDominatorTreeWrapperPass>();
     AU.addRequired<llvm::ScalarEvolutionWrapperPass>();
 }
 
@@ -1598,9 +1671,7 @@ bool GEPLoopStrengthReduction::runOnFunction(llvm::Function &F)
     auto &DL = F.getParent()->getDataLayout();
     auto &DT = getAnalysis<DominatorTreeWrapperPass>().getDomTree();
     auto &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
-    auto &MDU = *getAnalysis<MetaDataUtilsWrapper>().getMetaDataUtils();
     auto &MMD = *getAnalysis<MetaDataUtilsWrapper>().getModuleMetaData();
-    auto &PDT = getAnalysis<PostDominatorTreeWrapperPass>().getPostDomTree();
     auto &RPE = getAnalysis<IGCLivenessAnalysis>();
     auto &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
 
@@ -1609,19 +1680,14 @@ bool GEPLoopStrengthReduction::runOnFunction(llvm::Function &F)
     // increases pressure so LSR reduction should not be applied in function B, but we don't
     // recompute FRPE to save compile time, so reduction might apply for loops in function B.
     auto &FRPE = getAnalysis<IGCFunctionExternalRegPressureAnalysis>();
-
-    TranslationTable TT;
-    TT.run(F);
-
-    WIAnalysisRunner WI = WIAnalysisRunner(&F, &LI, &DT, &PDT, &MDU, &CGC, &MMD, &TT);
-    WI.run();
+    auto *WI = &FRPE.getWIAnalysis(&F);
 
     // Using one SCEV expander between all reductions reduces number of duplicated new instructions.
     auto E = SCEVExpander(SE, DL, "gep-loop-strength-reduction");
 
     SmallVector<ReductionCandidateGroup, 32> Candidates;
 
-    RegisterPressureTracker RPT(F, CGC, RPE, FRPE, WI);
+    RegisterPressureTracker RPT(F, CGC, RPE, FRPE, *WI);
 
     for (Loop *L : LI.getLoopsInPreorder())
         Analyzer(DL, DT, *L, LI, SE, E).analyze(Candidates);
@@ -1629,7 +1695,7 @@ bool GEPLoopStrengthReduction::runOnFunction(llvm::Function &F)
     if (Candidates.empty())
         return false;
 
-    Scorer(DL, MMD, RPE, WI).score(Candidates);
+    Scorer(DL, MMD, RPE, *WI).score(Candidates);
 
     IGCLLVM::IRBuilder<> IRB(F.getContext());
 
@@ -1653,7 +1719,6 @@ IGC_INITIALIZE_PASS_DEPENDENCY(IGCFunctionExternalRegPressureAnalysis)
 IGC_INITIALIZE_PASS_DEPENDENCY(IGCLivenessAnalysis)
 IGC_INITIALIZE_PASS_DEPENDENCY(LoopInfoWrapperPass)
 IGC_INITIALIZE_PASS_DEPENDENCY(MetaDataUtilsWrapper)
-IGC_INITIALIZE_PASS_DEPENDENCY(PostDominatorTreeWrapperPass)
 IGC_INITIALIZE_PASS_DEPENDENCY(ScalarEvolutionWrapperPass)
 IGC_INITIALIZE_PASS_END(GEPLoopStrengthReduction, PASS_FLAG, PASS_DESCRIPTION, PASS_CFG_ONLY, PASS_ANALYSIS)
 

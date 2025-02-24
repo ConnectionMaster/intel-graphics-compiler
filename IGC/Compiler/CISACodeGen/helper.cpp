@@ -371,7 +371,7 @@ namespace IGC
 
         auto alignment = IGCLLVM::getAlignmentValue(inst);
         if (alignment == 0)
-            alignment = DL.getABITypeAlignment(inst->getType());
+            alignment = DL.getABITypeAlign(inst->getType()).value();
 
         IRBuilder<> builder(inst);
 
@@ -418,7 +418,7 @@ namespace IGC
         IRBuilder<> builder(inst);
         auto alignment = IGCLLVM::getAlignmentValue(inst);
         if (alignment == 0)
-            alignment = DL.getABITypeAlignment(storeVal->getType());
+            alignment = DL.getABITypeAlign(storeVal->getType()).value();
         Value* attr[] =
         {
             bufPtr,
@@ -629,13 +629,14 @@ namespace IGC
 
     BufferAccessType getDefaultAccessType(BufferType bufTy)
     {
-        static_assert(BufferType::BUFFER_TYPE_UNKNOWN == 17, "Please also update switch() below");
+        static_assert(BufferType::BUFFER_TYPE_UNKNOWN == 19, "Please also update switch() below");
         switch (bufTy)
         {
         case BufferType::CONSTANT_BUFFER:
         case BufferType::RESOURCE:
         case BufferType::BINDLESS_TEXTURE:
         case BufferType::BINDLESS_CONSTANT_BUFFER:
+        case BufferType::BINDLESS_READONLY:
         case BufferType::STATELESS_READONLY:
         case BufferType::SAMPLER:
         case BufferType::BINDLESS_SAMPLER:
@@ -652,6 +653,7 @@ namespace IGC
         case BufferType::STATELESS_A32:
             return BufferAccessType::ACCESS_READWRITE;
 
+        case BufferType::BINDLESS_WRITEONLY:
         case BufferType::RENDER_TARGET:
             return BufferAccessType::ACCESS_WRITE;
         default:
@@ -1074,6 +1076,8 @@ namespace IGC
         }
         case llvm::GenISAIntrinsic::GenISA_typedread:
         case llvm::GenISAIntrinsic::GenISA_typedwrite:
+        case llvm::GenISAIntrinsic::GenISA_typedreadMS:
+        case llvm::GenISAIntrinsic::GenISA_typedwriteMS:
         case llvm::GenISAIntrinsic::GenISA_ldstructured:
         case llvm::GenISAIntrinsic::GenISA_storestructured1:
         case llvm::GenISAIntrinsic::GenISA_storestructured2:
@@ -1214,6 +1218,8 @@ namespace IGC
             case llvm::GenISAIntrinsic::GenISA_sampleinfoptr:
             case llvm::GenISAIntrinsic::GenISA_typedwrite:
             case llvm::GenISAIntrinsic::GenISA_typedread:
+            case llvm::GenISAIntrinsic::GenISA_typedwriteMS:
+            case llvm::GenISAIntrinsic::GenISA_typedreadMS:
                 pTextureValue = pIntr->getOperand(0);
                 break;
             default:
@@ -1274,7 +1280,7 @@ namespace IGC
     void GetResourceOperand(Instruction* inst,
         Value*& resValue, Value*& pairTexValue, Value*& texValue, Value*& sampleValue)
     {
-        llvm::GenIntrinsicInst* pIntr = llvm::dyn_cast<llvm::GenIntrinsicInst>(inst);
+        auto* pIntr = llvm::cast<llvm::GenIntrinsicInst>(inst);
 
         if (dyn_cast<LdRawIntrinsic>(pIntr))
         {
@@ -1594,6 +1600,7 @@ namespace IGC
         {
         case GenISAIntrinsic::GenISA_WaveShuffleIndex:
         case GenISAIntrinsic::GenISA_WaveBroadcast:
+        case GenISAIntrinsic::GenISA_WaveClusteredBroadcast:
         case GenISAIntrinsic::GenISA_simdShuffleDown:
         case GenISAIntrinsic::GenISA_simdShuffleXor:
         case GenISAIntrinsic::GenISA_simdBlockRead:
@@ -1620,6 +1627,25 @@ namespace IGC
         {
         case GenISAIntrinsic::GenISA_simdMediaBlockRead:
         case GenISAIntrinsic::GenISA_simdMediaBlockWrite:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    // This returns true for all the sub-group shuffle optimized intrinsics
+    bool isSubGroupShuffleVariant(const llvm::Instruction* I)
+    {
+        const GenIntrinsicInst* GII = dyn_cast<GenIntrinsicInst>(I);
+        if(!GII)
+            return false;
+
+        switch(GII->getIntrinsicID())
+        {
+        case GenISAIntrinsic::GenISA_WaveShuffleIndex:
+        case GenISAIntrinsic::GenISA_WaveBroadcast:
+        case GenISAIntrinsic::GenISA_WaveClusteredBroadcast:
+        case GenISAIntrinsic::GenISA_simdShuffleXor:
             return true;
         default:
             return false;
@@ -1674,6 +1700,11 @@ namespace IGC
             ((callInst->getCalledFunction() == nullptr) || !callInst->getCalledFunction()->isIntrinsic());
 
         return isUserFunction;
+    }
+
+    bool isDiscardInstruction(const llvm::Instruction* I)
+    {
+        return isa<GenIntrinsicInst>(I) && cast<GenIntrinsicInst>(I)->getIntrinsicID() == GenISAIntrinsic::GenISA_discard;
     }
 
     bool isURBWriteIntrinsic(const llvm::Instruction* I)
@@ -1880,9 +1911,12 @@ namespace IGC
             opcode == llvm_waveInterleave ||
             opcode == llvm_waveClusteredInterleave ||
             opcode == llvm_wavePrefix ||
+            opcode == llvm_waveClusteredPrefix ||
             opcode == llvm_waveShuffleIndex ||
             opcode == llvm_waveBroadcast ||
+            opcode == llvm_waveClusteredBroadcast ||
             opcode == llvm_waveBallot ||
+            opcode == llvm_waveClusteredBallot ||
             opcode == llvm_simdShuffleDown ||
             opcode == llvm_simdBlockRead||
             opcode == llvm_simdBlockReadBindless);
@@ -2300,16 +2334,23 @@ namespace IGC
             case GenISAIntrinsic::GenISA_ftof_rtn:
             case GenISAIntrinsic::GenISA_itof_rtn:
             case GenISAIntrinsic::GenISA_uitof_rtn:
+            case GenISAIntrinsic::GenISA_add_rtn:
+            case GenISAIntrinsic::GenISA_mul_rtn:
             case GenISAIntrinsic::GenISA_fma_rtn:
                 RM = ERoundingMode::ROUND_TO_NEGATIVE;
                 break;
             case GenISAIntrinsic::GenISA_ftof_rtp:
             case GenISAIntrinsic::GenISA_itof_rtp:
             case GenISAIntrinsic::GenISA_uitof_rtp:
+            case GenISAIntrinsic::GenISA_add_rtp:
+            case GenISAIntrinsic::GenISA_mul_rtp:
             case GenISAIntrinsic::GenISA_fma_rtp:
                 RM = ERoundingMode::ROUND_TO_POSITIVE;
                 break;
             case GenISAIntrinsic::GenISA_ftof_rte:
+            case GenISAIntrinsic::GenISA_add_rte:
+            case GenISAIntrinsic::GenISA_mul_rte:
+            case GenISAIntrinsic::GenISA_fma_rte:
                 RM = ERoundingMode::ROUND_TO_NEAREST_EVEN;
                 break;
             case GenISAIntrinsic::GenISA_ftobf:
@@ -2580,13 +2621,6 @@ namespace IGC
         return headerSize;
     }
 
-    bool DSDualPatchEnabled(class CodeGenContext* ctx)
-    {
-        return ctx->platform.supportDSDualPatchDispatch() &&
-            ctx->platform.WaDisableDSDualPatchMode() &&
-            !(ctx->m_DriverInfo.APIDisableDSDualPatchDispatch()) &&
-            IGC_IS_FLAG_DISABLED(DisableDSDualPatch);
-    }
 
     void InsertOptsMetadata(CodeGenContext* pCtx, llvm::Function* F)
     {
@@ -3468,5 +3502,37 @@ bool SeparateSpillAndScratch(const CodeGenContext* ctx)
         separate = ctx->getModuleMetaData()->enableSeparateSpillPvtScratchSpace;
 
     return (ctx->platform.hasScratchSurface() && separate);
+}
+
+bool UsedWithoutImmInMemInst( Value* varOffset )
+{
+    // If varOffset was used as the bare base operand for a load/store/ldraw/ldraw_vector/storeraw/storeraw_vector
+    // then it must be positive.
+    for( auto* user : varOffset->users() )
+    {
+        if( auto* loadInst = dyn_cast<LoadInst>( user ) )
+        {
+            if( loadInst->getOperand( 0 ) == varOffset )
+            {
+                return true;
+            }
+        }
+        else if( auto* storeInst = dyn_cast<StoreInst>( user ) )
+        {
+            if( storeInst->getOperand( 1 ) == varOffset )
+            {
+                return true;
+            }
+        }
+        else if( auto* genInst = dyn_cast<GenIntrinsicInst>( user ) )
+        {
+            if( genInst->getOperand( 1 ) == varOffset )
+            {
+                return true;
+            }
+        }
+    }
+
+    return false;
 }
 } // namespace IGC

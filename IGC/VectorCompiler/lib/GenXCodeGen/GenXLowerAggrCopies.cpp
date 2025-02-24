@@ -36,6 +36,8 @@ SPDX-License-Identifier: MIT
 #include "llvmWrapper/IR/Type.h"
 #include "llvmWrapper/Support/Alignment.h"
 
+#include "vc/GenXCodeGen/GenXLowerAggrCopies.h"
+
 #include <tuple>
 #include <vector>
 
@@ -59,7 +61,13 @@ struct GenXLowerAggrCopies : public FunctionPass {
   const int ExpandLimit;
   static char ID;
 
+#if LLVM_VERSION_MAJOR < 16
   GenXLowerAggrCopies() : FunctionPass(ID), ExpandLimit(ExpandLimitOpt) {}
+#else  // LLVM_VERSION_MAJOR < 16
+  const TargetTransformInfo *TTIp = nullptr;
+  explicit GenXLowerAggrCopies(const TargetTransformInfo *TTIp = nullptr)
+      : TTIp(TTIp), FunctionPass(ID), ExpandLimit(ExpandLimitOpt) {}
+#endif // LLVM_VERSION_MAJOR < 16
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.addPreserved<StackProtector>();
@@ -115,7 +123,8 @@ static bool memSetCanBeCoalesced(MemSetInst &MemSet, int CoalescedTySize) {
   IGC_ASSERT_MESSAGE(CoalescedTySize >= 1 && isPowerOf2_32(CoalescedTySize),
                      "wrong argument: invalid CoalescedTySize");
   return OrigLength % CoalescedTySize == 0 &&
-         static_cast<int>(MemSet.getDestAlignment()) >= CoalescedTySize;
+         static_cast<int>(MemSet.getDestAlign().valueOrOne().value()) >=
+             CoalescedTySize;
 }
 
 // Original memset intrinsic fills memory with 8-bit values.
@@ -178,8 +187,10 @@ static void setMemorySliceWithVecStore(SliceInfo Slice, Value &SetVal,
 bool GenXLowerAggrCopies::runOnFunction(Function &F) {
   SmallVector<MemIntrinsic *, 4> MemCalls;
 
+#if LLVM_VERSION_MAJOR < 16
   const TargetTransformInfo &TTI =
       getAnalysis<TargetTransformInfoWrapperPass>().getTTI(F);
+#endif
 
   // Collect all aggregate loads and mem* calls.
   for (Function::iterator BI = F.begin(), BE = F.end(); BI != BE; ++BI) {
@@ -212,7 +223,15 @@ bool GenXLowerAggrCopies::runOnFunction(Function &F) {
       if (doLinearExpand) {
         expandMemMov2VecLoadStore(Memcpy);
       } else {
+#if LLVM_VERSION_MAJOR >= 16
+        if (!TTIp) {
+            const TargetTransformInfo &TTI = getAnalysis<TargetTransformInfoWrapperPass>().getTTI(F);
+#endif
         expandMemCpyAsLoop(Memcpy, TTI);
+#if LLVM_VERSION_MAJOR >= 16
+        }
+        else expandMemCpyAsLoop(Memcpy, *TTIp);
+#endif
       }
     } else if (MemMoveInst *Memmove = dyn_cast<MemMoveInst>(MemCall)) {
       if (doLinearExpand) {
@@ -223,9 +242,9 @@ bool GenXLowerAggrCopies::runOnFunction(Function &F) {
     } else if (MemSetInst *MemSet = dyn_cast<MemSetInst>(MemCall)) {
       if (doLinearExpand) {
         auto &&[SetVal, BaseAddr, Len] = defineOptimalValueAndLength(*MemSet);
-        auto Align = MemSet->getDestAlignment();
+        auto Align = MemSet->getDestAlign();
         std::vector<SliceInfo> LegalLengths =
-            getLegalLengths(Len, Align ? Align : 1);
+            getLegalLengths(Len, Align.valueOrOne().value());
         for (SliceInfo Slice : LegalLengths)
           setMemorySliceWithVecStore(Slice, SetVal, BaseAddr, MemSet);
       } else {
@@ -277,6 +296,17 @@ INITIALIZE_PASS_DEPENDENCY(TargetTransformInfoWrapperPass)
 INITIALIZE_PASS_END(
     GenXLowerAggrCopies, "genx-lower-aggr-copies",
     "Lower aggregate copies, and llvm.mem* intrinsics into loops", false, false)
+
+#if LLVM_VERSION_MAJOR >= 16
+llvm::PreservedAnalyses
+GenXLowerAggrCopiesPass::run(Function &F, FunctionAnalysisManager &AM) {
+  auto &TT = AM.getResult<TargetIRAnalysis>(F);
+  GenXLowerAggrCopies GenXLowAggrCop(&TT);
+  if (GenXLowAggrCop.runOnFunction(F))
+    return PreservedAnalyses::none();
+  return PreservedAnalyses::all();
+}
+#endif
 
 FunctionPass *llvm::createGenXLowerAggrCopiesPass() {
   initializeGenXLowerAggrCopiesPass(*PassRegistry::getPassRegistry());

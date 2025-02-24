@@ -10,7 +10,6 @@ SPDX-License-Identifier: MIT
 #include "GenIntrinsicDefinition.h"
 #include "GenIntrinsicLookup.h"
 #include "Probe/Assertion.h"
-#include "llvmWrapper/IR/Attributes.h"
 #include "llvmWrapper/IR/DerivedTypes.h"
 #include "llvmWrapper/IR/Type.h"
 #include "llvmWrapper/IR/Module.h"
@@ -102,22 +101,26 @@ public:
         return false;
     }
 
-    static IntrinsicFunctionImp<id>* Get(llvm::Module& module, const llvm::ArrayRef<llvm::Type*>& overloadedTypes)
+    static IntrinsicFunctionImp<id>* Get(llvm::Module& module, const llvm::ArrayRef<llvm::Type*>& overloadedTypes, const llvm::ArrayRef<llvm::Type*>& overloadedPointeeTys)
     {
-        return llvm::cast<IntrinsicFunctionImp<id>>(GetDeclaration(module, overloadedTypes));
+        return llvm::cast<IntrinsicFunctionImp<id>>(GetDeclaration(module, overloadedTypes, overloadedPointeeTys));
     }
 
-    static llvm::Function* GetDeclaration(llvm::Module& module, const llvm::ArrayRef<llvm::Type*>& overloadedTypes)
+    static llvm::Function* GetDeclaration(llvm::Module& module, const llvm::ArrayRef<llvm::Type*>& overloadedTypes, const llvm::ArrayRef<llvm::Type*>& overloadedPointeeTys)
     {
-        return GetOrInsert(module, overloadedTypes);
+        return GetOrInsert(module, overloadedTypes, overloadedPointeeTys);
     }
 
-    static std::string GetName(const llvm::ArrayRef<llvm::Type*>& overloadedTypes)
+    static std::string GetName(const llvm::ArrayRef<llvm::Type*>& overloadedTypes, const llvm::ArrayRef<llvm::Type*>& overloadedPointeeTys)
     {
         std::string result = IntrinsicDefinitionT::scFunctionRootName;
         for (unsigned i = 0; i < overloadedTypes.size(); ++i)
         {
             result += "." + getMangledTypeStr(overloadedTypes[i]);
+        }
+        for (unsigned i = 0; i < overloadedPointeeTys.size(); ++i)
+        {
+            result += "." + getMangledTypeStr(overloadedPointeeTys[i]);
         }
         return result;
     }
@@ -140,12 +143,12 @@ public:
 
 private:
 
-    static llvm::Function* GetOrInsert(llvm::Module& module, const llvm::ArrayRef<llvm::Type*>& overloadedTypes)
+    static llvm::Function* GetOrInsert(llvm::Module& module, const llvm::ArrayRef<llvm::Type*>& overloadedTypes, const llvm::ArrayRef<llvm::Type*>& overloadedPointeeTys)
     {
         llvm::LLVMContext& ctx = module.getContext();
-        std::string funcName = GetName(overloadedTypes);
+        std::string funcName = GetName(overloadedTypes, overloadedPointeeTys);
         llvm::FunctionType* pFuncType = GetType(ctx, overloadedTypes);
-        llvm::AttributeList attribs = GetAttributeList(ctx);
+        llvm::AttributeList attribs = GetAttributeList(ctx, overloadedPointeeTys);
         // There can never be multiple globals with the same name of different types,
         // because intrinsics must be a specific type.
         IGCLLVM::Module& M = static_cast<IGCLLVM::Module&>(module);
@@ -202,7 +205,7 @@ private:
         {
             for (uint8_t i = 0; i < numArguments; i++)
             {
-                RetrieveType(i + 1, IntrinsicDefinitionT::scArgumentTypes[i]);
+                RetrieveType(i + 1, IntrinsicDefinitionT::scArguments[i].m_Type);
             }
         }
         // IGC_ASSERT(overloadedTypeIndex == overloadedTypes.size());
@@ -219,17 +222,60 @@ private:
         return llvm::FunctionType::get(resultTy, argTys, false);
     }
 
-    static llvm::AttributeList GetAttributeList(llvm::LLVMContext& ctx)
+    static llvm::AttributeList GetAttributeList(llvm::LLVMContext& ctx, const llvm::ArrayRef<llvm::Type*>& overloadedPointeeTys)
     {
         // 1. Instantiate regular attributes for the given intrinsic
         constexpr auto& attributeKinds = IntrinsicDefinitionT::scAttributeKinds;
         auto mainAttrList = llvm::AttributeList::get(
             ctx, llvm::AttributeList::FunctionIndex, attributeKinds);
-        // 2. Gather the memory attribute(s) in a separate WrapperLLVM-based routine
-        auto memoryAttributeSet = IntrinsicDefinitionT::scMemoryEffects.getAsAttributeSet(ctx);
-        auto memoryAB = IGCLLVM::makeAttrBuilder(ctx, memoryAttributeSet);
-        // Return a merged collection
-        return IGCLLVM::addFnAttributes(mainAttrList, ctx, memoryAB);
+        // 2. Gather the memory attribute(s) in a separate routine
+        auto memoryAB = IntrinsicDefinitionT::scMemoryEffects.getAsAttrBuilder(ctx);
+        mainAttrList = mainAttrList.addFnAttributes(ctx, memoryAB);
+        // 3. Gather parameter attributes
+        uint8_t overloadedTypeIndex = 0;
+        auto RetrieveParamAttr = [&overloadedTypeIndex, &ctx, &overloadedPointeeTys, &mainAttrList](uint8_t index, const ArgumentDescription& arg)
+            {
+                if (arg.m_AttrKind == llvm::Attribute::None)
+                {
+                    return;
+                }
+
+                IGC_ASSERT_MESSAGE(llvm::Attribute::canUseAsParamAttr(arg.m_AttrKind), "Not a param attribute!");
+
+                if (llvm::Attribute::isTypeAttrKind(arg.m_AttrKind))
+                {
+                    llvm::Type* pointeeType = nullptr;
+                    if (overloadedTypeIndex < overloadedPointeeTys.size() && arg.m_Type.IsOverloadable())
+                    {
+                        pointeeType = overloadedPointeeTys[overloadedTypeIndex++];
+                    }
+                    else
+                    {
+                        pointeeType = arg.m_Type.m_Pointer.m_Type.GetType(ctx);
+                    }
+
+                    // IGC_ASSERT_MESSAGE(pointeeType, "Missing type for the type-dependent attribute!");
+                    if (!pointeeType)
+                        return;
+
+                    mainAttrList = mainAttrList.addParamAttribute(ctx, { index }, llvm::Attribute::get(ctx, arg.m_AttrKind, pointeeType));
+                }
+                else
+                {
+                    mainAttrList = mainAttrList.addParamAttribute(ctx, { index }, llvm::Attribute::get(ctx, arg.m_AttrKind));
+                }
+            };
+
+        constexpr uint8_t numArguments = static_cast<uint8_t>(Argument::Count);
+        if constexpr (numArguments > 0)
+        {
+            for (uint8_t i = 0; i < numArguments; i++)
+            {
+                RetrieveParamAttr(i, IntrinsicDefinitionT::scArguments[i]);
+            }
+        }
+
+        return mainAttrList;
     }
 };
 
@@ -247,14 +293,14 @@ static constexpr auto GetDeclarationFuncArray()
     return GetDeclarationFuncArrayImp(seq);
 }
 
-llvm::Function* GetDeclaration(llvm::Module* pModule, llvm::GenISAIntrinsic::ID id, llvm::ArrayRef<llvm::Type*> overloadedTys)
+llvm::Function* GetDeclaration(llvm::Module* pModule, llvm::GenISAIntrinsic::ID id, llvm::ArrayRef<llvm::Type*> overloadedTys, llvm::ArrayRef<llvm::Type*> overloadedPointeeTys)
 {
     constexpr auto funcArray = GetDeclarationFuncArray();
     llvm::Function* pResult = nullptr;
     uint32_t index = static_cast<uint32_t>(id) - scBeginIntrinsicIndex;
     if (index < funcArray.size())
     {
-        pResult = funcArray[index](*pModule, overloadedTys);
+        pResult = funcArray[index](*pModule, overloadedTys, overloadedPointeeTys);
     }
     return pResult;
 }
@@ -273,14 +319,14 @@ static constexpr auto GetNameFuncArray()
     return GetNameFuncArrayImp(seq);
 }
 
-std::string GetName(llvm::GenISAIntrinsic::ID id, llvm::ArrayRef<llvm::Type*> overloadedTys)
+std::string GetName(llvm::GenISAIntrinsic::ID id, llvm::ArrayRef<llvm::Type*> overloadedTys, llvm::ArrayRef<llvm::Type*> overloadedPointeeTys)
 {
     constexpr auto funcArray = GetNameFuncArray();
     std::string result;
     uint32_t index = static_cast<uint32_t>(id) - scBeginIntrinsicIndex;
     if (index < funcArray.size())
     {
-        result = funcArray[index](overloadedTys);
+        result = funcArray[index](overloadedTys, overloadedPointeeTys);
     }
     return result;
 }

@@ -14,11 +14,8 @@ SPDX-License-Identifier: MIT
 #include "GraphColor.h"
 #include "PointsToAnalysis.h"
 
-#include <fstream>
-#include <math.h>
-#include <sstream>
+#include <cmath>
 #include <unordered_set>
-#include <optional>
 
 using namespace vISA;
 
@@ -353,8 +350,8 @@ void SpillManagerGRF::getOverlappingIntervals(
     }
   }
 
-  for (auto &dcl : overlappingDcls)
-    intervals.push_back(dcl);
+  intervals.insert(intervals.end(), overlappingDcls.begin(),
+                   overlappingDcls.end());
 }
 
 // Calculate the spill memory displacement for the regvar.
@@ -427,14 +424,13 @@ unsigned SpillManagerGRF::calculateSpillDispForLS(G4_RegVar *regVar) const {
   // Locate the blocked locations calculated from the interfering
   // spilled live ranges and put them into a list in ascending order.
 
-  typedef std::deque<G4_RegVar *> LocList;
-  LocList locList;
+  std::vector<G4_RegVar *> locList;
   unsigned lrId = (regVar->getId() >= varIdCount_)
                       ? regVar->getBaseRegVar()->getId()
                       : regVar->getId();
   vASSERT(lrId < varIdCount_);
 
-  for (auto lr : (*spilledLSLRs_)) {
+  for (auto* lr : (*spilledLSLRs_)) {
     G4_Declare* dcl = regVar->getDeclare();
     while (dcl->getAliasDeclare()) {
       dcl = dcl->getAliasDeclare();
@@ -453,17 +449,13 @@ unsigned SpillManagerGRF::calculateSpillDispForLS(G4_RegVar *regVar) const {
       unsigned iDisp = intfRegVar->getDisp();
       if (iDisp == UINT_MAX)
         continue;
-
-      LocList::iterator loc;
-      for (loc = locList.begin();
-        loc != locList.end() && (*loc)->getDisp() < iDisp; ++loc)
-        ;
-      if (loc != locList.end())
-        locList.insert(loc, intfRegVar);
-      else
-        locList.push_back(intfRegVar);
+      locList.push_back(intfRegVar);
     }
   }
+
+  std::sort(locList.begin(), locList.end(), [](G4_RegVar *v1, G4_RegVar *v2) {
+    return v1->getDisp() < v2->getDisp();
+  });
 
   // Find a spill slot for lRange within the locList.
   // we always start searching from nextSpillOffset_ to facilitate
@@ -473,12 +465,11 @@ unsigned SpillManagerGRF::calculateSpillDispForLS(G4_RegVar *regVar) const {
       ROUND(nextSpillOffset_, builder_->numEltPerGRF<Type_UB>());
   unsigned regVarSize = getByteSize(regVar);
 
-  for (LocList::iterator curLoc = locList.begin(), end = locList.end();
-       curLoc != end; ++curLoc) {
-    unsigned curLocDisp = (*curLoc)->getDisp();
+  for (auto* curLoc : locList) {
+    unsigned curLocDisp = curLoc->getDisp();
     if (regVarLocDisp < curLocDisp && regVarLocDisp + regVarSize <= curLocDisp)
       break;
-    unsigned curLocEnd = curLocDisp + getByteSize(*curLoc);
+    unsigned curLocEnd = curLocDisp + getByteSize(curLoc);
     {
       if (curLocEnd % builder_->numEltPerGRF<Type_UB>() != 0)
         curLocEnd = ROUND(curLocEnd, builder_->numEltPerGRF<Type_UB>());
@@ -4721,15 +4712,8 @@ unsigned int GlobalRA::GRFSizeToOwords(unsigned int numGRFs,
 unsigned int GlobalRA::getHWordByteSize() { return HWORD_BYTE_SIZE; }
 
 bool Interval::intervalsOverlap(const Interval &second) const {
-  auto firstStart = start->getLexicalId();
-  auto firstEnd = end->getLexicalId();
-  auto secondStart = second.start->getLexicalId();
-  auto secondEnd = second.end->getLexicalId();
-
-  if (firstStart > secondEnd || secondStart > firstEnd)
-    return false;
-
-  return true;
+  return !(start->getLexicalId() > second.end->getLexicalId() ||
+           second.start->getLexicalId() > end->getLexicalId());
 }
 
 static G4_INST *createSpillFillAddr(IR_Builder &builder, G4_Declare *addr,
@@ -4848,10 +4832,8 @@ void GlobalRA::expandSpillLSC(G4_BB *bb, INST_LIST_ITER &instIt) {
   }
 
   if (inst->getFP() && kernel.getOption(vISA_GenerateDebugInfo)) {
-    for (auto newInst : builder->instList) {
-      kernel.getKernelDebugInfo()->updateExpandedIntrinsic(
-          inst->asSpillIntrinsic(), newInst);
-    }
+    kernel.getKernelDebugInfo()->updateExpandedIntrinsic(
+        inst->asSpillIntrinsic(), builder->instList);
   }
 
   // Call WA and NoMask WA are mutual exclusive.
@@ -4958,10 +4940,8 @@ void GlobalRA::expandScatterSpillLSC(G4_BB *bb, INST_LIST_ITER &instIt) {
       payload->getTopDcl()->getName(), builder->getGRFSize()));
 
   if (inst->getFP() && kernel.getOption(vISA_GenerateDebugInfo)) {
-    for (auto newInst : builder->instList) {
-      kernel.getKernelDebugInfo()->updateExpandedIntrinsic(
-          inst->asSpillIntrinsic(), newInst);
-    }
+    kernel.getKernelDebugInfo()->updateExpandedIntrinsic(
+        inst->asSpillIntrinsic(), builder->instList);
   }
 
   splice(bb, instIt, builder->instList, inst->getVISAId());
@@ -5054,10 +5034,8 @@ void GlobalRA::expandFillLSC(G4_BB *bb, INST_LIST_ITER &instIt) {
   }
 
   if (inst->getFP() && kernel.getOption(vISA_GenerateDebugInfo)) {
-    for (auto newInst : builder->instList) {
-      kernel.getKernelDebugInfo()->updateExpandedIntrinsic(
-          inst->asFillIntrinsic(), newInst);
-    }
+    kernel.getKernelDebugInfo()->updateExpandedIntrinsic(
+        inst->asFillIntrinsic(), builder->instList);
   }
 
   // Call WA and NoMask WA are mutual exclusive.
@@ -5331,10 +5309,9 @@ void GlobalRA::expandSpillStackcall(uint32_t numRows, uint32_t offset,
     }
 
     if (kernel.getOption(vISA_GenerateDebugInfo)) {
+      INST_LIST expandedInsts = {hdrSetInst, spillSends};
       kernel.getKernelDebugInfo()->updateExpandedIntrinsic(
-          inst->asSpillIntrinsic(), hdrSetInst);
-      kernel.getKernelDebugInfo()->updateExpandedIntrinsic(
-          inst->asSpillIntrinsic(), spillSends);
+          inst->asSpillIntrinsic(), expandedInsts);
     }
 
     numRowsOword -= payloadSizeInOwords;
@@ -5591,10 +5568,9 @@ void GlobalRA::expandFillStackcall(uint32_t numRows, uint32_t offset,
     bb->insertBefore(fillIt, fillSends);
 
     if (kernel.getOption(vISA_GenerateDebugInfo)) {
+      INST_LIST expandedInsts = {hdrSetInst, fillSends};
       kernel.getKernelDebugInfo()->updateExpandedIntrinsic(
-          inst->asFillIntrinsic(), hdrSetInst);
-      kernel.getKernelDebugInfo()->updateExpandedIntrinsic(
-          inst->asFillIntrinsic(), fillSends);
+          inst->asFillIntrinsic(), expandedInsts);
     }
 
     numRowsOword -= respSizeInOwords;

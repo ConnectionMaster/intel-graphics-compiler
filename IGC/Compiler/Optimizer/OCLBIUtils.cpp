@@ -169,17 +169,20 @@ void CImagesBI::prepareColor(Value* Color)
     if (VTy)
     {
         unsigned NumElts = static_cast<unsigned>(VTy->getNumElements());
-        IGC_ASSERT(NumElts == 2 || NumElts == 4);
+        IGC_ASSERT(NumElts == 2 || NumElts == 3 || NumElts == 4);
         if (NumElts >= 2)
         {
             ColorY = ExtractElementInst::Create(TmpColor, ConstantInt::get(m_pIntType, COORD_Y), "ColorY", m_pCallInst); // color y
             cast<Instruction>(ColorY)->setDebugLoc(m_DL);
         }
-        if (NumElts == 4)
+        if (NumElts >= 3)
         {
             ColorZ = ExtractElementInst::Create(TmpColor, ConstantInt::get(m_pIntType, COORD_Z), "ColorZ", m_pCallInst); // color z
-            ColorW = ExtractElementInst::Create(TmpColor, ConstantInt::get(m_pIntType, COORD_W), "ColorW", m_pCallInst); // color w
             cast<Instruction>(ColorZ)->setDebugLoc(m_DL);
+        }
+        if (NumElts == 4)
+        {
+            ColorW = ExtractElementInst::Create(TmpColor, ConstantInt::get(m_pIntType, COORD_W), "ColorW", m_pCallInst); // color w
             cast<Instruction>(ColorW)->setDebugLoc(m_DL);
         }
     }
@@ -503,8 +506,15 @@ public:
                     return nullptr;
                 }
                 auto *binOp = cast<BinaryOperator>(samplerValue);
-                auto *argExt = new ZExtInst(arg, Type::getInt64Ty(*m_pCtx), "", binOp);
-                binOp->setOperand(0, argExt);
+                if (arg->getType() == Type::getInt64Ty(*m_pCtx))
+                {
+                    binOp->setOperand(0, arg);
+                }
+                else
+                {
+                    auto * argExt = new ZExtInst(arg, Type::getInt64Ty(*m_pCtx), "", binOp);
+                    binOp->setOperand(0, argExt);
+                }
 
                 unsigned addressSpace = IGC::EncodeAS4GFXResource(*samplerIndex, BufferType::BINDLESS_SAMPLER);
                 Type *ptrTy = PointerType::get(m_pFloatType, addressSpace);
@@ -1071,11 +1081,11 @@ protected:
         // GenISA intrinsics ID start after llvm intrinsics
         if (isaId != GenISAIntrinsic::num_genisa_intrinsics && isaId > static_cast<int>(Intrinsic::num_intrinsics))
         {
-            replaceGenISACallInst(isaId, this->isOverloadable ? overloadTypes : None);
+            replaceGenISACallInst(isaId, this->isOverloadable ? overloadTypes : llvm::ArrayRef<Type*>());
         }
         else
         {
-            replaceCallInst(id, this->isOverloadable ? overloadTypes : None);
+            replaceCallInst(id, this->isOverloadable ? overloadTypes : llvm::ArrayRef<Type*>());
         }
     }
 public:
@@ -1203,6 +1213,12 @@ public:
         }
 
         m_args.push_back(truncInst);
+
+        if (isaId == GenISAIntrinsic::GenISA_WaveClusteredBallot)
+        {
+            m_args.push_back(m_pCallInst->getArgOperand(1));
+        }
+
         m_args.push_back(IRB.getInt32(0));
         replaceGenISACallInst(isaId);
     }
@@ -1303,7 +1319,7 @@ public:
             break;
         }
         default:
-            replaceGenISACallInst(id, m_IsOverLoaded ? ArrayRef<Type*>(m_pCallInst->getArgOperand(0)->getType()) : None);
+            replaceGenISACallInst(id, m_IsOverLoaded ? ArrayRef<Type*>(m_pCallInst->getArgOperand(0)->getType()) : llvm::ArrayRef<Type*>());
             break;
         }
     }
@@ -1445,18 +1461,23 @@ CBuiltinsResolver::CBuiltinsResolver(CImagesBI::ParamMap* paramMap, CImagesBI::I
     // Write Image
     m_CommandMap["__builtin_IB_write_1d_u1i"] = initImageClass<CWrite>(paramMap, inlineMap, nextSampler, CImagesBI::Dimension::DIM_1D);
     m_CommandMap["__builtin_IB_write_1d_u2i"] = initImageClass<CWrite>(paramMap, inlineMap, nextSampler, CImagesBI::Dimension::DIM_1D);
+    m_CommandMap["__builtin_IB_write_1d_u3i"] = initImageClass<CWrite>(paramMap, inlineMap, nextSampler, CImagesBI::Dimension::DIM_1D);
     m_CommandMap["__builtin_IB_write_1d_u4i"] = initImageClass<CWrite>(paramMap, inlineMap, nextSampler, CImagesBI::Dimension::DIM_1D);
     m_CommandMap["__builtin_IB_write_1darr_u1i"] = initImageClass<CWrite>(paramMap, inlineMap, nextSampler, CImagesBI::Dimension::DIM_1D_ARRAY);
     m_CommandMap["__builtin_IB_write_1darr_u2i"] = initImageClass<CWrite>(paramMap, inlineMap, nextSampler, CImagesBI::Dimension::DIM_1D_ARRAY);
+    m_CommandMap["__builtin_IB_write_1darr_u3i"] = initImageClass<CWrite>(paramMap, inlineMap, nextSampler, CImagesBI::Dimension::DIM_1D_ARRAY);
     m_CommandMap["__builtin_IB_write_1darr_u4i"] = initImageClass<CWrite>(paramMap, inlineMap, nextSampler, CImagesBI::Dimension::DIM_1D_ARRAY);
     m_CommandMap["__builtin_IB_write_2d_u1i"] = initImageClass<CWrite>(paramMap, inlineMap, nextSampler, CImagesBI::Dimension::DIM_2D);
     m_CommandMap["__builtin_IB_write_2d_u2i"] = initImageClass<CWrite>(paramMap, inlineMap, nextSampler, CImagesBI::Dimension::DIM_2D);
+    m_CommandMap["__builtin_IB_write_2d_u3i"] = initImageClass<CWrite>(paramMap, inlineMap, nextSampler, CImagesBI::Dimension::DIM_2D);
     m_CommandMap["__builtin_IB_write_2d_u4i"] = initImageClass<CWrite>(paramMap, inlineMap, nextSampler, CImagesBI::Dimension::DIM_2D);
     m_CommandMap["__builtin_IB_write_2darr_u1i"] = initImageClass<CWrite>(paramMap, inlineMap, nextSampler, CImagesBI::Dimension::DIM_2D_ARRAY);
     m_CommandMap["__builtin_IB_write_2darr_u2i"] = initImageClass<CWrite>(paramMap, inlineMap, nextSampler, CImagesBI::Dimension::DIM_2D_ARRAY);
+    m_CommandMap["__builtin_IB_write_2darr_u3i"] = initImageClass<CWrite>(paramMap, inlineMap, nextSampler, CImagesBI::Dimension::DIM_2D_ARRAY);
     m_CommandMap["__builtin_IB_write_2darr_u4i"] = initImageClass<CWrite>(paramMap, inlineMap, nextSampler, CImagesBI::Dimension::DIM_2D_ARRAY);
     m_CommandMap["__builtin_IB_write_3d_u1i"] = initImageClass<CWrite>(paramMap, inlineMap, nextSampler, CImagesBI::Dimension::DIM_3D);
     m_CommandMap["__builtin_IB_write_3d_u2i"] = initImageClass<CWrite>(paramMap, inlineMap, nextSampler, CImagesBI::Dimension::DIM_3D);
+    m_CommandMap["__builtin_IB_write_3d_u3i"] = initImageClass<CWrite>(paramMap, inlineMap, nextSampler, CImagesBI::Dimension::DIM_3D);
     m_CommandMap["__builtin_IB_write_3d_u4i"] = initImageClass<CWrite>(paramMap, inlineMap, nextSampler, CImagesBI::Dimension::DIM_3D);
     m_CommandMap["__builtin_IB_write_2d_f"] = initImageClass<CWrite>(paramMap, inlineMap, nextSampler, CImagesBI::Dimension::DIM_2D);
     m_CommandMap["__builtin_IB_write_2darr_f"] = initImageClass<CWrite>(paramMap, inlineMap, nextSampler, CImagesBI::Dimension::DIM_2D_ARRAY);
@@ -1753,6 +1774,7 @@ CBuiltinsResolver::CBuiltinsResolver(CImagesBI::ParamMap* paramMap, CImagesBI::I
 
     // Ballot builtins
     m_CommandMap["__builtin_IB_WaveBallot"] = CWaveBallotIntrinsic::create(GenISAIntrinsic::GenISA_WaveBallot);
+    m_CommandMap["__builtin_IB_clustered_WaveBallot"] = CWaveBallotIntrinsic::create(GenISAIntrinsic::GenISA_WaveClusteredBallot);
 
     m_CommandMap[StringRef("__builtin_IB_samplepos")] = CSamplePos::create();
 

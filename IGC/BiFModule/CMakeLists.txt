@@ -37,12 +37,20 @@ if(UNIX)
     if("${CCLANG_SONAME_VERSION}" VERSION_GREATER "5.0.0")
       set_property(TARGET opencl-clang-lib PROPERTY "IMPORTED_SONAME" "${COMMON_CLANG_LIB_FULL_NAME}.${CCLANG_SONAME_VERSION}")
     else()
-      message(FATAL_ERROR "[IGC\\BiFModule] : Version ${CCLANG_SONAME_VERSION} of library ${COMMON_CLANG_LIB_FULL_NAME} is below version 5.0.0 (where it's starts support of SPIR-V), please upgrade this library at least to version 5.0.0")
+      # Handle libopencl-clang2.so
+      string(REPLACE "-clang${CMAKE_SHARED_LIBRARY_SUFFIX}" "-clang2${CMAKE_SHARED_LIBRARY_SUFFIX}" TEST_COMMON_CLANG_LIB_FULL_NAME ${COMMON_CLANG_LIB_FULL_NAME})
+      string(REGEX MATCH "\\[${TEST_COMMON_CLANG_LIB_FULL_NAME}\\.([0-9](\\.[0-9]*)*[a-zA-Z0-9]*)\\]" CCLANG_SONAME_VERSION "${CCLANG_READELF_CALL}")
+      set(CCLANG_SONAME_VERSION "${CMAKE_MATCH_1}")
+      if(NOT CCLANG_SONAME_VERSION STREQUAL "")
+        set_property(TARGET opencl-clang-lib PROPERTY "IMPORTED_SONAME" "${TEST_COMMON_CLANG_LIB_FULL_NAME}.${CCLANG_SONAME_VERSION}")
+      else()
+        message(FATAL_ERROR "[IGC\\BiFModule] : Version ${CCLANG_SONAME_VERSION} of library ${COMMON_CLANG_LIB_FULL_NAME} is below version 5.0.0 (where it's starts support of SPIR-V), please upgrade this library at least to version 5.0.0")
+      endif()
     endif()
   endif()
   if (NOT CCLANG_FROM_SYSTEM)
-    install(FILES $<TARGET_FILE:opencl-clang-lib> DESTINATION ${CMAKE_INSTALL_FULL_LIBDIR} COMPONENT igc-opencl)
     install(FILES $<TARGET_SONAME_FILE:opencl-clang-lib> DESTINATION ${CMAKE_INSTALL_FULL_LIBDIR} COMPONENT igc-opencl)
+
 
     # Get header opencl-c.h directory
     get_filename_component(opencl-headers-dir ${opencl-header} DIRECTORY)
@@ -489,6 +497,7 @@ set(KHR_DEFINES ${KHR_DEFINES} "cl_intel_pvc_lsc_validation")
 set(KHR_DEFINES ${KHR_DEFINES} "cl_intel_subgroup_extended_block_read_cacheopts")
 set(KHR_DEFINES ${KHR_DEFINES} "cl_intel_subgroup_extended_block_write_cacheopts")
 set(KHR_DEFINES ${KHR_DEFINES} "cl_intel_subgroup_2d_block_io")
+set(KHR_DEFINES ${KHR_DEFINES} "cl_intel_subgroup_matrix_multiply_accumulate_bf8")
 
 igc_bif_build_bc(
     OUTPUT               "${IGC_BUILD__BIF_DIR}/IBiF_Impl_int.bc"

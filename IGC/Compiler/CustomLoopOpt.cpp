@@ -586,7 +586,7 @@ bool CustomLoopVersioning::processLoop(Loop* loop)
     FMF.setFast();
     irb.setFastMathFlags(FMF);
     Value* cond0 = irb.CreateFCmpOGT(
-        var_CBLoad_preHdr, ConstantFP::get(irb.getFloatTy(), 1.0));
+        var_CBLoad_preHdr, ConstantFP::get(var_CBLoad_preHdr->getType(), 1.0));
 
     Value* cond1 = irb.CreateFCmpOLT(
         irb.CreateFMul(var_range_x, var_CBLoad_preHdr),
@@ -1642,12 +1642,13 @@ bool LoopSplitWidePHIs::processPHI(SmallVectorImpl<PHINode*> &WL, Loop *L)
     // We check the required conditions, populating lists of uses
     // to be replaced with the split components or their joined result.
     PHINode *PHI = WL.pop_back_val();
-    auto DefI = cast<Instruction>(PHI->getIncomingValueForBlock(Latch));
+    Value* DefI = PHI->getIncomingValueForBlock(Latch);
 
     // Identify whether the latch value's definition is a candidate
     // for splitting.
     CatenatedValue CV;
-    if (!getCatenatedValue(DefI, CV))
+    if (!isa<Instruction>(DefI) ||
+        !getCatenatedValue(cast<Instruction>(DefI), CV))
         return false;
 
     // If there is a bitcast of CV.Result, attempt to fold it away.

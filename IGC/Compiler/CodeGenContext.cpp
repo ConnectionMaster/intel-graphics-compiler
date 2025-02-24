@@ -365,6 +365,9 @@ namespace IGC
         return result != std::end(cache) ? result : nullptr;
     }
 
+    static cl::opt<bool>
+      ForceTypedPointers("typed-pointers", cl::desc("Use typed pointers (if both typed and opaque are used, then opaque will be used)"), cl::init(false));
+
     LLVMContextWrapper::LLVMContextWrapper(bool createResourceDimTypes)
         : m_UserAddrSpaceMD(this)
     {
@@ -373,19 +376,24 @@ namespace IGC
             CreateResourceDimensionTypes(*this);
         }
         auto* basePtr = static_cast<llvm::LLVMContext*>(this);
-        // When opaque pointers are enabled through the environment setting, we
-        // expect the Context to convert any incoming typed pointers
-        // automatically. However, the build system has opaque pointers enabled
-        // in the FE/in the builtin bitcode, that setting gets force-enabled,
-        // as the context will only operate on opaque pointers anyway.
-        // TODO: For transition purposes, consider introducing an IGC internal
-        // option to tweak typed/opaque pointers with a precedence over the
-        // environment flag.
+        // By default, LLVM 16+ operates on opaque pointers and older LLVM versions on typed pointers. The flag
+        // EnableOpaquePointersBackend allows enabling opaque pointers on older LLVM versions and then any incoming
+        // pointer types are dropped. The flag ForceTypedPointers enables us to force typed pointers on LLVM 16+
+        // for maintenance purposes. It is not possible to ForceTypedPointers when any opaque pointers are present
+        // in an LLVM IR module, then opaque pointer mode is force enabled. EnableOpaquePointersBackend does not
+        // perform automatic conversion of builtin types which should be represented using TargetExtTy.
+        // TODO: For transition purposes, consider introducing an IGC internal option to tweak typed/opaque pointers
+        // with a precedence over the environment flag.
         if (IGC::canOverwriteLLVMCtxPtrMode(basePtr))
         {
-            IGCLLVM::setOpaquePointers(basePtr,
-                __IGC_OPAQUE_POINTERS_API_ENABLED ||
-                IGC_IS_FLAG_ENABLED(EnableOpaquePointersBackend));
+          bool enableOpaquePointers = __IGC_OPAQUE_POINTERS_API_ENABLED || IGC_IS_FLAG_ENABLED(EnableOpaquePointersBackend);
+
+          if (ForceTypedPointers.getValue())
+          {
+            enableOpaquePointers = false;
+          }
+
+          IGCLLVM::setOpaquePointers(basePtr, enableOpaquePointers);
         }
     }
 
@@ -749,17 +757,6 @@ namespace IGC
         return true;
     }
 
-    bool CodeGenContext::HasFuncExpensiveLoop(llvm::Function* pFunc)
-    {
-        if (m_FuncHasExpensiveLoops.find(pFunc) !=
-            m_FuncHasExpensiveLoops.end())
-        {
-            return m_FuncHasExpensiveLoops[pFunc];
-        }
-        return false;
-    }
-
-
     static std::string demangleFuncName(const std::string &rawName) {
         // OpenMP adds additional prefix and suffix to the mangling scheme,
         // remove it if present.
@@ -868,17 +865,21 @@ namespace IGC
             return m_NumGRFPerThread;
         }
 
-        // read value from CompOptions first
-        DWORD GRFNum4RQToUse = getModuleMetaData()->compOpt.ForceLargeGRFNum4RQ ? 256 : 0;
-
-        // override if reg key value is set
-        GRFNum4RQToUse = IGC_IS_FLAG_ENABLED( TotalGRFNum4RQ ) ?
-            IGC_GET_FLAG_VALUE( TotalGRFNum4RQ ) : GRFNum4RQToUse;
-
-        if (hasSyncRTCalls() && GRFNum4RQToUse != 0)
+        if (hasSyncRTCalls())
         {
-            m_NumGRFPerThread = GRFNum4RQToUse;
-            return m_NumGRFPerThread;
+            // read value from CompOptions first
+            DWORD GRFNum4RQToUse =
+                getModuleMetaData()->compOpt.ForceLargeGRFNum4RQ ? 256 : 0;
+
+            // override if reg key value is set
+            GRFNum4RQToUse = IGC_IS_FLAG_ENABLED(TotalGRFNum4RQ)
+                                ? IGC_GET_FLAG_VALUE(TotalGRFNum4RQ)
+                                : GRFNum4RQToUse;
+            if (GRFNum4RQToUse != 0)
+            {
+                m_NumGRFPerThread = GRFNum4RQToUse;
+                return m_NumGRFPerThread;
+            }
         }
         if (this->type == ShaderType::COMPUTE_SHADER && IGC_GET_FLAG_VALUE(TotalGRFNum4CS) != 0)
         {
@@ -934,6 +935,19 @@ namespace IGC
             "IGC::PositionOnlyVertexShader") != nullptr;
     }
 
+    bool CodeGenContext::isSWSubTriangleOpacityCullingEmulationEnabled() const
+    {
+        // STOC level emulation is enabled only if:
+        // 1. Platform is Xe3.
+        // 2. 64bit RayTracing structures are used.
+        // 3. STOC level emulation is requested by UMD.
+        // 4. STOC level emulation routine binary is delivered by the UMD.
+        return platform.isSWSubTriangleOpacityCullingEmulationEnabled() &&
+            bvhInfo.uses64Bit &&
+            m_enableSubTriangleOpacityEmulation &&
+            (m_numBifModules != 0) &&
+            (m_bifModules != nullptr);
+    }
 
 
 
@@ -948,7 +962,7 @@ namespace IGC
 
     // Returns the SIMD mode of a kernel based on a platform and settings flags.
     // VS, DS, HS, GS currently supported only.
-    SIMDMode CodeGenContext::GetSIMDMode()
+    SIMDMode CodeGenContext::GetSIMDMode() const
     {
         SIMDMode simdMode = SIMDMode::UNKNOWN;
 

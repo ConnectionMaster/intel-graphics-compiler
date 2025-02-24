@@ -103,19 +103,6 @@ private:
 };
 } // namespace llvm
 
-static alignment_t
-getAlignment(const Argument &Arg,
-             GenXOCLRuntimeInfo::KernelArgInfo::KindType Kind) {
-  using ArgKindType = GenXOCLRuntimeInfo::KernelArgInfo::KindType;
-  if (Kind != ArgKindType::SLM)
-    return 0;
-
-  Type *TypeToAlign = Arg.getType();
-  TypeToAlign = IGCLLVM::getNonOpaquePtrEltTy(TypeToAlign);
-  return Arg.getParent()->getParent()->getDataLayout().getABITypeAlignment(
-      TypeToAlign);
-}
-
 KernelArgBuilder::ArgAccessKindType
 KernelArgBuilder::getOCLArgAccessKind(ArrayRef<StringRef> Tokens,
                                       ArgKindType Kind) const {
@@ -294,11 +281,17 @@ KernelArgBuilder::translateArgument(const Argument &Arg) const {
   Info.BTI = KM.getBTI(ArgNo);
   // For implicit arguments that are byval argument linearization, index !=
   // ArgNo in the IR function.
+  Info.ArgNo = ArgNo;
   Info.Index = KM.getArgIndex(ArgNo);
   // Linearization arguments have a non-zero offset in the original explicit
   // byval arg.
   Info.OffsetInArg = KM.getOffsetInArg(ArgNo);
-  Info.Alignment = (unsigned)getAlignment(Arg, Info.Kind);
+  if (Info.Kind == GenXOCLRuntimeInfo::KernelArgInfo::KindType::SLM)
+    // Max SLM alignment is 16 or 8 bytes and depends on what memory
+    // messages are used: legacy or LSC.
+    Info.Alignment = ST.translateLegacyMessages() ? 8 : 16;
+  else
+    Info.Alignment = 0;
 
   return Info;
 }
@@ -329,6 +322,12 @@ GenXOCLRuntimeInfo::FunctionInfo::FunctionInfo(const FunctionGroup &FG,
     vc::KernelMetadata KernelMD(FG.getHead());
     Name = KernelMD.getName().str();
     SLMSize = KernelMD.getSLMSize();
+    IndirectCount = KernelMD.getIndirectCount();
+
+    if (Func->getParent()->getNamedMetadata(
+            FunctionMD::VCDisableMidThreadPreemption)) {
+      DisableMidThreadPreemption = true;
+    }
 
     if (ST.hasNBarrier())
       NumBarriers = KernelMD.getAlignedBarrierCnt(NumBarriers);
@@ -647,7 +646,10 @@ static alignment_t getAlignment(const GlobalVariable &GV) {
   auto Align = GV.getAlignment();
   if (Align)
     return Align;
-  return GV.getParent()->getDataLayout().getABITypeAlignment(GV.getValueType());
+  return GV.getParent()
+      ->getDataLayout()
+      .getABITypeAlign(GV.getValueType())
+      .value();
 }
 
 static void appendGlobalVariableData(RawSectionInfo &Sect,
