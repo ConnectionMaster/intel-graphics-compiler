@@ -1375,6 +1375,8 @@ DECLARE_IGC_REGKEY(bool, AddNoInlineToTrimmedFunctions, false, "Tell late passes
 DECLARE_IGC_REGKEY(bool, ForceInlineExternalFunctions, false, "not to trim functions called from multiple kernels",
                    true)
 DECLARE_IGC_REGKEY(DWORD, KernelTotalSizeThreshold, 50000, "Trimming target of kernel total size", true)
+DECLARE_IGC_REGKEY(DWORD, LargeKernelThresholdMultiplier, 13,
+                   "Multipler to kernel threshold. When exceeded more agressive trimming will be performed", false)
 DECLARE_IGC_REGKEY(bool, PartitionUnit, false, "Partition compilation unit", true)
 DECLARE_IGC_REGKEY(DWORD, PrintPartitionUnit, 0, "Print information about compilation unit partitioning", true)
 DECLARE_IGC_REGKEY(bool, PartitionWithFastHybridRA, false, "Enable FastRA and HybridRA when partition is enabled", true)
@@ -1788,7 +1790,7 @@ DECLARE_IGC_REGKEY(bool, DisableCanonizationWA, false,
                    "WA for A0 to inject shifts to canonize global and local pointers", true)
 DECLARE_IGC_REGKEY(bool, DisableEarlyRemat, false, "Disable quick remats to avoid some spills", true)
 DECLARE_IGC_REGKEY(bool, DisableLateRemat, false, "Disable quick remats to avoid some spills", true)
-DECLARE_IGC_REGKEY(DWORD, RematThreshold, 6, "Tunes how aggresively we should remat values into continuations", true)
+DECLARE_IGC_REGKEY(DWORD, RematThreshold, 7, "Tunes how aggresively we should remat values into continuations", true)
 DECLARE_IGC_REGKEY(bool, DisableCompactifySpills, false, "Just emit spill/fill at the point of def/use", true)
 DECLARE_IGC_REGKEY(bool, AllowSpillCompactionOnRetry, false, "Allow spill compaction on retry - may increase spills",
                    true)
